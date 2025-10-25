@@ -1,0 +1,22 @@
+# VPN 账户信息（敏感）
+*.env
+.vpn_accounts*
+
+# 运行时文件
+*.pid
+*.state
+/var/run/
+
+# 日志文件
+*.log
+
+# 临时文件
+*~
+*.swp
+*.bak
+.DS_Store
+
+# IDE 配置
+.vscode/
+.idea/
+*.iml
