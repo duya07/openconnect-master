@@ -1,0 +1,32 @@
+# OpenConnect VPN 账户配置示例
+# 
+# 格式说明:
+# 显示名|用户名|密码|VPN主机|认证组(可选)
+#
+# 字段说明:
+# - 显示名: 方便识别的名称，可以使用中文
+# - 用户名: VPN 登录用户名
+# - 密码: VPN 登录密码
+# - VPN主机: VPN 服务器地址（域名或 IP）
+# - 认证组: VPN 认证组（可选，部分 VPN 需要）
+#
+# 注意:
+# - 以 # 开头的行为注释
+# - 密码中如果包含 | 符号，请使用转义或更换密码
+# - 此文件包含敏感信息，请妥善保管
+# - 建议设置文件权限: chmod 600 /root/.vpn_accounts.env
+
+# 示例1: 大学 VPN（不需要认证组）
+我的大学VPN|student001|mypassword123|vpn.university.edu|
+
+# 示例2: 公司 VPN（需要认证组）
+公司VPN|employee@company.com|CompanyPass456|vpn.company.com|DefaultGroup
+
+# 示例3: 个人 VPN（使用域名）
+个人VPN Server|john.doe|MySecretPass789|my-vpn.example.com|
+
+# 示例4: 使用 IP 地址
+备用VPN|user123|pass123|192.168.1.100|GroupA
+
+# 您的账户（请修改以下信息）
+# 我的VPN|your_username|your_password|vpn.example.com|认证组(可选)
