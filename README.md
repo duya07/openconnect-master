@@ -178,18 +178,6 @@ chmod +x oc_master.sh
 # 选择是否允许远程连接
 ```
 
-**测试 SOCKS5 代理**：
-```bash
-# 测试 IPv4
-curl -x socks5h://127.0.0.1:8585 https://ip.p3terx.com
-
-# 测试 IPv6
-curl -x socks5h://127.0.0.1:8585 -6 https://ip.p3terx.com
-
-# 使用代理访问网站
-curl -x socks5h://127.0.0.1:8585 https://www.google.com
-```
-
 ### 账户配置文件格式
 
 账户信息存储在 `/root/.vpn_accounts.env`，格式如下：
