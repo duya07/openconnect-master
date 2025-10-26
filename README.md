@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**[英文](README_EN.md) | 简体中文**
+**[English](README_EN.md) | 简体中文**
 
 ![Version](https://img.shields.io/badge/version-7.7.7-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
