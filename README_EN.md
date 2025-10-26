@@ -79,20 +79,20 @@ Three Running Modes | Policy Routing Protection | Network Namespace Isolation | 
 
 ```bash
 # Download and run directly
-bash <(curl -fsSL https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh)
 ```
 
 ### Method 2: Manual Install
 
 ```bash
 # Download script
-wget https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh
+wget https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh
 
 # Add execute permission
-chmod +x oc_master.sh
+chmod +x oc_master_en.sh
 
 # Run script
-./oc_master.sh
+./oc_master_en.sh
 ```
 
 ### Method 3: Clone Repository
@@ -103,8 +103,8 @@ git clone https://github.com/duya07/openconnect-master.git
 cd openconnect-master
 
 # Run script
-chmod +x oc_master.sh
-./oc_master.sh
+chmod +x oc_master_en.sh
+./oc_master_en.sh
 ```
 
 ## 📖 Documentation
@@ -208,7 +208,7 @@ See also [examples/vpn_accounts.example](examples/vpn_accounts.example)
 
 This adds to crontab:
 ```cron
-*/5 * * * * /path/to/oc_master.sh _internal_check_health
+*/5 * * * * /path/to/oc_master_en.sh _internal_check_health
 ```
 
 ⚠️ **Note**: Daemon tasks currently only support **Default Mode** and **ocproxy Mode**
@@ -229,7 +229,7 @@ This adds to crontab:
 4) Stop VPN
 
 # Method 2: Direct command line
-./oc_master.sh stop
+./oc_master_en.sh stop
 ```
 
 ### IPv6 Connectivity Test
