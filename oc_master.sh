@@ -6,6 +6,7 @@
 #     备用检测点、netns内部直连)提高检测成功率。
 #   - 增强(Netns): socat 转发支持 IPv4 和 IPv6 双栈监听。
 #   - 新增(Netns): 启动时和菜单中增加 IPv6 连通性主动测试功能。
+#   - 新增: OpenConnect 协议选择，支持 AnyConnect / Pulse(Ivanti) / NC(Juniper)。
 # =================================================================
 set -euo pipefail
 
@@ -273,6 +274,26 @@ select_account() {
   export VPN_GROUP=$(echo "$choice" | cut -d'|' -f5)
   log_info "已加载: $VPN_DESC"
 }
+
+select_protocol() {
+  local p=""
+  echo
+  title "🔌 请选择 OpenConnect 协议："
+  echo "  1) AnyConnect  - Cisco AnyConnect（默认）"
+  echo "  2) Pulse       - Pulse Secure / Ivanti Secure Access"
+  echo "  3) NC          - Juniper Network Connect"
+  echo "  99) 返回"
+  read -rp "选择 [1-3，默认 1]: " p
+  case "${p:-1}" in
+    1) export VPN_PROTOCOL="anyconnect"; export VPN_PROTOCOL_DESC="Cisco AnyConnect" ;;
+    2) export VPN_PROTOCOL="pulse";      export VPN_PROTOCOL_DESC="Pulse / Ivanti" ;;
+    3) export VPN_PROTOCOL="nc";         export VPN_PROTOCOL_DESC="Juniper NC" ;;
+    99) return 1 ;;
+    *) log_err "无效协议选择"; return 1 ;;
+  esac
+  log_info "已选择协议: ${VPN_PROTOCOL_DESC} (--protocol=${VPN_PROTOCOL})"
+}
+
 _load_account_by_index() {
   local idx="$1"; mapfile -t ACC < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE")
   [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -lt "${#ACC[@]}" ] || { log_err "无效账户索引: $idx"; exit 1; }
@@ -301,39 +322,41 @@ _execute_with_safety_net() {
   fi
 }
 
-start_default() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_openconnect; select_account || return; _execute_with_safety_net "_start_default_logic"; }
+start_default() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_openconnect; select_account || return; select_protocol || return; _execute_with_safety_net "_start_default_logic"; }
 _start_default_logic() {
   setup_ssh_protect_routes
-  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; } | tee -a "$STATE_FILE" >/dev/null
-  log_info "连接VPN [默认模式]: $VPN_HOST ..."
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol=anyconnect --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
+  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null
+  log_info "连接VPN [默认模式 / 协议: ${VPN_PROTOCOL:-anyconnect}]: $VPN_HOST ..."
+  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "${oc_cmd[@]}"
   log_info "等待 TUN 接口就绪..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | grep -q 'tun.*UP'; then log "VPN 连接成功 (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
   log_err "VPN 连接失败或超时"; return 1
 }
 
-start_ocproxy_mode() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_ocproxy; select_account || return; _execute_with_safety_net "_start_ocproxy_logic"; }
+start_ocproxy_mode() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_openconnect; ensure_pkg_ocproxy; select_account || return; select_protocol || return; _execute_with_safety_net "_start_ocproxy_logic"; }
 _start_ocproxy_logic() {
   local socks_port
   local listen_addr="127.0.0.1" # [Final] 简化: 默认且仅监听本地，移除远程选项
   while true;do read -rp "请输入SOCKS5监听端口 (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port"||{ log_err "端口已被占用";continue; }; break; done
   
-  log_info "正在启动 ocproxy 模式 (监听地址: $listen_addr)...";
+  log_info "正在启动 ocproxy 模式 (协议: ${VPN_PROTOCOL:-anyconnect}, 监听地址: $listen_addr)...";
   # [Final] 简化: 移除了无效的 allow_arg 变量
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol=anyconnect --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
+  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "${oc_cmd[@]}"
   
-  log_info "等待 ocproxy 启动..."; for ((i=0;i<10;i++)); do if is_vpn_running; then log "ocproxy 连接成功 (PID=$(cat "$PID_FILE"))"; echo "MODE=ocproxy">"$STATE_FILE";echo "ACCOUNT_INDEX=$ACCOUNT_INDEX" >> "$STATE_FILE";echo "SOCKS_PORT=$socks_port" >> "$STATE_FILE";echo "LISTEN_ADDR=$listen_addr" >> "$STATE_FILE"; return 0; fi; sleep 1; done
+  log_info "等待 ocproxy 启动..."; for ((i=0;i<10;i++)); do if is_vpn_running; then log "ocproxy 连接成功 (PID=$(cat "$PID_FILE"))"; echo "MODE=ocproxy">"$STATE_FILE";echo "ACCOUNT_INDEX=$ACCOUNT_INDEX" >> "$STATE_FILE";echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}" >> "$STATE_FILE";echo "SOCKS_PORT=$socks_port" >> "$STATE_FILE";echo "LISTEN_ADDR=$listen_addr" >> "$STATE_FILE"; return 0; fi; sleep 1; done
   log_err "ocproxy 连接失败或超时"; return 1
 }
 
 start_netns_mode() {
   is_vpn_running && { log_err "VPN 已在运行"; return; }
+  ensure_pkg_openconnect
   ensure_cmd_gost || return
   ensure_cmd_socat || true # 即使 socat 安装失败也继续，使用 iptables
   select_account || return
+  select_protocol || return
   _execute_with_safety_net "_start_netns_logic"
 }
 _start_netns_logic() {
@@ -348,8 +371,8 @@ _start_netns_logic() {
   
   setup_netns
   
-  log_info "正在 Netns 中启动 OpenConnect...";
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol=anyconnect --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
+  log_info "正在 Netns 中启动 OpenConnect (协议: ${VPN_PROTOCOL:-anyconnect})...";
+  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "$IP_CMD" netns exec "${NETNS_NAME}" "${oc_cmd[@]}"
   
@@ -410,7 +433,7 @@ _start_netns_logic() {
   fi
   
   {
-    echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "SOCKS_PORT=$socks_port";
+    echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
     echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${forwarder_mode}";
     [ -n "$socat_pid_v4" ] && echo "SOCAT_PID=${socat_pid_v4}";
     [ -n "$socat_pid_v6" ] && echo "SOCAT_PID_V6=${socat_pid_v6}";
@@ -499,9 +522,10 @@ show_status() {
     echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "查询失败")"
     echo -e "    ${C_BOLD}本机公网 IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "无/查询失败")"
   else
-    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
+    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
     title "  VPN 状态: ${C_GREEN}🟢 运行中${C_RESET} (OpenConnect PID: $(cat "$PID_FILE" 2>/dev/null || echo N/A))"
     if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && echo -e "    ${C_BOLD}使用账户:${C_RESET} $(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
+    echo -e "    ${C_BOLD}VPN 协议:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
     
     case "${MODE:-}" in
       default)
