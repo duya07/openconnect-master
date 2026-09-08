@@ -467,11 +467,54 @@ route_state_conflicts() {
   return 1
 }
 
+read_route_table_or_empty() {
+  local family="$1" table="$2" output=""
+  if output="$(LC_ALL=C ip "$family" route show table "$table" 2>&1)"; then
+    printf '%s' "$output"
+    return 0
+  fi
+  case "$output" in
+    *'FIB table does not exist.'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+first_usable_non_vpn_default() {
+  awk -v vpn="$VPN_INTERFACE" '
+    $1 == "default" && $0 !~ ("dev " vpn "([[:space:]]|$)") {
+      for (i = 1; i < NF; i++) {
+        if ($i == "dev" && $(i + 1) != "") {
+          print
+          exit
+        }
+      }
+    }
+  '
+}
+
+return_route_state_is_clean() {
+  local rules4 rules6 routes4 routes6 links
+  rules4="$(ip -4 rule show 2>/dev/null)" || return 1
+  rules6="$(ip -6 rule show 2>/dev/null)" || return 1
+  routes4="$(read_route_table_or_empty -4 "$RETURN4_TABLE")" || return 1
+  routes6="$(read_route_table_or_empty -6 "$RETURN6_TABLE")" || return 1
+  links="$(ip -o link show 2>/dev/null)" || return 1
+
+  ! grep -Eq "^[[:space:]]*${RETURN4_PRIORITY}:" <<< "$rules4" || return 1
+  ! grep -Eq "^[[:space:]]*${RETURN6_PRIORITY}:" <<< "$rules6" || return 1
+  ! grep -Eq "lookup ${RETURN4_TABLE}([[:space:]]|$)" <<< "$rules4" || return 1
+  ! grep -Eq "lookup ${RETURN6_TABLE}([[:space:]]|$)" <<< "$rules6" || return 1
+  [ -z "$routes4" ] || return 1
+  [ -z "$routes6" ] || return 1
+  ! grep -Eq "^[[:space:]]*[0-9]+:[[:space:]]+${VPN_INTERFACE}(:|@)" <<< "$links" || return 1
+}
+
 cleanup_return_routes() {
   [ -e "$ROUTE_OWNER_FILE" ] || return 0
-  local _ saved_default4="" saved_default6="" current_default=""
+  local _ saved_default4="" saved_default6="" current_default="" default_routes=""
   saved_default4="$(sed -n 's/^DEFAULT4=//p' "$ROUTE_OWNER_FILE" | tail -n 1)"
   saved_default6="$(sed -n 's/^DEFAULT6=//p' "$ROUTE_OWNER_FILE" | tail -n 1)"
+  [ -n "$saved_default4" ] || { log_err "路由所有权文件缺少原 IPv4 默认路由；为避免断开入站，拒绝自动清理。"; return 1; }
   for _ in {1..32}; do
     ip -4 rule del priority "$RETURN4_PRIORITY" lookup "$RETURN4_TABLE" 2>/dev/null || break
   done
@@ -484,19 +527,33 @@ cleanup_return_routes() {
     ip link del dev "$VPN_INTERFACE" 2>/dev/null || true
   fi
 
-  current_default="$(ip -4 route show default | awk -v vpn="$VPN_INTERFACE" '$0 !~ ("dev " vpn "([[:space:]]|$)") && !found { print; found=1 }')"
+  default_routes="$(ip -4 route show default 2>/dev/null)" || { log_err "无法读取 IPv4 默认路由，保留路由所有权标记。"; return 1; }
+  current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
   if [ -z "$current_default" ] && [ -n "$saved_default4" ]; then
     local -a restore_args4
     read -r -a restore_args4 <<< "$saved_default4"
     ip -4 route replace "${restore_args4[@]}" 2>/dev/null || true
   fi
-  current_default="$(ip -6 route show default | awk -v vpn="$VPN_INTERFACE" '$0 !~ ("dev " vpn "([[:space:]]|$)") && !found { print; found=1 }')"
+  default_routes="$(ip -6 route show default 2>/dev/null)" || { log_err "无法读取 IPv6 默认路由，保留路由所有权标记。"; return 1; }
+  current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
   if [ -z "$current_default" ] && [ -n "$saved_default6" ]; then
     local -a restore_args6
     read -r -a restore_args6 <<< "$saved_default6"
     ip -6 route replace "${restore_args6[@]}" 2>/dev/null || true
   fi
-  rm -f "$ROUTE_OWNER_FILE"
+
+  if [ -n "$saved_default4" ]; then
+    default_routes="$(ip -4 route show default 2>/dev/null)" || { log_err "无法验证 IPv4 默认路由，保留路由所有权标记。"; return 1; }
+    current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+    [ -n "$current_default" ] || { log_err "IPv4 默认路由未恢复，保留路由所有权标记。"; return 1; }
+  fi
+  if [ -n "$saved_default6" ]; then
+    default_routes="$(ip -6 route show default 2>/dev/null)" || { log_err "无法验证 IPv6 默认路由，保留路由所有权标记。"; return 1; }
+    current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+    [ -n "$current_default" ] || { log_err "IPv6 默认路由未恢复，保留路由所有权标记。"; return 1; }
+  fi
+  return_route_state_is_clean || { log_err "策略规则、专用路由表或 $VPN_INTERFACE 仍有残留，保留路由所有权标记。"; return 1; }
+  rm -f -- "$ROUTE_OWNER_FILE"
 }
 
 setup_return_routes() {
@@ -508,14 +565,14 @@ setup_return_routes() {
   fi
 
   local default4 default6="" dev4 dev6="" address cidr
-  default4="$(ip -4 route show default | awk -v vpn="$VPN_INTERFACE" '$0 !~ ("dev " vpn "([[:space:]]|$)") && !found { print; found=1 }')"
+  default4="$(ip -4 route show default | first_usable_non_vpn_default)"
   [ -n "$default4" ] || { die "找不到 VPN 之外的 IPv4 默认路由，无法建立安全回程表。"; return 1; }
   dev4="$(awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$default4")"
   [ -n "$dev4" ] || { die "无法从默认路由识别出口接口。"; return 1; }
   mapfile -t RETURN4_ADDRESSES < <(ip -4 -o addr show dev "$dev4" scope global | awk '{print $4}')
   [ "${#RETURN4_ADDRESSES[@]}" -gt 0 ] || { die "接口 $dev4 没有全局 IPv4 地址。"; return 1; }
 
-  default6="$(ip -6 route show default | awk -v vpn="$VPN_INTERFACE" '$0 !~ ("dev " vpn "([[:space:]]|$)") && !found { print; found=1 }')"
+  default6="$(ip -6 route show default | first_usable_non_vpn_default)"
 
   {
     printf 'DEFAULT4=%s\n' "$default4"
@@ -633,7 +690,7 @@ service_run() {
 
 service_cleanup() {
   check_root
-  cleanup_return_routes || true
+  cleanup_return_routes || return 1
   rm -f "$HEALTH_FAILURE_FILE"
 }
 
@@ -675,13 +732,35 @@ cancel_rollback() {
 
 stop_and_disable_managed_units() {
   # stop 必须独立执行：即使单元未启用或不可 disable，也必须先终止隧道。
-  local managed_pid stop_rc=0 state=""
+  local managed_pid timer_state="" health_state="" state=""
   managed_pid="$(service_main_pid)"
-  systemctl stop "$HEALTH_TIMER_NAME" "$SERVICE_NAME" >/dev/null 2>&1 || stop_rc=$?
+
+  systemctl stop "$HEALTH_TIMER_NAME" >/dev/null 2>&1 || true
+  timer_state="$(systemctl is-active "$HEALTH_TIMER_NAME" 2>/dev/null || true)"
+  case "$timer_state" in
+    inactive|failed) ;;
+    *)
+      die "systemd 未能确认 $HEALTH_TIMER_NAME 已停止（当前状态：${timer_state:-无法读取}）；拒绝继续停止隧道。"
+      return 1
+      ;;
+  esac
+
+  systemctl stop "$HEALTH_SERVICE_NAME" >/dev/null 2>&1 || true
+  health_state="$(systemctl is-active "$HEALTH_SERVICE_NAME" 2>/dev/null || true)"
+  case "$health_state" in
+    inactive|failed) ;;
+    *)
+      die "systemd 未能确认 $HEALTH_SERVICE_NAME 已停止（当前状态：${health_state:-无法读取}）；拒绝继续停止隧道。"
+      return 1
+      ;;
+  esac
+
+  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
   case "$state" in
-    active|activating|deactivating|reloading)
-      die "systemd 未能停止 $SERVICE_NAME（当前状态：$state）；为避免破坏仍在运行的隧道，拒绝清理路由。"
+    inactive|failed) ;;
+    *)
+      die "systemd 未能确认 $SERVICE_NAME 已停止（当前状态：${state:-无法读取}）；为避免破坏仍在运行的隧道，拒绝清理路由。"
       return 1
       ;;
   esac
@@ -689,10 +768,23 @@ stop_and_disable_managed_units() {
     die "受管 OpenConnect 进程 $managed_pid 仍在运行；拒绝清理路由。"
     return 1
   fi
-  if [ "$stop_rc" -ne 0 ] && [ -z "$state" ]; then
-    die "无法确认 $SERVICE_NAME 已停止；拒绝清理路由。"
-    return 1
-  fi
+
+  health_state="$(systemctl is-active "$HEALTH_SERVICE_NAME" 2>/dev/null || true)"
+  case "$health_state" in
+    inactive|failed) ;;
+    *)
+      die "$HEALTH_SERVICE_NAME 在主隧道停止后未能确认停稳（当前状态：${health_state:-无法读取}）；拒绝清理路由。"
+      return 1
+      ;;
+  esac
+  state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+  case "$state" in
+    inactive|failed) ;;
+    *)
+      die "$SERVICE_NAME 在停止流程末尾未能确认停稳（当前状态：${state:-无法读取}）；拒绝清理路由。"
+      return 1
+      ;;
+  esac
   systemctl disable "$HEALTH_TIMER_NAME" "$SERVICE_NAME" >/dev/null 2>&1 || log_warn "服务已停止，但禁用开机自启失败；请检查 systemctl 状态。"
 }
 
@@ -710,11 +802,11 @@ clear_start_signal_traps() {
 }
 
 handle_interrupted_start() {
-  local signal_name="$1"
+  local signal_name="$1" exit_code="$2"
   clear_start_signal_traps
   log_warn "启动过程收到 ${signal_name}，正在停止受管隧道并清理本项目状态..."
   cleanup_start_attempt || true
-  exit 130
+  exit "$exit_code"
 }
 
 start_managed_units() {
@@ -726,24 +818,34 @@ start_managed_units() {
 
 arm_rollback() {
   cancel_rollback
-  systemd-run --quiet --unit="$ROLLBACK_UNIT" --on-active=3m -- "$INSTALL_PATH" _rollback
+  systemd-run --quiet --unit="$ROLLBACK_UNIT" --on-active=3m -- "$INSTALL_PATH" _rollback || return 1
   log_warn "已武装独立回滚：3 分钟内未确认，将停止并禁用全局 VPN。"
 }
 
 rollback_now() {
   check_root
   system_log "global-mode safety rollback triggered"
-  stop_and_disable_managed_units
-  service_cleanup
+  stop_and_disable_managed_units || return 1
+  service_cleanup || return 1
 }
 
 prepare_service_replacement() {
-  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    local answer=""
-    log_warn "已有 oc-master 连接正在运行，继续会先停止它。"
+  local answer="" service_state="" health_state="" timer_state="" state needs_stop=0
+  service_state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+  health_state="$(systemctl is-active "$HEALTH_SERVICE_NAME" 2>/dev/null || true)"
+  timer_state="$(systemctl is-active "$HEALTH_TIMER_NAME" 2>/dev/null || true)"
+  for state in "$service_state" "$health_state" "$timer_state"; do
+    case "$state" in
+      inactive|failed) ;;
+      *) needs_stop=1 ;;
+    esac
+  done
+
+  if [ "$needs_stop" -eq 1 ]; then
+    log_warn "已有 oc-master 受管单元正在运行或切换状态，继续会先将其完整停止。"
     read -r -p "确认替换？[y/N]: " answer
     [[ "$answer" =~ ^[yY]$ ]] || return 1
-    systemctl stop "$SERVICE_NAME"
+    stop_and_disable_managed_units || return 1
   fi
 
   local foreign_pids
@@ -769,9 +871,9 @@ start_mode() {
   write_profile "$mode" "$ACCOUNT_INDEX" "$VPN_PROTOCOL" "$socks_port"
   rm -f "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"
 
-  trap 'handle_interrupted_start SIGINT' INT
-  trap 'handle_interrupted_start SIGTERM' TERM
-  trap 'handle_interrupted_start SIGHUP' HUP
+  trap 'handle_interrupted_start SIGINT 130' INT
+  trap 'handle_interrupted_start SIGTERM 143' TERM
+  trap 'handle_interrupted_start SIGHUP 129' HUP
 
   if [ "$mode" = "global" ] && ! arm_rollback; then
     log_err "无法创建独立安全回滚，拒绝启动整机全局 VPN。"
@@ -819,8 +921,8 @@ start_mode() {
 
 stop_vpn() {
   check_root
-  stop_and_disable_managed_units
-  service_cleanup
+  stop_and_disable_managed_units || return 1
+  service_cleanup || return 1
   cancel_rollback
   log "VPN 已停止，oc-master 的策略路由已清理。"
 }

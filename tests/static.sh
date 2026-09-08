@@ -48,7 +48,6 @@ grep -F 'Restart=always' oc_master.sh >/dev/null
 grep -F 'http_data_probe' oc_master.sh >/dev/null
 grep -F 'chmod 600 "$ACCOUNTS_FILE"' oc_master.sh >/dev/null
 grep -F 'chown 0:0 "$ACCOUNTS_FILE"' oc_master.sh >/dev/null
-grep -F 'systemctl stop "$HEALTH_TIMER_NAME" "$SERVICE_NAME"' oc_master.sh >/dev/null
 grep -F '拒绝清理路由' oc_master.sh >/dev/null
 grep -F 'stop_and_disable_managed_units' oc_master.sh >/dev/null
 grep -F 'GLOBAL-DDNS-RISK' oc_master.sh >/dev/null
