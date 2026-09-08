@@ -17,6 +17,19 @@ readonly PROFILE_FILE="${OCM_PROFILE_FILE:-${CONFIG_DIR}/profile.conf}"
 readonly ACCOUNTS_FILE="${OCM_ACCOUNTS_FILE:-/root/.vpn_accounts.env}"
 readonly RUNTIME_DIR="${OCM_RUNTIME_DIR:-/run/oc-master}"
 readonly LOCK_FILE="${OCM_LOCK_FILE:-/run/lock/oc-master.lock}"
+readonly ACTIVE_RUN_FILE="${OCM_ACTIVE_RUN_FILE:-${CONFIG_DIR}/active-run.conf}"
+readonly RUN_STATE_FILE="${OCM_RUN_STATE_FILE:-${CONFIG_DIR}/run-state.conf}"
+# shellcheck disable=SC2034  # 后续事务路由任务消费。
+readonly ROUTE_PLAN_FILE="${OCM_ROUTE_PLAN_FILE:-${CONFIG_DIR}/route-plan.conf}"
+readonly STATE_LOCK_FILE="${OCM_STATE_LOCK_FILE:-/run/lock/oc-master-state.lock}"
+# shellcheck disable=SC2034  # 后续 service-operation lock 任务消费。
+readonly SERVICE_LOCK_FILE="${OCM_SERVICE_LOCK_FILE:-/run/lock/oc-master-service.lock}"
+# shellcheck disable=SC2034  # 后续服务代际任务消费。
+readonly SERVICE_RUN_ID_FILE="${OCM_SERVICE_RUN_ID_FILE:-${RUNTIME_DIR}/service.run-id}"
+readonly BOOT_ID_FILE="${OCM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+readonly UUID_FILE="${OCM_UUID_FILE:-/proc/sys/kernel/random/uuid}"
+# shellcheck disable=SC2034  # 后续 systemd restart 策略任务消费。
+readonly NON_RESTARTABLE_EXIT=78
 readonly DDNS_SCAN_ROOT="${OCM_DDNS_SCAN_ROOT:-/}"
 readonly HEALTH_FAILURE_FILE="${RUNTIME_DIR}/health.failures"
 readonly HEALTH_RESTART_FILE="${RUNTIME_DIR}/health.last_restart"
@@ -68,6 +81,267 @@ acquire_manager_lock() {
   exec {MANAGER_LOCK_FD}>"$LOCK_FILE"
   flock -n "$MANAGER_LOCK_FD" || { die "另一个 oc-master 管理操作正在进行，请稍后重试。"; return 1; }
 }
+
+valid_uuid() {
+  [[ "${1:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+}
+
+read_single_uuid_file() {
+  local path="$1"
+  local -a lines=()
+
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  mapfile -t lines < "$path" || return 1
+  [ "${#lines[@]}" -eq 1 ] && valid_uuid "${lines[0]}" || return 1
+  printf '%s\n' "${lines[0]}"
+}
+
+new_run_id() {
+  read_single_uuid_file "$UUID_FILE"
+}
+
+current_boot_id() {
+  read_single_uuid_file "$BOOT_ID_FILE"
+}
+
+atomic_replace_from_stdin() (
+  [ "$#" -eq 2 ] || return 1
+  local target="$1" mode="$2" target_dir target_base temporary_file=""
+
+  target_dir="$(dirname -- "$target")" || return 1
+  target_base="$(basename -- "$target")" || return 1
+  [ -d "$target_dir" ] || return 1
+  trap '[ -z "$temporary_file" ] || rm -f -- "$temporary_file"' EXIT HUP INT TERM
+  temporary_file="$(mktemp "${target_dir}/.${target_base}.XXXXXX")" || return 1
+  cat > "$temporary_file" || return 1
+  chown 0:0 "$temporary_file" || return 1
+  chmod "$mode" "$temporary_file" || return 1
+  [ -f "$temporary_file" ] && [ ! -L "$temporary_file" ] || return 1
+  mv -f -- "$temporary_file" "$target" || return 1
+  temporary_file=""
+)
+
+valid_state_phase() {
+  case "${1:-}" in
+    PREPARING|STARTING|RUNNING|AWAITING_CONFIRMATION|CONFIRMED|ROLLBACK_CLAIMED|STOPPING|CLEANUP_FAILED|CLEANED) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_account_record() {
+  local record="${1:-}" pipes desc user password host group protocol
+
+  case "$record" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  pipes="${record//[^|]/}"
+  [ "${#pipes}" -eq 5 ] || return 1
+  IFS='|' read -r desc user password host group protocol <<< "$record"
+  [ -n "$desc" ] && [ -n "$user" ] && [ -n "$password" ] && [ -n "$host" ] || return 1
+  [[ "$host" != -* ]] || return 1
+  [ -z "$protocol" ] || valid_protocol "$protocol"
+}
+
+valid_active_run_values() {
+  [ "$#" -eq 7 ] || return 1
+  local run_id="$1" boot_id="$2" mode="$3" account_index="$4" protocol="$5" socks_port="$6" account_record="$7"
+
+  valid_uuid "$run_id" && valid_uuid "$boot_id" || return 1
+  case "$mode" in proxy|global) ;; *) return 1 ;; esac
+  [[ "$account_index" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  valid_protocol "$protocol" || return 1
+  case "$mode" in
+    proxy) valid_port "$socks_port" || return 1 ;;
+    global) [ -z "$socks_port" ] || return 1 ;;
+  esac
+  valid_account_record "$account_record"
+}
+
+valid_run_state_values() {
+  [ "$#" -eq 4 ] || return 1
+  local run_id="$1" phase="$2" desired_active="$3" rollback_deadline="$4"
+
+  valid_uuid "$run_id" && valid_state_phase "$phase" || return 1
+  case "$desired_active" in 0|1) ;; *) return 1 ;; esac
+  [[ "$rollback_deadline" =~ ^(0|[1-9][0-9]*)$ ]]
+}
+
+write_active_run() {
+  [ "$#" -eq 7 ] || return 1
+  valid_active_run_values "$@" || return 1
+  printf '%s\n' \
+    'FORMAT_VERSION=1' \
+    "RUN_ID=$1" \
+    "CREATED_BOOT_ID=$2" \
+    "MODE=$3" \
+    "ACCOUNT_INDEX=$4" \
+    "VPN_PROTOCOL=$5" \
+    "SOCKS_PORT=$6" \
+    "ACCOUNT_RECORD=$7" \
+    | atomic_replace_from_stdin "$ACTIVE_RUN_FILE" 0600
+}
+
+load_active_run() {
+  local line key value
+  local parsed_format="" parsed_run_id="" parsed_boot_id="" parsed_mode=""
+  local parsed_account_index="" parsed_protocol="" parsed_socks_port="" parsed_account_record=""
+  local seen_format=0 seen_run_id=0 seen_boot_id=0 seen_mode=0
+  local seen_account_index=0 seen_protocol=0 seen_socks_port=0 seen_account_record=0
+
+  [ -f "$ACTIVE_RUN_FILE" ] && [ ! -L "$ACTIVE_RUN_FILE" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" == *=* ]] || return 1
+    IFS='=' read -r key value <<< "$line"
+    case "$key" in
+      FORMAT_VERSION)
+        [ "$seen_format" -eq 0 ] || return 1
+        seen_format=1; parsed_format="$value"
+        ;;
+      RUN_ID)
+        [ "$seen_run_id" -eq 0 ] || return 1
+        seen_run_id=1; parsed_run_id="$value"
+        ;;
+      CREATED_BOOT_ID)
+        [ "$seen_boot_id" -eq 0 ] || return 1
+        seen_boot_id=1; parsed_boot_id="$value"
+        ;;
+      MODE)
+        [ "$seen_mode" -eq 0 ] || return 1
+        seen_mode=1; parsed_mode="$value"
+        ;;
+      ACCOUNT_INDEX)
+        [ "$seen_account_index" -eq 0 ] || return 1
+        seen_account_index=1; parsed_account_index="$value"
+        ;;
+      VPN_PROTOCOL)
+        [ "$seen_protocol" -eq 0 ] || return 1
+        seen_protocol=1; parsed_protocol="$value"
+        ;;
+      SOCKS_PORT)
+        [ "$seen_socks_port" -eq 0 ] || return 1
+        seen_socks_port=1; parsed_socks_port="$value"
+        ;;
+      ACCOUNT_RECORD)
+        [ "$seen_account_record" -eq 0 ] || return 1
+        seen_account_record=1; parsed_account_record="$value"
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$ACTIVE_RUN_FILE"
+
+  [ "$seen_format" -eq 1 ] && [ "$seen_run_id" -eq 1 ] && [ "$seen_boot_id" -eq 1 ] \
+    && [ "$seen_mode" -eq 1 ] && [ "$seen_account_index" -eq 1 ] && [ "$seen_protocol" -eq 1 ] \
+    && [ "$seen_socks_port" -eq 1 ] && [ "$seen_account_record" -eq 1 ] || return 1
+  [ "$parsed_format" = 1 ] || return 1
+  valid_active_run_values "$parsed_run_id" "$parsed_boot_id" "$parsed_mode" "$parsed_account_index" \
+    "$parsed_protocol" "$parsed_socks_port" "$parsed_account_record" || return 1
+
+  RUN_ID="$parsed_run_id"
+  # shellcheck disable=SC2034  # load_active_run 的公开输出。
+  CREATED_BOOT_ID="$parsed_boot_id"
+  # shellcheck disable=SC2034  # load_active_run 的公开输出。
+  MODE="$parsed_mode"
+  ACCOUNT_INDEX="$parsed_account_index"
+  VPN_PROTOCOL="$parsed_protocol"
+  # shellcheck disable=SC2034  # load_active_run 的公开输出。
+  SOCKS_PORT="$parsed_socks_port"
+  # shellcheck disable=SC2034  # load_active_run 的公开输出。
+  ACCOUNT_RECORD="$parsed_account_record"
+}
+
+write_run_state() {
+  [ "$#" -eq 4 ] || return 1
+  valid_run_state_values "$@" || return 1
+  printf '%s\n' \
+    'FORMAT_VERSION=1' \
+    "RUN_ID=$1" \
+    "PHASE=$2" \
+    "DESIRED_ACTIVE=$3" \
+    "ROLLBACK_DEADLINE=$4" \
+    | atomic_replace_from_stdin "$RUN_STATE_FILE" 0600
+}
+
+load_run_state() {
+  local line key value
+  local parsed_format="" parsed_run_id="" parsed_phase="" parsed_desired_active="" parsed_rollback_deadline=""
+  local seen_format=0 seen_run_id=0 seen_phase=0 seen_desired_active=0 seen_rollback_deadline=0
+
+  [ -f "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" == *=* ]] || return 1
+    IFS='=' read -r key value <<< "$line"
+    case "$key" in
+      FORMAT_VERSION)
+        [ "$seen_format" -eq 0 ] || return 1
+        seen_format=1; parsed_format="$value"
+        ;;
+      RUN_ID)
+        [ "$seen_run_id" -eq 0 ] || return 1
+        seen_run_id=1; parsed_run_id="$value"
+        ;;
+      PHASE)
+        [ "$seen_phase" -eq 0 ] || return 1
+        seen_phase=1; parsed_phase="$value"
+        ;;
+      DESIRED_ACTIVE)
+        [ "$seen_desired_active" -eq 0 ] || return 1
+        seen_desired_active=1; parsed_desired_active="$value"
+        ;;
+      ROLLBACK_DEADLINE)
+        [ "$seen_rollback_deadline" -eq 0 ] || return 1
+        seen_rollback_deadline=1; parsed_rollback_deadline="$value"
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$RUN_STATE_FILE"
+
+  [ "$seen_format" -eq 1 ] && [ "$seen_run_id" -eq 1 ] && [ "$seen_phase" -eq 1 ] \
+    && [ "$seen_desired_active" -eq 1 ] && [ "$seen_rollback_deadline" -eq 1 ] || return 1
+  [ "$parsed_format" = 1 ] || return 1
+  valid_run_state_values "$parsed_run_id" "$parsed_phase" "$parsed_desired_active" \
+    "$parsed_rollback_deadline" || return 1
+
+  RUN_ID="$parsed_run_id"
+  PHASE="$parsed_phase"
+  # shellcheck disable=SC2034  # load_run_state 的公开输出。
+  DESIRED_ACTIVE="$parsed_desired_active"
+  # shellcheck disable=SC2034  # load_run_state 的公开输出。
+  ROLLBACK_DEADLINE="$parsed_rollback_deadline"
+}
+
+load_runtime_state() {
+  local active_run_id
+
+  load_active_run || return 1
+  active_run_id="$RUN_ID"
+  load_run_state || return 1
+  [ "$RUN_ID" = "$active_run_id" ]
+}
+
+transition_run_state() (
+  [ "$#" -eq 5 ] || return 1
+  local expected_run_id="$1" allowed_old_phases="$2" new_phase="$3"
+  local desired_active="$4" rollback_deadline="$5" phase state_lock_fd
+  local -a allowed_phase_list=()
+
+  valid_run_state_values "$expected_run_id" "$new_phase" "$desired_active" "$rollback_deadline" || return 1
+  IFS=',' read -r -a allowed_phase_list <<< "$allowed_old_phases"
+  [ "${#allowed_phase_list[@]}" -gt 0 ] || return 1
+  for phase in "${allowed_phase_list[@]}"; do
+    valid_state_phase "$phase" || return 1
+  done
+
+  command -v flock >/dev/null 2>&1 || return 1
+  install -d -m 0755 "$(dirname -- "$STATE_LOCK_FILE")" || return 1
+  exec {state_lock_fd}>"$STATE_LOCK_FILE" || return 1
+  flock "$state_lock_fd" || return 1
+
+  load_runtime_state || return 1
+  [ "$RUN_ID" = "$expected_run_id" ] || return 1
+  case ",$allowed_old_phases," in
+    *",$PHASE,"*) ;;
+    *) return 1 ;;
+  esac
+  write_run_state "$expected_run_id" "$new_phase" "$desired_active" "$rollback_deadline"
+)
 
 is_systemd_host() {
   command -v systemctl >/dev/null 2>&1 && [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]
