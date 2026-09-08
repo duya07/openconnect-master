@@ -182,9 +182,11 @@ The menu provides:
 2) Start host-global VPN
 3) Stop VPN
 4) Manage accounts
-5) View logs
-6) Uninstall manager
-7) Install/update the ocm shortcut
+5) Check the VPN data plane now
+6) View runtime logs
+7) Check/install dependencies
+8) Install/update the ocm shortcut
+9) Uninstall manager
 0) Exit
 ```
 
@@ -195,6 +197,7 @@ sudo ocm start-proxy   # Start local SOCKS5 egress
 sudo ocm start-global  # Start host-global VPN
 sudo ocm stop          # Stop and clean project-owned routes
 sudo ocm accounts      # Manage accounts
+sudo ocm deps          # Check or install all runtime dependencies
 sudo ocm status        # Show service, mode, and egress state
 sudo ocm check         # Run one real data-plane check
 sudo ocm logs          # Show recent connection and health logs
