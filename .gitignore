@@ -20,3 +20,6 @@
 .vscode/
 .idea/
 *.iml
+
+# Codex/Superpowers 隔离工作树
+/.worktrees/
