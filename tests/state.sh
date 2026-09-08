@@ -115,6 +115,24 @@ fi
 unset -f mv
 assert_eq "$ACTIVE_BEFORE_FAILURE" "$(cksum < "$ACTIVE_RUN_FILE")" 'failed atomic replacement changed the old file'
 
+rm -f -- "$ACTIVE_RUN_FILE"
+mkdir -- "$ACTIVE_RUN_FILE"
+printf '%s\n' 'preserve this directory entry' > "${ACTIVE_RUN_FILE}/sentinel"
+DIRECTORY_SENTINEL_BEFORE="$(cksum < "${ACTIVE_RUN_FILE}/sentinel")"
+readonly DIRECTORY_SENTINEL_BEFORE
+if write_active_run "$TEST_RUN_ID" "$TEST_BOOT_ID" proxy 0 anyconnect 1080 "$TEST_ACCOUNT_LINE" \
+  >/dev/null 2>&1; then
+  fail 'active-run writer accepted a directory target'
+fi
+[ -d "$ACTIVE_RUN_FILE" ] || fail 'failed directory-target write replaced the target directory'
+assert_eq "$DIRECTORY_SENTINEL_BEFORE" "$(cksum < "${ACTIVE_RUN_FILE}/sentinel")" \
+  'failed directory-target write changed the existing directory entry'
+DIRECTORY_ENTRY_COUNT="$(find "$ACTIVE_RUN_FILE" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d '[:space:]')"
+readonly DIRECTORY_ENTRY_COUNT
+assert_eq 1 "$DIRECTORY_ENTRY_COUNT" 'failed directory-target write left an extra file behind'
+rm -f -- "${ACTIVE_RUN_FILE}/sentinel"
+rmdir -- "$ACTIVE_RUN_FILE"
+
 write_run_state "$TEST_RUN_ID" PREPARING 1 0
 assert_file_mode "$RUN_STATE_FILE" 600
 load_run_state || fail 'valid run state was rejected'

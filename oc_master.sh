@@ -111,13 +111,14 @@ atomic_replace_from_stdin() (
   target_dir="$(dirname -- "$target")" || return 1
   target_base="$(basename -- "$target")" || return 1
   [ -d "$target_dir" ] || return 1
+  [ ! -d "$target" ] || return 1
   trap '[ -z "$temporary_file" ] || rm -f -- "$temporary_file"' EXIT HUP INT TERM
   temporary_file="$(mktemp "${target_dir}/.${target_base}.XXXXXX")" || return 1
   cat > "$temporary_file" || return 1
   chown 0:0 "$temporary_file" || return 1
   chmod "$mode" "$temporary_file" || return 1
   [ -f "$temporary_file" ] && [ ! -L "$temporary_file" ] || return 1
-  mv -f -- "$temporary_file" "$target" || return 1
+  mv -T -f -- "$temporary_file" "$target" || return 1
   temporary_file=""
 )
 
