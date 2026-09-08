@@ -1,0 +1,28 @@
+{
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "openconnect-out",
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "version": "5",
+      "network": "tcp"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "network": [
+          "udp"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "final": "openconnect-out"
+  }
+}
