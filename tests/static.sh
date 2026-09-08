@@ -6,13 +6,14 @@ export PATH
 
 cd -- "${BASH_SOURCE[0]%/*}/.."
 
-"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh
+"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh
+  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/testlib.sh tests/compat.sh
 fi
 
 "${BASH}" tests/functions.sh
+"${BASH}" tests/compat.sh
 
 if command -v jq >/dev/null 2>&1; then
   jq -e . examples/sing-box-selected-inbound.json examples/sing-box-all-tcp.json >/dev/null
