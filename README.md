@@ -1,93 +1,124 @@
-# OpenConnect Master Manager
+# 🚀 OpenConnect Master Manager
 
-[English](README_EN.md) | 简体中文
+<div align="center">
 
-面向 Linux VPS 的 OpenConnect 出口管理器。v8 的首要目标是：**远程入站连接保持走 VPS 原网关，只有明确选择的出站流量进入 VPN**。
+**[English](README_EN.md) | 简体中文**
 
-## 推荐架构
+![Version](https://img.shields.io/badge/version-8.0.0-blue?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square)
+![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
 
-| 模式 | 宿主机默认路由 | 系统防火墙/sysctl | 出口能力 | 推荐度 |
-|---|---:|---:|---|---:|
-| 本地 SOCKS5 | 不修改 | 不修改 | TCP、IPv4 | **推荐** |
-| 整机全局 VPN | 修改 | 不修改 | 由 VPN 网关决定 | 高级用途 |
+**一站式 OpenConnect VPN 出口管理工具**
 
-对 sing-box，通常不需要让整台 VPS 进入 VPN。让 OpenConnect 在 `127.0.0.1` 提供 SOCKS5，再由 sing-box 决定全部 TCP 或某个 inbound 走该出口，入站回程就不会被 VPN 默认路由接管。
+本地 SOCKS5 出口 | 整机全局 VPN | 入站回程保护 | systemd 稳定守护
 
-v8 不再提供旧 Netns 模式。它同时依赖 network namespace、iptables、IP forwarding、gost/socat，故障面更大，而且旧实现没有可靠重连和完整回滚；这不符合“对系统破坏最低”的目标。
+[快速开始](#-快速开始) • [功能特性](#-功能特性) • [使用文档](#-使用文档) • [管理命令](#-管理命令)
 
-## v8 修复了什么
+</div>
 
-- OpenConnect 由 systemd 前台监督，不再依赖 PID 文件加 5 分钟 cron 猜测状态。
-- 使用 `--reconnect-timeout=86400` 处理长时间链路抖动。
-- OpenConnect 版本支持时启用 30 秒 TCP keepalive，降低 ESP/DTLS 活跃但底层 TLS 被 NAT/防火墙回收的概率。
-- 每 30 秒检查真实 HTTP 数据面；连续 3 次失败才重启，并有 15 分钟认证冷却，避免错误密码导致锁号。
-- SOCKS 模式启动成功的判据是“监听存在且请求确实从 VPN 出口完成”，不是“OpenConnect 进程存在”。
-- 全局模式使用专用策略表保护原 VPS 地址的回程，不写 `/etc/iproute2/rt_tables`。
-- 全局启动前创建独立的 3 分钟 systemd 回滚；必须从外部新建连接并输入 `KEEP` 才会取消。
-- 全局启动前检查常见 cron/systemd DDNS 任务；发现后要求额外确认，避免把 VPN 出口写回公网域名。
-- 停止和异常退出都会执行幂等清理；即使 OpenConnect 已经退出，也不会跳过残留路由。
-- 管理操作使用独占锁；systemd 启动链任一步失败都会立即停止、禁用并清理，而不是等待残留状态自行消失。
-- 账户列表不显示密码。账户文件是 root-only 的 `0600` **明文文件**，不再错误宣称为“加密存储”。
-- 协议成为账户配置的一部分，不再在无人值守重连时退回错误默认协议。
+---
 
-完整的旧版缺陷、因果边界和实机证据见 [审查报告](docs/REVIEW.md)。
+## ✨ 功能特性
 
-## 要求
+### 🎯 两种运行模式
 
-- 使用 systemd 的 Linux VPS
-- root
-- `openconnect`、`curl`、`iproute2`、`util-linux`（`flock`）
-- SOCKS 模式另需 `ocproxy`
+| 模式 | 说明 | 宿主机默认路由 | 适用场景 |
+|---|---|---|---|
+| **本地 SOCKS5 模式** | 在 `127.0.0.1` 提供 OpenConnect 出口 | 不修改 | 单个程序、代理服务或指定端口按需使用 VPN，推荐 |
+| **整机全局模式** | 让宿主机默认出站通过 VPN，并保护原公网地址的入站回程 | 修改 | 确实需要整台 VPS 使用 VPN 出口的场景 |
 
-脚本可以通过 apt、dnf 或 yum 安装缺失的系统包，但只会在展示包名并得到确认后执行。
+### 🔥 核心功能
 
-## 安装与运行
+- ✅ **稳定连接与自动恢复**
+  - OpenConnect 由 systemd 前台监督并支持开机恢复
+  - 长时间链路抖动后自动重连
+  - 定期检查真实 HTTP 数据面，而不只检查进程或端口
+  - 连续多次检查失败才重启，并设置认证失败冷却时间
 
-建议先下载并检查，再执行：
+- ✅ **低影响的按需出口**
+  - SOCKS5 模式不修改宿主机默认路由、防火墙和 sysctl
+  - 可由任何支持 SOCKS5 的程序单独使用 VPN 出口
+  - 启动时验证监听端口和实际出口是否同时可用
+
+- ✅ **全局模式入站保护**
+  - 使用独立策略路由表保护 VPS 原公网地址的回程
+  - 启动前检测路由表、规则优先级和其他 OpenConnect 进程冲突
+  - 启动前武装独立的 3 分钟回滚任务
+  - 必须从外部验证新连接并输入 `KEEP`，否则自动回滚
+  - 检测常见 DDNS 任务并提示出口地址被误更新的风险
+
+- ✅ **多账户与多协议管理**
+  - 保存和切换多个 VPN 账户
+  - 支持 `anyconnect`、`nc` 和 `pulse` 协议
+  - 兼容旧版五字段账户记录
+  - 列表中隐藏密码，账户文件固定为 root-only `0600`
+
+- ✅ **安全管理与清理**
+  - 所有管理操作使用独占锁，避免同时修改网络状态
+  - 启动失败、停止和异常退出都会清理本项目创建的状态
+  - 不覆盖不属于本项目的快捷命令、路由或 OpenConnect 进程
+  - 提供简短的 `ocm` 管理命令
+
+## 📦 系统要求
+
+- **操作系统**：使用 systemd 的 Linux VPS
+- **权限**：root 或 sudo
+- **网络**：能够访问 VPN 网关和软件源
+- **基础依赖**：`openconnect`、`curl`、`iproute2`、`procps`、`util-linux`
+- **SOCKS5 模式依赖**：`ocproxy`
+
+脚本会检测缺失依赖，并在列出范围、得到确认后使用 apt、dnf 或 yum 安装。当前版本不再依赖 GOST、socat、Network Namespace 或额外的 iptables NAT。
+
+## 🚀 快速开始
+
+### 方法一：使用 curl 安装（推荐）
 
 ```bash
-git clone https://github.com/duya07/openconnect-master.git
-cd openconnect-master
-chmod +x oc_master.sh
-sudo ./oc_master.sh install
+curl -fsSL https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh -o /tmp/oc_master.sh
+sudo bash /tmp/oc_master.sh install
+rm -f /tmp/oc_master.sh
 sudo ocm
 ```
 
-`install` 只安装/更新受控程序副本和快捷命令，不启动 VPN、不安装软件包，也不创建 systemd 服务：
+### 方法二：使用 wget 安装
+
+```bash
+wget -qO /tmp/oc_master.sh https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh
+sudo bash /tmp/oc_master.sh install
+rm -f /tmp/oc_master.sh
+sudo ocm
+```
+
+安装完成后会创建：
 
 ```text
 /usr/local/sbin/oc-master
 /usr/local/bin/ocm -> /usr/local/sbin/oc-master
 ```
 
-若 `/usr/local/bin/ocm` 已被其他程序占用，脚本会拒绝覆盖。即使跳过 `install`，首次启动连接也会安装同一受控副本和快捷命令，并创建：
+`install` 只安装或更新脚本和快捷命令，不会立即连接 VPN，也不会在未确认时安装系统软件包。若 `ocm` 已被其他程序占用，安装会停止而不是覆盖。
 
-```text
-/etc/systemd/system/oc-master.service
-/etc/systemd/system/oc-master-health.service
-/etc/systemd/system/oc-master-health.timer
-/etc/oc-master/profile.conf
-```
+### 更新脚本
 
-停止命令会同时停止连接、清理本项目路由并禁用开机自启：
+重新执行任一安装方法即可。运行中的连接不会被安装命令直接替换，请先停止 VPN：
 
 ```bash
 sudo ocm stop
 ```
 
-其他非交互入口：
+## 📖 使用文档
 
-```bash
-sudo ocm status
-sudo ocm check
-sudo ocm logs
-```
+### 首次运行
 
-`start-proxy` 和 `start-global` 仍会交互选择账户，以免无意重试错误凭据。
+1. 执行 `sudo ocm` 打开主菜单。
+2. 选择 `4) 管理账户`，添加 VPN 账户。
+3. 根据需要选择本地 SOCKS5 模式或整机全局模式。
+4. 启动完成后使用状态和数据面检查确认真实出口。
 
-## 账户文件
+### 账户配置
 
-路径仍兼容旧版：`/root/.vpn_accounts.env`。
+账户信息存储在 `/root/.vpn_accounts.env`，格式如下：
 
 ```text
 显示名|用户名|密码|VPN主机|认证组(可空)|协议(anyconnect/nc/pulse)
@@ -97,79 +128,99 @@ sudo ocm logs
 
 ```text
 学校 VPN|student001|password|https://vpn.example.edu|Students|nc
+公司 VPN|employee|password|https://vpn.example.com||anyconnect
 ```
 
-限制：字段不能包含 `|`，密码不能包含换行。旧的五字段记录仍可读取，但启动时必须明确选择协议。建议通过菜单重新保存为六字段记录。
+也可以参考 [examples/vpn_accounts.example](examples/vpn_accounts.example)。
 
-不同品牌页面不等于同一种协议。若网关跳转到 Juniper/Pulse 的 `/dana-na/` 页面，`pulse` 也不一定可用；应分别验证 `pulse` 与兼容的 `nc`，不要让脚本静默猜测。
+账户文件是权限为 `0600` 的 root-only **明文文件**，不是加密保险箱。字段不能包含 `|`，密码不能包含换行。旧版五字段记录仍可读取，但每次启动时需要明确选择协议；建议通过菜单重新保存为六字段记录。
 
-## 与 sing-box 搭配
+### 🔌 本地 SOCKS5 模式（推荐）
 
-先用菜单启动本地 SOCKS5，例如 `127.0.0.1:1080`。然后在 sing-box 的 `outbounds` 中加入：
+适合只让某个程序、代理服务或指定业务使用 VPN 出口：
 
-```json
-{
-  "type": "socks",
-  "tag": "openconnect-out",
-  "server": "127.0.0.1",
-  "server_port": 1080,
-  "version": "5",
-  "network": "tcp"
-}
-```
+1. 在主菜单选择 `1) 启动本地 SOCKS5 出口`。
+2. 选择 VPN 账户并输入本地端口，例如 `1080`。
+3. 将应用的 SOCKS5 地址设置为 `127.0.0.1:1080`。
 
-### 只让某个入站走 VPN
-
-假设对应入站 tag 是 `vpn-only-in`：
-
-```json
-{
-  "inbound": ["vpn-only-in"],
-  "network": ["tcp"],
-  "action": "route",
-  "outbound": "openconnect-out"
-}
-```
-
-把这条规则放进现有 `route.rules`。完整片段见 [sing-box-selected-inbound.json](examples/sing-box-selected-inbound.json)。
-
-### 让全部 sing-box TCP 出站走 VPN
-
-将 `route.final` 设为：
-
-```json
-{
-  "final": "openconnect-out"
-}
-```
-
-完整片段见 [sing-box-all-tcp.json](examples/sing-box-all-tcp.json)。由于 ocproxy 只承载 TCP/IPv4，必须为 UDP 明确保留 direct/block 规则，不能把 UDP/QUIC 误宣称为已代理。
-
-修改生产配置前先检查，再重启：
+验证出口：
 
 ```bash
-sing-box check -c /etc/sing-box/config.json -C /etc/sing-box/conf
-systemctl restart sing-box
+curl --proxy socks5h://127.0.0.1:1080 https://api.ipify.org
 ```
 
-具体参数按你的安装路径调整。
+应用接入示例：sing-box 可以把这个 SOCKS5 地址配置成一个 outbound，再按 inbound 或路由规则选择使用。示例片段见 [指定入站走 VPN](examples/sing-box-selected-inbound.json) 和 [全部 TCP 走 VPN](examples/sing-box-all-tcp.json)。SOCKS5 模式只承载 TCP/IPv4，UDP/QUIC 需要单独处理。
 
-## 全局模式的安全确认
+### 🛡️ 整机全局模式
 
-全局模式会改变默认出站路由，风险明显高于 SOCKS 模式。流程是：
+适合让宿主机默认出站都使用 VPN。启动时脚本会：
 
-1. 保存原默认路由，并为原 VPS 源地址建立专用回程表。
-2. 检查常见 cron/systemd DDNS 任务；若命中，必须先处理风险并输入 `GLOBAL-DDNS-RISK`。
-3. 武装独立的 3 分钟回滚任务。
+1. 保存原默认路由，并为原 VPS 公网源地址建立回程策略。
+2. 检查专用路由表、规则优先级、其他 OpenConnect 进程和常见 DDNS 任务。
+3. 创建独立的 3 分钟安全回滚任务。
 4. 启动固定接口 `ocm0` 并验证真实 HTTP 数据面。
-5. 操作者从外部新建 SSH 或代理连接。
-6. 只有输入 `KEEP` 才保留；掉线或超时会自动停止并禁用服务。
+5. 要求你从外部新建 SSH 或代理连接，并在 120 秒内输入 `KEEP`。
 
-即使如此，首次仍应在云厂商控制台可用时进行。多网卡、多个公网地址、策略路由或第三方 VPN 共存环境尚未声明支持；脚本检测到专用表冲突或其他 OpenConnect 进程会拒绝启动，而不是覆盖。
+首次启用建议同时打开云厂商控制台。若外部新连接失败，不要输入 `KEEP`，脚本会自动停止并恢复本项目管理的路由状态。
 
-回程策略只能保护“已经使用原 VPS 源地址”的连接，不能阻止普通出站程序看到 VPN 公网地址。常见 DDNS 脚本会因此把域名更新到 VPN 出口，导致端口转发和中转失联。推荐直接使用 SOCKS 模式；确需全局模式时，应先暂停 DDNS，或让 DDNS 的公网 IP 查询和 API 请求显式绑定原物理接口/源地址。oc-master 只检测并警告，不会擅自停用第三方任务。
+全局出口可能让普通 DDNS 脚本把 VPN 地址误写成 VPS 公网地址。脚本只检测并警告，不会擅自暂停第三方任务；启用前应确认 DDNS 已停止，或已绑定原物理接口/源地址。
 
-## 诊断
+## 🎛️ 管理命令
+
+### 交互菜单
+
+```bash
+sudo ocm
+```
+
+菜单提供：
+
+```text
+1) 启动本地 SOCKS5 出口
+2) 启动整机全局 VPN
+3) 停止 VPN
+4) 管理账户
+5) 查看日志
+6) 卸载管理器
+7) 安装/更新快捷命令 ocm
+0) 退出
+```
+
+### 命令行入口
+
+```bash
+sudo ocm start-proxy   # 启动本地 SOCKS5 出口
+sudo ocm start-global  # 启动整机全局 VPN
+sudo ocm stop          # 停止连接并清理本项目路由
+sudo ocm accounts      # 管理账户
+sudo ocm status        # 查看服务、模式和出口状态
+sudo ocm check         # 执行一次真实数据面检查
+sudo ocm logs          # 查看最近的连接与健康检查日志
+sudo ocm install       # 安装或更新快捷命令
+sudo ocm uninstall     # 卸载管理器
+```
+
+`start-proxy` 和 `start-global` 会交互选择账户，避免无人值守时误用凭据或协议。
+
+### 停止与卸载
+
+停止 VPN：
+
+```bash
+sudo ocm stop
+```
+
+卸载管理器：
+
+```bash
+sudo ocm uninstall
+```
+
+卸载会停止 VPN，删除本项目的 systemd 单元、程序副本、快捷命令和活动配置；不会卸载共享软件包，账户文件 `/root/.vpn_accounts.env` 默认保留。
+
+## 🐛 故障排除
+
+### 查看当前状态
 
 ```bash
 sudo ocm status
@@ -178,46 +229,88 @@ sudo ocm logs
 systemctl status oc-master.service oc-master-health.timer
 ```
 
-判断连接是否正常时至少同时看：
+### 常见问题
 
-- systemd 中 OpenConnect 主进程是否存在；
-- SOCKS 监听或 `ocm0` 默认路由是否存在；
-- HTTP 探测是否真正成功；
-- 实际出口 IP 是否符合预期。
+1. **VPN 连接失败**
+   - 检查账户、认证组和 VPN 地址。
+   - 根据网关实际类型选择 `anyconnect`、`nc` 或 `pulse`，不要仅凭登录页品牌猜测。
+   - 使用 `sudo ocm logs` 查看 OpenConnect 的明确错误。
 
-仅有 PID 或端口监听不能证明代理可用。
+2. **SOCKS5 端口存在但代理不通**
+   - 运行 `sudo ocm check`，确认 HTTP 数据面而不只是监听端口。
+   - 用 `curl --proxy socks5h://127.0.0.1:端口 https://api.ipify.org` 直接测试。
+   - 检查端口是否被其他程序占用。
 
-如果客户端节点前还有端口转发或中转，必须分层检查：
+3. **全局模式后外部入站异常**
+   - 不要输入 `KEEP`，等待或触发安全回滚。
+   - 检查是否存在多网卡、多公网地址、第三方策略路由或其他 VPN。
+   - 同时检查 DDNS 是否把域名更新成了 VPN 出口地址。
 
-1. `inbound connection` 后立即出现 `read header: EOF`，只说明 TCP 已到服务端、对端未发送合法代理头；端口探活也会产生这种日志。
-2. 用与客户端完全相同的方法和密钥做一次真实 Shadowsocks/HTTP 请求。纯 TCP connect 不能证明加密、认证和转发可用。
-3. 中转节点测试失败且最终 sing-box 没有新增对应入站时，故障位于中转入口或其转发目标，不应重启 OpenConnect 或修改宿主机路由。
-4. 若 sing-box 的 `log.output` 指向文件，应使用 `tail -F /path/to/access.log` 实时观察；此时 `journalctl -f` 或面板轮询可能看不到即时 access log。
+健康状态需要同时满足 OpenConnect 受 systemd 监督、预期监听或路由存在，以及真实 HTTP 请求成功。仅有 PID 或监听端口不能证明出口可用。
 
-Shadowsocks 2022 的 `method` 和密钥必须逐字一致。排查时只比较长度或安全指纹，不要把明文密钥写进命令历史、日志或 Issue。
+## 📊 版本历史
 
-## 迁移
+### v8.0.0 (2026-09-08)
 
-从 v7 升级前先用旧脚本停止连接，并确认没有遗留 namespace、iptables 或策略路由。v8 不会主动删除它无法确认归属的规则，也不会抢占其他 OpenConnect 进程。
+- ✨ **新增**：`ocm` 快捷管理命令和非交互管理入口
+- ✨ **新增**：账户可保存 OpenConnect 协议类型
+- 🔧 **增强**：systemd 连接监督、真实数据面健康检查和失败冷却
+- 🔧 **增强**：全局模式入站回程策略、DDNS 风险检测和独立安全回滚
+- 🔧 **调整**：运行模式精简为本地 SOCKS5 与整机全局 VPN，不再依赖 GOST、socat 和 Netns
 
-```bash
-sudo ./oc_master.sh stop
-ip rule show
-ip route show table all
-pgrep -a openconnect || true
-```
+### v7.7.7 (2025-10-25) - Final
 
-如果旧版异常退出留下了资源，请先参考 [迁移说明](docs/MIGRATION-v8.md)，不要直接复制通用删除命令到生产机。
+- ✨ **新增**：Netns 模式的 IPv6 连通性主动测试功能
+- 🔧 **修复**：增强 `show_status` 中的 IPv6 检测
+- 🔧 **优化**：简化 ocproxy 模式，默认监听本地地址
+- ✨ **增强**：socat 转发支持 IPv4 和 IPv6 双栈监听
+- 📝 **文档**：完善使用文档和故障排除指南
 
-## 参考实现
+### v7.7.6 (2025-01-10)
 
-- [OpenConnect](https://gitlab.com/openconnect/openconnect)
+- 🔧 **修复**：采用“服务内置（gost in netns），端口外挂（socat/DNAT）”架构
+- ✨ **新增**：优先使用 socat 端口转发，并提供 iptables DNAT 备用
+- 🔧 **增强**：增加 tun 接口和内部网络连通性检查
+
+### v7.7.5 (Earlier)
+
+- 初始版本发布
+- 支持三种运行模式
+- 实现策略路由保护
+- 引入 Network Namespace 隔离
+
+旧版本升级前请先停止旧连接。若旧版异常退出后留有 Netns、iptables 或进程状态，可参考 [迁移说明](docs/MIGRATION-v8.md)。
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+### 开发建议
+
+- 保持代码风格一致
+- 添加必要的注释
+- 更新相关文档和示例
+- 修改网络行为时同时验证启动、失败回滚、停止和重连路径
+
+审查依据和实机验证记录保存在 [docs/REVIEW.md](docs/REVIEW.md)，不影响普通用户按本文档安装和管理。
+
+## 📄 许可证
+
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE) 文件。
+
+## 🙏 致谢
+
+- [OpenConnect](https://www.infradead.org/openconnect/)
 - [ocproxy](https://github.com/cernekee/ocproxy)
 - [wazum/openconnect-proxy](https://github.com/wazum/openconnect-proxy)
-- [vpn-slice](https://github.com/dlenski/vpn-slice)
-- [vopono](https://github.com/jamesmcm/vopono)
-- [sing-box](https://github.com/SagerNet/sing-box)
+- 所有使用、测试和提供反馈的用户
 
-## License
+---
 
-[MIT](LICENSE)
+<div align="center">
+
+**如果这个项目对您有帮助，请给个 ⭐ Star 支持一下！**
+
+Made with ❤️ by [duya07](https://github.com/duya07)
+
+</div>
