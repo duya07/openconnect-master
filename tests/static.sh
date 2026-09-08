@@ -55,5 +55,8 @@ grep -F 'GLOBAL-DDNS-RISK' oc_master.sh >/dev/null
 grep -F 'start_managed_units' oc_master.sh >/dev/null
 grep -F 'acquire_manager_lock' oc_master.sh >/dev/null
 grep -F 'readonly SHORTCUT_PATH="${OCM_SHORTCUT_PATH:-/usr/local/bin/ocm}"' oc_master.sh >/dev/null
+grep -F 'handle_interrupted_start SIGINT' oc_master.sh >/dev/null
+grep -F '检查/安装依赖' oc_master.sh >/dev/null
+grep -F '请选择 [0-9]:' oc_master.sh >/dev/null
 
 printf 'static checks passed\n'

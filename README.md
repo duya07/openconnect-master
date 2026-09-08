@@ -180,9 +180,11 @@ sudo ocm
 2) 启动整机全局 VPN
 3) 停止 VPN
 4) 管理账户
-5) 查看日志
-6) 卸载管理器
-7) 安装/更新快捷命令 ocm
+5) 立即检查 VPN 数据面
+6) 查看运行日志
+7) 检查/安装依赖
+8) 安装/更新快捷命令 ocm
+9) 卸载管理器
 0) 退出
 ```
 
@@ -193,6 +195,7 @@ sudo ocm start-proxy   # 启动本地 SOCKS5 出口
 sudo ocm start-global  # 启动整机全局 VPN
 sudo ocm stop          # 停止连接并清理本项目路由
 sudo ocm accounts      # 管理账户
+sudo ocm deps          # 检查或安装全部运行依赖
 sudo ocm status        # 查看服务、模式和出口状态
 sudo ocm check         # 执行一次真实数据面检查
 sudo ocm logs          # 查看最近的连接与健康检查日志

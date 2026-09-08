@@ -7,6 +7,7 @@ umask 077
 
 readonly VERSION="8.0.0"
 readonly TAG="oc-master"
+readonly DISPLAY_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 readonly INSTALL_PATH="${OCM_INSTALL_PATH:-/usr/local/sbin/oc-master}"
@@ -32,18 +33,30 @@ readonly RETURN6_PRIORITY="10001"
 
 if [ -t 1 ]; then
   C_RESET='\033[0m'; C_BOLD='\033[1m'
-  C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_CYAN='\033[36m'
+  C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_CYAN='\033[36m'; C_GREY='\033[90m'
 else
-  C_RESET=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+  C_RESET=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_GREY=''
 fi
 
-log()      { printf '%b%s%b\n' "${C_GREEN}✓ [$TAG] " "$*" "$C_RESET"; }
-log_info() { printf '%b%s%b\n' "${C_CYAN}i [$TAG] " "$*" "$C_RESET"; }
-log_warn() { printf '%b%s%b\n' "${C_YELLOW}! [$TAG] " "$*" "$C_RESET" >&2; }
-log_err()  { printf '%b%s%b\n' "${C_RED}x [$TAG] " "$*" "$C_RESET" >&2; }
+log()      { printf '%b%s%b\n' "${C_GREEN}✅ [$DISPLAY_TAG] " "$*" "$C_RESET"; }
+log_info() { printf '%b%s%b\n' "${C_CYAN}ℹ️  [$DISPLAY_TAG] " "$*" "$C_RESET"; }
+log_warn() { printf '%b%s%b\n' "${C_YELLOW}⚠️  [$DISPLAY_TAG] " "$*" "$C_RESET" >&2; }
+log_err()  { printf '%b%s%b\n' "${C_RED}❌ [$DISPLAY_TAG] " "$*" "$C_RESET" >&2; }
 die()      { log_err "$*"; return 1; }
 system_log() { logger -t "$TAG" "$*" 2>/dev/null || true; }
 check_root() { [ "${EUID}" -eq 0 ] || { log_err "请使用 root 运行。"; exit 1; }; }
+title() { printf '%b%s%b\n' "$C_BOLD" "$*" "$C_RESET"; }
+sep() { printf '%b%s%b\n' "$C_GREY" '--------------------------------------------------------' "$C_RESET"; }
+clear_screen() {
+  [ -t 1 ] || return 0
+  command -v clear >/dev/null 2>&1 && clear 2>/dev/null || true
+}
+pause_menu() {
+  [ -t 0 ] || return 0
+  printf '\n'
+  read -r -n 1 -s -p "按任意键返回主菜单..." _ || true
+  printf '\n'
+}
 
 ensure_dirs() {
   install -d -o 0 -g 0 -m 0700 "$CONFIG_DIR" "$RUNTIME_DIR"
@@ -104,6 +117,13 @@ ensure_dependencies() {
     command -v "$cmd" >/dev/null 2>&1 || { die "依赖安装后仍找不到：$cmd"; return 1; }
   done
   [ "$mode" != "proxy" ] || command -v ocproxy >/dev/null 2>&1 || { die "依赖安装后仍找不到：ocproxy"; return 1; }
+}
+
+check_all_dependencies() {
+  ensure_dependencies proxy || return 1
+  command -v systemd-run >/dev/null 2>&1 \
+    || { die "缺少 systemd-run；整机全局模式无法创建独立安全回滚。"; return 1; }
+  log "全部运行依赖检查通过。"
 }
 
 ensure_accounts_file() {
@@ -184,7 +204,10 @@ select_account() {
 manage_accounts() {
   ensure_accounts_file
   while true; do
-    printf '\n%b\n' "${C_BOLD}VPN 账户（密码始终隐藏）${C_RESET}"
+    clear_screen
+    printf '\n%b⚙️  VPN 账户管理%b\n' "$C_BOLD" "$C_RESET"
+    sep
+    printf '  密码始终隐藏；账户文件权限为 0600。\n\n'
     read_accounts
     local i line desc user _password host group protocol extra
     if [ "${#ACCOUNTS[@]}" -eq 0 ]; then
@@ -197,9 +220,10 @@ manage_accounts() {
           "$((i + 1))" "$desc" "$user" "$host" "${group:--}" "${protocol:-未设置}"
       done
     fi
-    printf '%s\n' "  1) 添加账户" "  2) 删除账户" "  3) 返回"
+    sep
+    printf '%s\n' "  1) ➕ 添加账户" "  2) 🗑️  删除账户" "  0) ↩️  返回主菜单"
     local action=""
-    read -r -p "选择 [1-3]: " action
+    read -r -p "请选择 [0-2]: " action
     case "$action" in
       1)
         local new_desc="" new_user="" new_pass="" new_host="" new_group=""
@@ -232,7 +256,7 @@ manage_accounts() {
         rm -f "$tmp"
         log "账户已删除。"
         ;;
-      3) return 0 ;;
+      0) return 0 ;;
       *) log_err "无效选择。" ;;
     esac
   done
@@ -672,6 +696,27 @@ stop_and_disable_managed_units() {
   systemctl disable "$HEALTH_TIMER_NAME" "$SERVICE_NAME" >/dev/null 2>&1 || log_warn "服务已停止，但禁用开机自启失败；请检查 systemctl 状态。"
 }
 
+cleanup_start_attempt() {
+  if ! stop_and_disable_managed_units; then
+    log_err "无法确认隧道已经停止；为保护现有连接，保留受管状态和已武装的回滚任务。"
+    return 1
+  fi
+  service_cleanup || { log_err "隧道已停止，但本项目网络状态未能完整清理。"; return 1; }
+  cancel_rollback
+}
+
+clear_start_signal_traps() {
+  trap - INT TERM HUP
+}
+
+handle_interrupted_start() {
+  local signal_name="$1"
+  clear_start_signal_traps
+  log_warn "启动过程收到 ${signal_name}，正在停止受管隧道并清理本项目状态..."
+  cleanup_start_attempt || true
+  exit 130
+}
+
 start_managed_units() {
   systemctl reset-failed "$SERVICE_NAME" &&
     systemctl enable "$SERVICE_NAME" "$HEALTH_TIMER_NAME" >/dev/null &&
@@ -724,82 +769,128 @@ start_mode() {
   write_profile "$mode" "$ACCOUNT_INDEX" "$VPN_PROTOCOL" "$socks_port"
   rm -f "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"
 
-  if [ "$mode" = "global" ]; then arm_rollback; fi
+  trap 'handle_interrupted_start SIGINT' INT
+  trap 'handle_interrupted_start SIGTERM' TERM
+  trap 'handle_interrupted_start SIGHUP' HUP
+
+  if [ "$mode" = "global" ] && ! arm_rollback; then
+    log_err "无法创建独立安全回滚，拒绝启动整机全局 VPN。"
+    cleanup_start_attempt || true
+    clear_start_signal_traps
+    return 1
+  fi
   if ! start_managed_units; then
     log_err "systemd 启动链失败，正在立即停止、禁用并清理本项目状态。"
-    cancel_rollback
-    stop_and_disable_managed_units
-    service_cleanup
+    cleanup_start_attempt || true
+    clear_start_signal_traps
     return 1
   fi
 
   log_info "等待真实数据面可用（最长 60 秒）..."
   if ! wait_until_healthy; then
     log_err "连接没有通过数据面检查，正在停止并清理。"
-    stop_and_disable_managed_units
-    service_cleanup
-    cancel_rollback
+    cleanup_start_attempt || true
+    clear_start_signal_traps
     journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
     return 1
   fi
 
   if [ "$mode" = "proxy" ]; then
+    clear_start_signal_traps
     log "SOCKS5 已可用：127.0.0.1:${socks_port}；宿主机默认路由未修改。"
     return 0
   fi
 
   log "全局 VPN 数据面已可用。"
-  printf '%s\n' "请现在从外部新建一次 SSH 或 sing-box 连接，确认入站回程正常。"
+  printf '%s\n' "请现在从外部新建一次 SSH 或其他入站连接，确认回程正常。"
   read -r -t 120 -p "确认无误后在 120 秒内输入 KEEP: " answer || answer=""
   printf '\n'
   if [ "$answer" = "KEEP" ]; then
     cancel_rollback
+    clear_start_signal_traps
     log "已确认入站正常，取消独立回滚。"
   else
     log_warn "未收到 KEEP，立即执行安全回滚。"
-    rollback_now
+    cleanup_start_attempt || true
+    clear_start_signal_traps
     return 1
   fi
 }
 
 stop_vpn() {
   check_root
-  cancel_rollback
   stop_and_disable_managed_units
   service_cleanup
+  cancel_rollback
   log "VPN 已停止，oc-master 的策略路由已清理。"
 }
 
 public_ip() {
   local proxy="${1:-}" args=(-4 -sS --connect-timeout 4 --max-time 8)
   if [ -n "$proxy" ]; then args+=(--proxy "$proxy"); else args+=(--noproxy '*'); fi
-  curl "${args[@]}" https://api.ipify.org 2>/dev/null || printf '查询失败'
+  local value=""
+  value="$(curl "${args[@]}" https://api.ipify.org 2>/dev/null || true)"
+  [ -n "$value" ] && printf '%s' "$value" || printf '查询失败'
+}
+
+public_ipv6() {
+  local value=""
+  value="$(curl -6 -sS --connect-timeout 2 --max-time 4 --noproxy '*' https://api64.ipify.org 2>/dev/null || true)"
+  [ -n "$value" ] && printf '%s' "$value" || printf '无/查询失败'
 }
 
 show_status() {
-  printf '\n%b\n' "${C_BOLD}OpenConnect Master v${VERSION}${C_RESET}"
+  printf '\n%b%s%b\n' "$C_BOLD" '========================================================' "$C_RESET"
+  printf '%b  🚀 OpenConnect Master Manager v%s 🚀%b\n' "$C_BOLD" "$VERSION" "$C_RESET"
+  printf '%b%s%b\n' "$C_BOLD" '========================================================' "$C_RESET"
+  sep
   if [ ! -r "$PROFILE_FILE" ]; then
-    printf '状态：未配置\n'
-    printf '本机 IPv4：%s\n' "$(public_ip)"
+    printf '  %bVPN 状态:%b %b🔴 停止%b\n' "$C_BOLD" "$C_RESET" "$C_RED" "$C_RESET"
+    printf '    %b运行模式:%b 未配置\n' "$C_BOLD" "$C_RESET"
+    printf '    %b自动守护:%b 未启用（首次启动后自动配置）\n' "$C_BOLD" "$C_RESET"
+    printf '    %b本机公网 IPv4:%b %s\n' "$C_BOLD" "$C_RESET" "$(public_ip)"
+    printf '    %b本机公网 IPv6:%b %s\n' "$C_BOLD" "$C_RESET" "$(public_ipv6)"
+    sep
     return 0
   fi
 
   if ! load_profile; then return 1; fi
-  local active="否" healthy="否" exit_ip="-"
+  local active="否" healthy="否" exit_ip="未检测" mode_name="未知" main_pid="-" guard="未启用"
+  local host_ipv4 host_ipv6 status_color="$C_RED" status_icon="🔴" status_label="停止"
   systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && active="是"
-  if health_once; then healthy="是"; fi
+  systemctl is-active --quiet "$HEALTH_TIMER_NAME" 2>/dev/null && guard="已启用"
+  if [ "$active" = "是" ] && health_once; then healthy="是"; fi
+  host_ipv4="$(public_ip)"
+  host_ipv6="$(public_ipv6)"
   if [ "$PROFILE_MODE" = "proxy" ]; then
+    mode_name="🔌 本地 SOCKS5 模式（宿主机路由不变）"
     [ "$healthy" != "是" ] || exit_ip="$(public_ip "socks5h://127.0.0.1:${PROFILE_SOCKS_PORT}")"
   else
-    [ "$healthy" != "是" ] || exit_ip="$(public_ip)"
+    mode_name="🛡️  整机全局 VPN（入站回程保护）"
+    [ "$healthy" != "是" ] || exit_ip="$host_ipv4"
   fi
-  printf '模式：%s\n' "$PROFILE_MODE"
-  printf '账户：%s\n' "$VPN_DESC"
-  printf '协议：%s\n' "$PROFILE_PROTOCOL"
-  [ "$PROFILE_MODE" != "proxy" ] || printf 'SOCKS5：127.0.0.1:%s\n' "$PROFILE_SOCKS_PORT"
-  printf 'systemd 活跃：%s\n' "$active"
-  printf '数据面健康：%s\n' "$healthy"
-  printf '当前出口 IPv4：%s\n' "$exit_ip"
+  if [ "$active" = "是" ]; then
+    status_color="$C_YELLOW"; status_icon="🟡"; status_label="运行中，数据面异常"
+    if [ "$healthy" = "是" ]; then
+      status_color="$C_GREEN"; status_icon="🟢"; status_label="运行中"
+    fi
+  fi
+  main_pid="$(service_main_pid)"
+  [[ "$main_pid" =~ ^[0-9]+$ ]] && [ "$main_pid" -gt 0 ] || main_pid="-"
+
+  printf '  %bVPN 状态:%b %b%s %s%b' "$C_BOLD" "$C_RESET" "$status_color" "$status_icon" "$status_label" "$C_RESET"
+  [ "$main_pid" = "-" ] || printf ' (OpenConnect PID: %s)' "$main_pid"
+  printf '\n'
+  printf '    %b运行模式:%b %s\n' "$C_BOLD" "$C_RESET" "$mode_name"
+  printf '    %b使用账户:%b %s\n' "$C_BOLD" "$C_RESET" "$VPN_DESC"
+  printf '    %bVPN 协议:%b %s\n' "$C_BOLD" "$C_RESET" "$PROFILE_PROTOCOL"
+  [ "$PROFILE_MODE" != "proxy" ] || printf '    %bSOCKS 地址:%b 127.0.0.1:%s\n' "$C_BOLD" "$C_RESET" "$PROFILE_SOCKS_PORT"
+  printf '    %b数据面健康:%b %s\n' "$C_BOLD" "$C_RESET" "$healthy"
+  printf '    %b自动守护:%b %s\n' "$C_BOLD" "$C_RESET" "$guard"
+  printf '    %bVPN 出口 IPv4:%b %b%s%b\n' "$C_BOLD" "$C_RESET" "$C_YELLOW" "$exit_ip" "$C_RESET"
+  printf '    %b本机公网 IPv4:%b %s\n' "$C_BOLD" "$C_RESET" "$host_ipv4"
+  printf '    %b本机公网 IPv6:%b %s\n' "$C_BOLD" "$C_RESET" "$host_ipv6"
+  sep
 }
 
 show_logs() {
@@ -830,28 +921,40 @@ uninstall_manager() {
 
 main_menu() {
   while true; do
+    clear_screen
     show_status || true
-    printf '\n%s\n' \
-      "  1) 启动本地 SOCKS5 出口（推荐，不改宿主机路由）" \
-      "  2) 启动整机全局 VPN（高级，带独立回滚）" \
-      "  3) 停止 VPN" \
-      "  4) 管理账户" \
-      "  5) 查看日志" \
-      "  6) 卸载管理器" \
-      "  7) 安装/更新快捷命令 ocm" \
-      "  0) 退出"
+    title "主菜单:"
+    printf '  %b1) 启动: 🔌 本地 SOCKS5 模式（推荐，不改宿主机路由）%b\n' "$C_GREEN" "$C_RESET"
+    printf '  %b2) 启动: 🛡️  整机全局 VPN（保护入站，带安全回滚）%b\n' "$C_GREEN" "$C_RESET"
+    printf '  %b3) ⏹️  停止 VPN%b\n' "$C_RED" "$C_RESET"
+    sep
+    printf '%s\n' \
+      "  4) ⚙️  管理 VPN 账户" \
+      "  5) 🧪 立即检查 VPN 数据面" \
+      "  6) 📜 查看运行日志" \
+      "  7) 📦 检查/安装依赖" \
+      "  8) 🔗 安装/更新快捷命令 ocm" \
+      "  9) 🗑️  卸载管理器" \
+      "  0) 🚪 退出"
+    printf '\n'
     local choice=""
-    read -r -p "选择 [0-7]: " choice
+    read -r -p "请选择 [0-9]: " choice
     case "$choice" in
-      1) "$SCRIPT_PATH" start-proxy || true ;;
-      2) "$SCRIPT_PATH" start-global || true ;;
-      3) "$SCRIPT_PATH" stop || true ;;
+      1) "$SCRIPT_PATH" start-proxy || true; pause_menu ;;
+      2) "$SCRIPT_PATH" start-global || true; pause_menu ;;
+      3) "$SCRIPT_PATH" stop || true; pause_menu ;;
       4) "$SCRIPT_PATH" accounts || true ;;
-      5) show_logs || true ;;
-      6) "$SCRIPT_PATH" uninstall && return 0 || true ;;
-      7) "$SCRIPT_PATH" install || true ;;
+      5) "$SCRIPT_PATH" check || true; pause_menu ;;
+      6) show_logs || true; pause_menu ;;
+      7) "$SCRIPT_PATH" deps || true; pause_menu ;;
+      8) "$SCRIPT_PATH" install || true; pause_menu ;;
+      9)
+        "$SCRIPT_PATH" uninstall || true
+        [ -e "$INSTALL_PATH" ] || return 0
+        pause_menu
+        ;;
       0) return 0 ;;
-      *) log_err "无效选择。" ;;
+      *) log_err "无效选择：${choice:-空}"; pause_menu ;;
     esac
   done
 }
@@ -866,13 +969,14 @@ run_main() {
     start-global) check_root; acquire_manager_lock; start_mode global ;;
     stop) check_root; acquire_manager_lock; stop_vpn ;;
     accounts) check_root; acquire_manager_lock; manage_accounts ;;
+    deps) check_root; acquire_manager_lock; check_all_dependencies ;;
     install) check_root; acquire_manager_lock; install_command ;;
     uninstall) check_root; acquire_manager_lock; uninstall_manager ;;
     status) check_root; show_status ;;
     check) check_root; check_data_plane ;;
     logs) check_root; show_logs ;;
     main) check_root; main_menu ;;
-    *) log_err "用法：$0 [start-proxy|start-global|stop|accounts|install|uninstall|status|check|logs]"; return 2 ;;
+    *) log_err "用法：$0 [start-proxy|start-global|stop|accounts|deps|install|uninstall|status|check|logs]"; return 2 ;;
   esac
 }
 

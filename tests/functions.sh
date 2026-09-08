@@ -139,4 +139,33 @@ else
   printf 'shortcut checks skipped: filesystem does not expose POSIX symlinks\n'
 fi
 
+MOCK_CLEANUP_CALLS="${TEST_ROOT}/cleanup.calls"
+MOCK_STOP_RESULT=0
+stop_and_disable_managed_units() {
+  printf '%s\n' stop >> "$MOCK_CLEANUP_CALLS"
+  return "$MOCK_STOP_RESULT"
+}
+service_cleanup() { printf '%s\n' cleanup >> "$MOCK_CLEANUP_CALLS"; }
+cancel_rollback() { printf '%s\n' cancel >> "$MOCK_CLEANUP_CALLS"; }
+
+cleanup_start_attempt || fail "confirmed stopped start attempt was not cleaned"
+[ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop cleanup cancel ' ] \
+  || fail "start-attempt cleanup order is wrong"
+
+: > "$MOCK_CLEANUP_CALLS"
+MOCK_STOP_RESULT=1
+if cleanup_start_attempt >/dev/null 2>&1; then
+  fail "failed service stop was accepted during start-attempt cleanup"
+fi
+[ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop ' ] \
+  || fail "routes or rollback were changed after an unconfirmed service stop"
+
+: > "$MOCK_CLEANUP_CALLS"
+MOCK_STOP_RESULT=0
+check_root() { :; }
+log() { printf '%s\n' log >> "$MOCK_CLEANUP_CALLS"; }
+stop_vpn
+[ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop cleanup cancel log ' ] \
+  || fail "manual stop did not preserve stop-cleanup-cancel order"
+
 printf 'function checks passed\n'
