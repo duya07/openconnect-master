@@ -1,372 +1,196 @@
-# 🚀 OpenConnect Master Manager
+# OpenConnect Master Manager
 
-<div align="center">
+English | [简体中文](README.md)
 
-**English | [简体中文](README.md)**
+An OpenConnect egress manager for Linux VPS hosts. v8 prioritizes one invariant: **existing SSH, sing-box, and other inbound connections must continue to return through the VPS's original gateway; only explicitly selected outbound traffic enters the VPN**.
 
-![Version](https://img.shields.io/badge/version-7.7.7-blue?style=flat-square)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square)
-![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
+> The v8 English launcher uses the same audited implementation as the Chinese launcher to prevent networking behavior from drifting. Interactive prompts are currently Chinese; command names and configuration fields are language-neutral.
 
-**All-in-One OpenConnect VPN Management Tool**
+## Recommended architecture
 
-Three Running Modes | Policy Routing Protection | Network Namespace Isolation | IPv4+IPv6 Dual Stack
+| Mode | Host default route | Firewall/sysctl changes | Egress capability | Recommendation |
+|---|---:|---:|---|---:|
+| Local SOCKS5 | Unchanged | None | TCP, IPv4 | **Recommended** |
+| Host-global VPN | Changed | None | Depends on VPN gateway | Advanced |
 
-[Quick Start](#-quick-start) • [Features](#-features) • [Documentation](#-documentation)
+For sing-box, the safest design is normally not to put the whole VPS behind the VPN. OpenConnect exposes a SOCKS5 listener on `127.0.0.1`; sing-box then selects either all TCP connections or one inbound tag for that outbound. VPN routing therefore cannot capture the server's inbound return path.
 
-</div>
+v8 removes the old Netns mode. It combined network namespaces, iptables, global forwarding sysctls, gost/socat, and incomplete reconnection logic. That failure surface did not fit the minimum-impact goal.
 
----
+## What v8 fixes
 
-## ✨ Features
+- systemd supervises foreground OpenConnect instead of a PID-file-only five-minute cron check.
+- `--reconnect-timeout=86400` lets OpenConnect recover from extended link interruptions.
+- A 30-second TCP keepalive is enabled when supported, reducing the chance that NAT or firewalls discard an otherwise idle control TLS connection while ESP/DTLS carries data.
+- A real HTTP data-plane check runs every 30 seconds. Three consecutive failures are required before restart, with a 15-minute authentication cooldown to reduce account-lockout risk.
+- SOCKS startup succeeds only when the listener and a request through the VPN both work.
+- Global mode protects the original VPS source addresses with dedicated policy tables and does not edit `/etc/iproute2/rt_tables`.
+- A separate three-minute systemd rollback is armed before global mode. A newly established external connection must be verified before entering `KEEP`.
+- Global startup scans common cron/systemd DDNS jobs and requires an extra acknowledgement when one is detected, reducing the risk of publishing the VPN egress as the VPS address.
+- Cleanup is idempotent and still runs when OpenConnect has already exited.
+- Manager mutations are serialized. A failure anywhere in the systemd start chain triggers immediate stop, disable, and cleanup.
+- Account listings never print passwords. The `0600` account file is explicitly documented as **plaintext**, not encrypted storage.
+- The VPN protocol is persisted with the account/profile and never silently falls back during unattended recovery.
 
-### 🎯 Three Running Modes
+See the [evidence-led review](docs/REVIEW.md) for the v7 defects, causal boundaries, rejected hypotheses, and live verification results.
 
-| Mode | Icon | Description | IPv4 | IPv6 | Use Case |
-|------|------|-------------|------|------|----------|
-| **Default Mode** | 🛡️ | Global VPN + SSH Protection | ✅ | ✅ | Scenarios requiring global proxy |
-| **ocproxy Mode** | 🔌 | SOCKS5 Proxy (Simplified) | ✅ | ❌ | Lightweight proxy needs |
-| **Netns Mode** | 🌐 | Network Namespace Isolation | ✅ | ✅ | **Recommended**! Complete isolation, dual-stack support |
+## Requirements
 
-### 🔥 Core Features
+- A Linux VPS running systemd
+- root access
+- `openconnect`, `curl`, `iproute2`, and `util-linux` (`flock`)
+- `ocproxy` for SOCKS mode
 
-- ✅ **Intelligent Policy Routing**
-  - Automatically protects SSH connections from VPN interference
-  - Supports IPv4 and IPv6 dual-stack routing
-  - Precise routing table management and cleanup
+The script can install missing packages with apt, dnf, or yum only after it shows the scope and receives confirmation.
 
-- ✅ **Multi-Account Management**
-  - Support for multiple VPN account switching
-  - Encrypted storage of account information
-  - Quick selection and switching
+## Install and run
 
-- ✅ **Scheduled Tasks Support**
-  - Automatic reconnection daemon
-  - Scheduled start/stop
-  - Connection status monitoring
-
-- ✅ **Safe Cleanup Mechanism**
-  - Complete environment cleanup
-  - Automatic rollback protection
-  - Graceful interrupt handling
-
-- ✅ **Network Namespace Isolation** (Netns Mode)
-  - Completely independent network environment
-  - Does not affect host network
-  - Supports IPv4 and IPv6 dual stack
-  - Access via SOCKS5 proxy
-
-## 📦 System Requirements
-
-- **Operating System**: Debian/Ubuntu/CentOS/RHEL or other Linux distributions
-- **Permissions**: Root access required
-- **Network**: Internet access required
-- **Dependencies**: Script will automatically detect and install necessary dependencies
-
-### Auto-Installed Dependencies
-
-- `openconnect` - OpenConnect VPN client
-- `ocproxy` - Required for ocproxy mode
-- `gost` - SOCKS5 server for Netns mode
-- `socat` - Port forwarding for Netns mode (recommended)
-- `iptables` - Firewall and NAT rules
-- `iproute2` - Network configuration tools
-
-## 🚀 Quick Start
-
-### Method 1: One-Click Install (Recommended)
+Download, inspect, then run the repository copy:
 
 ```bash
-# Download and run directly
-bash <(curl -fsSL https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh)
-```
-
-### Method 2: Manual Install
-
-```bash
-# Download script
-wget https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh
-
-# Add execute permission
-chmod +x oc_master_en.sh
-
-# Run script
-./oc_master_en.sh
-```
-
-### Method 3: Clone Repository
-
-```bash
-# Clone repository
 git clone https://github.com/duya07/openconnect-master.git
 cd openconnect-master
-
-# Run script
-chmod +x oc_master_en.sh
-./oc_master_en.sh
+chmod +x oc_master.sh
+sudo ./oc_master.sh install
+sudo ocm
 ```
 
-## 📖 Documentation
+`install` only installs or updates the managed executable and shortcut. It does not start the VPN, install packages, or create systemd units:
 
-### First Run
+```text
+/usr/local/sbin/oc-master
+/usr/local/bin/ocm -> /usr/local/sbin/oc-master
+```
 
-1. After running the script, select `5) Manage VPN Accounts`
-2. Add your VPN account information:
-   - Display name (for easy identification)
-   - VPN username
-   - VPN password
-   - VPN server address
-   - Authentication group (optional)
+If another program already owns `/usr/local/bin/ocm`, the script fails closed instead of overwriting it. Starting a connection also installs the same managed copy and shortcut, then creates:
 
-### Mode Selection Guide
+```text
+/etc/systemd/system/oc-master.service
+/etc/systemd/system/oc-master-health.service
+/etc/systemd/system/oc-master-health.timer
+/etc/oc-master/profile.conf
+```
 
-#### 🛡️ Default Mode
+Stop, clean project-owned routing state, and disable autostart:
 
-**Use Cases**:
-- Global VPN proxy needed
-- All traffic through VPN
-- Access to internal network resources
-
-**Features**:
-- All traffic through VPN
-- Automatic SSH connection protection
-- IPv4 and IPv6 support
-
-**Usage**:
 ```bash
-# Select after running the script
-1) Start: 🛡️  Default Mode (Global VPN, SSH Protection)
+sudo ocm stop
 ```
 
-#### 🔌 ocproxy Mode
+Other command entry points:
 
-**Use Cases**:
-- Only need SOCKS5 proxy
-- No IPv6 support needed
-- Lightweight usage
-
-**Features**:
-- Provides SOCKS5 proxy interface
-- IPv4 only
-- Listens on localhost 127.0.0.1 by default
-
-**Usage**:
 ```bash
-# Select after running the script
-2) Start: 🔌 ocproxy Mode (SOCKS5, IPv4 only)
-# Enter listening port (e.g. 1080)
+sudo ocm status
+sudo ocm check
+sudo ocm logs
 ```
 
-#### 🌐 Netns Mode (Recommended)
+`start-proxy` and `start-global` remain interactive so an incorrect credential is not retried accidentally.
 
-**Use Cases**:
-- Need completely isolated network environment
-- Need both IPv4 and IPv6 support
-- Seeking best stability and compatibility
+## Account file
 
-**Features**:
-- Complete isolation using Network Namespace
-- Does not affect host network
-- IPv4 and IPv6 dual-stack support
-- Access via SOCKS5 proxy
-- Option for local or remote listening
+v8 keeps the legacy path `/root/.vpn_accounts.env`:
 
-**Usage**:
-```bash
-# Select after running the script
-3) Start: 🌐 Netns Mode (SOCKS5, IPv4+IPv6 Full Features)
-# Enter listening port (e.g. 8585)
-# Choose whether to allow remote connections
-```
-
-### Account Configuration File Format
-
-Account information is stored in `/root/.vpn_accounts.env`, format:
-
-```
-DisplayName|Username|Password|VPNHost|AuthGroup(optional)
+```text
+display name|username|password|VPN URL|auth group (optional)|protocol(anyconnect/nc/pulse)
 ```
 
 Example:
+
+```text
+University VPN|student001|password|https://vpn.example.edu|Students|nc
 ```
-My University VPN|student001|mypassword|vpn.university.edu|DefaultGroup
-Company VPN|employee@company.com|companypass|vpn.company.com|
+
+Fields cannot contain `|`, and passwords cannot contain a newline. Legacy five-field records are readable, but the operator must explicitly choose a protocol at each interactive start.
+
+A vendor-branded login page does not prove a protocol. A gateway redirecting to a Juniper/Pulse `/dana-na/` page may still require the older compatible `nc` protocol rather than `pulse`; test explicitly instead of guessing.
+
+## sing-box integration
+
+Start the local SOCKS service first, for example at `127.0.0.1:1080`, then add this outbound to sing-box:
+
+```json
+{
+  "type": "socks",
+  "tag": "openconnect-out",
+  "server": "127.0.0.1",
+  "server_port": 1080,
+  "version": "5",
+  "network": "tcp"
+}
 ```
 
-See also [examples/vpn_accounts.example](examples/vpn_accounts.example)
+To route one inbound tag through the VPN, add this to `route.rules`:
 
-### Scheduled Tasks
+```json
+{
+  "inbound": ["vpn-only-in"],
+  "network": ["tcp"],
+  "action": "route",
+  "outbound": "openconnect-out"
+}
+```
 
-#### Setup Daemon (Auto-Reconnect)
+See [sing-box-selected-inbound.json](examples/sing-box-selected-inbound.json) for a complete merge fragment.
+
+To route all sing-box TCP traffic through the VPN, set:
+
+```json
+{
+  "final": "openconnect-out"
+}
+```
+
+See [sing-box-all-tcp.json](examples/sing-box-all-tcp.json). ocproxy is TCP/IPv4 only, so keep an explicit direct/block rule for UDP. UDP/QUIC is not claimed to be tunneled by this mode.
+
+Validate before restarting production:
 
 ```bash
-# In script main menu select
-6) Setup Scheduled/Daemon Tasks
-1) Setup Daemon Task (Check every 5 minutes, reconnect on disconnect)
+sing-box check -c /etc/sing-box/config.json -C /etc/sing-box/conf
+systemctl restart sing-box
 ```
 
-This adds to crontab:
-```cron
-*/5 * * * * /path/to/oc_master_en.sh _internal_check_health
-```
+Adjust paths for your installation.
 
-⚠️ **Note**: Daemon tasks currently only support **Default Mode** and **ocproxy Mode**
+## Global-mode safety confirmation
 
-#### Setup Scheduled Shutdown
+Global mode has a materially larger blast radius than SOCKS mode:
+
+1. Copy the original default route into dedicated return tables for the VPS source addresses.
+2. Scan common cron/systemd DDNS jobs; if one is detected, address the risk and enter `GLOBAL-DDNS-RISK`.
+3. Arm an independent three-minute rollback.
+4. Start the fixed `ocm0` interface and verify the real HTTP data plane.
+5. Establish a new SSH or proxy connection from outside the VPS.
+6. Enter `KEEP` only after that new connection succeeds; timeout or disconnect stops and disables the service.
+
+Use it for the first time only when the hosting console is available. Multi-interface, multi-public-address, third-party policy-routing, and concurrent-VPN configurations are not declared supported. A policy-table collision or foreign OpenConnect process causes a fail-closed error.
+
+Return-policy routing protects connections that already use the VPS's original source address; it cannot stop ordinary outbound programs from observing the VPN's public address. A typical DDNS updater may therefore publish the VPN egress and break port forwards or relays. Prefer SOCKS mode. Before using global mode, pause DDNS or bind both its public-IP lookup and API request to the original interface/source address. oc-master detects and warns, but never disables third-party jobs itself.
+
+## Diagnostics
 
 ```bash
-# Example: Automatically shutdown VPN at 2 AM daily
-6) Setup Scheduled/Daemon Tasks
-2) Add Scheduled Shutdown Task
-# Enter: 0 2 * * *
+sudo ocm status
+sudo ocm check
+sudo ocm logs
+systemctl status oc-master.service oc-master-health.timer
 ```
 
-### Stop VPN
+A healthy result requires all of the following: a supervised OpenConnect process, the expected SOCKS listener or `ocm0` route, a successful HTTP request, and the expected egress address. A PID or listening socket alone is not proof.
 
-```bash
-# Method 1: In script menu
-4) Stop VPN
+## Migration
 
-# Method 2: Direct command line
-./oc_master_en.sh stop
-```
+Stop v7 with the old script and inventory any remaining namespace, iptables, sysctl, and policy-routing state before installing v8. v8 intentionally refuses to delete objects it cannot prove it owns. See [MIGRATION-v8.md](docs/MIGRATION-v8.md).
 
-### IPv6 Connectivity Test
+## Referenced projects
 
-For Netns mode, you can test IPv6 connectivity:
-
-```bash
-# In script main menu select
-8) 🧪 Test Netns IPv6 Connectivity
-```
-
-Test items include:
-1. ✓ Check global IPv6 address in Netns
-2. ✓ Ping Google IPv6 DNS (2001:4860:4860::8888)
-3. ✓ HTTP IPv6 connection test
-
-## 🔧 Advanced Configuration
-
-### Custom Configuration Parameters
-
-Key configuration variables in the script (modify as needed):
-
-```bash
-# Network Namespace Configuration
-NETNS_NAME="ocm_vpn_space"
-VETH_HOST="veth_ocm_h"
-VETH_NS="veth_ocm_ns"
-VETH_HOST_IP="192.168.200.1"
-VETH_NS_IP="192.168.200.2"
-
-# Routing Table IDs
-RT4_ID=100  # IPv4 routing table
-RT6_ID=101  # IPv6 routing table
-
-# File Locations
-PID_FILE="/var/run/oc_manager.pid"
-STATE_FILE="/var/run/oc_manager.state"
-ACCOUNTS_FILE="/root/.vpn_accounts.env"
-```
-
-### Manual Debug Commands
-
-```bash
-# View Network Namespaces
-ip netns list
-
-# View network configuration inside Netns
-ip netns exec ocm_vpn_space ip addr
-ip netns exec ocm_vpn_space ip route
-
-# Test connection inside Netns
-ip netns exec ocm_vpn_space ping 8.8.8.8
-ip netns exec ocm_vpn_space curl https://ip.p3terx.com
-
-# View SOCKS5 listening port
-ss -tlnp | grep gost
-
-# View OpenConnect process
-ps aux | grep openconnect
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **VPN Connection Failed**
-   - Check if account information is correct
-   - Verify VPN server address is accessible
-   - Check OpenConnect logs
-
-2. **SOCKS5 Proxy Not Working** (Netns Mode)
-   - Test network connectivity in Netns: `ip netns exec ocm_vpn_space ping 8.8.8.8`
-   - Check if gost process is running: `ps aux | grep gost`
-   - Check port forwarding: `ss -tlnp | grep 8585`
-
-3. **IPv6 Not Working**
-   - Confirm VPN server supports IPv6
-   - Use Netns mode (Default and ocproxy modes have limited IPv6 support)
-   - Run IPv6 connectivity test (menu option 8)
-
-4. **SSH Connection Interrupted** (Default Mode)
-   - Script automatically protects SSH connections
-   - If still interrupted, check policy routing configuration
-
-For more issues, refer to [FAQ Documentation](docs/FAQ.md)
-
-## 📊 Version History
-
-### v7.7.7 (2025-10-25) - Final
-
-- ✨ **New**: Active IPv6 connectivity test feature for Netns mode
-- 🔧 **Fix**: Enhanced IPv6 detection in show_status, improved detection success rate
-- 🔧 **Optimization**: Simplified ocproxy mode, removed remote connection option, listen on localhost by default
-- ✨ **Enhancement**: socat forwarding supports IPv4 and IPv6 dual-stack listening
-- 📝 **Documentation**: Improved usage documentation and troubleshooting guide
-
-### v7.7.6 (2025-01-10)
-
-- 🔧 **Fix**: Adopted correct architecture of "service built-in (gost in netns), port external (socat/DNAT)"
-- ✨ **New**: Prioritize socat for port forwarding, with iptables DNAT as backup
-- 🔧 **Enhancement**: Added checks for tun interface and internal network connectivity
-
-### v7.7.5 (Earlier)
-
-- Initial version release
-- Support for three running modes
-- Implemented policy routing protection
-- Network Namespace isolation
-
-## 🤝 Contributing
-
-Issues and Pull Requests are welcome!
-
-### Development Guidelines
-
-- Maintain consistent code style
-- Add necessary comments
-- Update related documentation
-- Test all three modes
-
-## 📄 License
-
-This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details
-
-## 🙏 Acknowledgments
-
-- [OpenConnect](https://www.infradead.org/openconnect/)
-- [GOST](https://github.com/go-gost/gost)
+- [OpenConnect](https://gitlab.com/openconnect/openconnect)
 - [ocproxy](https://github.com/cernekee/ocproxy)
-- All users who use and provide feedback
+- [wazum/openconnect-proxy](https://github.com/wazum/openconnect-proxy)
+- [vpn-slice](https://github.com/dlenski/vpn-slice)
+- [vopono](https://github.com/jamesmcm/vopono)
+- [sing-box](https://github.com/SagerNet/sing-box)
 
----
+## License
 
-<div align="center">
-
-**If this project helps you, please give it a ⭐ Star!**
-
-Made with ❤️ by [duya07](https://github.com/duya07)
-
-</div>
+[MIT](LICENSE)
