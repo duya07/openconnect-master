@@ -937,19 +937,356 @@ confirm_global_risk() {
   fi
 }
 
+valid_ipv4_address() {
+  local address="${1:-}" octet
+  local -a octets=()
+
+  [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS='.' read -r -a octets <<< "$address"
+  [ "${#octets[@]}" -eq 4 ] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$octet" -le 255 ] || return 1
+  done
+}
+
+valid_ipv6_address() {
+  local address="${1:-}" prefix suffix part group compressed=0 group_count=0
+  local -a groups=()
+
+  [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$address" == *:* ]] || return 1
+  [[ "$address" != *:::* ]] || return 1
+  if [[ "$address" == *::* ]]; then
+    compressed=1
+    prefix="${address%%::*}"
+    suffix="${address#*::}"
+    [[ "$suffix" != *::* ]] || return 1
+    for part in "$prefix" "$suffix"; do
+      [ -z "$part" ] && continue
+      IFS=':' read -r -a groups <<< "$part"
+      for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        group_count=$((group_count + 1))
+      done
+    done
+    [ "$group_count" -lt 8 ]
+    return
+  fi
+
+  IFS=':' read -r -a groups <<< "$address"
+  [ "${#groups[@]}" -eq 8 ] || return 1
+  for group in "${groups[@]}"; do
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+  done
+  [ "$compressed" -eq 0 ]
+}
+
+valid_route_plan_address() {
+  [ "$#" -eq 2 ] || return 1
+  case "$1" in
+    -4) valid_ipv4_address "$2" ;;
+    -6) valid_ipv6_address "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+route_default_device() {
+  [ "$#" -eq 1 ] || return 1
+  local route_line="$1" token device="" dev_count=0
+  local -a route_tokens=()
+
+  [ -n "$route_line" ] && [[ "$route_line" != *$'\r'* ]] && [[ "$route_line" != *$'\n'* ]] || return 1
+  read -r -a route_tokens <<< "$route_line"
+  [ "${#route_tokens[@]}" -gt 1 ] && [ "${route_tokens[0]}" = default ] || return 1
+  for ((token = 0; token < ${#route_tokens[@]}; token++)); do
+    case "${route_tokens[$token]}" in
+      nexthop|blackhole|unreachable|prohibit) return 1 ;;
+      dev)
+        token=$((token + 1))
+        [ "$token" -lt "${#route_tokens[@]}" ] || return 1
+        device="${route_tokens[$token]}"
+        dev_count=$((dev_count + 1))
+        ;;
+    esac
+  done
+  [ "$dev_count" -eq 1 ] && [[ "$device" =~ ^[[:alnum:]_.:@-]+$ ]] || return 1
+  printf '%s\n' "$device"
+}
+
+policy_rule_output_is_parseable() {
+  local rules="$1" line
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    [[ "$line" =~ ^[[:space:]]*[0-9]+:[[:space:]]+ ]] || return 1
+  done <<< "$rules"
+}
+
+route_resources_are_available() {
+  local rules4 rules6 routes4 routes6 links
+  rules4="$(ip -4 rule show 2>/dev/null)" || return 1
+  rules6="$(ip -6 rule show 2>/dev/null)" || return 1
+  policy_rule_output_is_parseable "$rules4" && policy_rule_output_is_parseable "$rules6" || return 1
+  routes4="$(read_route_table_or_empty -4 "$RETURN4_TABLE")" || return 1
+  routes6="$(read_route_table_or_empty -6 "$RETURN6_TABLE")" || return 1
+  links="$(ip -o link show 2>/dev/null)" || return 1
+
+  ! grep -Eq "^[[:space:]]*${RETURN4_PRIORITY}:" <<< "$rules4" || return 1
+  ! grep -Eq "^[[:space:]]*${RETURN6_PRIORITY}:" <<< "$rules6" || return 1
+  ! grep -Eq "lookup ${RETURN4_TABLE}([[:space:]]|$)" <<< "$rules4" || return 1
+  ! grep -Eq "lookup ${RETURN6_TABLE}([[:space:]]|$)" <<< "$rules6" || return 1
+  [ -z "$routes4" ] && [ -z "$routes6" ] || return 1
+  ! grep -Eq "^[[:space:]]*[0-9]+:[[:space:]]+${VPN_INTERFACE}(:|@)" <<< "$links"
+}
+
+collect_route_plan_addresses() {
+  [ "$#" -eq 3 ] || return 1
+  local family="$1" expected_device="$2"
+  local -n output_addresses="$3"
+  local address_output line index device address_family cidr address normalized_device
+  local -a collected_addresses=()
+  local -A seen_addresses=()
+
+  address_output="$(ip "$family" -o addr show scope global 2>/dev/null)" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    read -r index device address_family cidr _ <<< "$line"
+    [[ "$index" =~ ^[0-9]+:$ ]] && [ -n "$device" ] && [ -n "$cidr" ] || return 1
+    case "$family:$address_family" in -4:inet|-6:inet6) ;; *) return 1 ;; esac
+    normalized_device="${device%%@*}"
+    [ "$normalized_device" = "${expected_device%%@*}" ] || return 1
+    address="${cidr%/*}"
+    [ "$address" != "$cidr" ] && valid_route_plan_address "$family" "$address" || return 1
+    if [ -z "${seen_addresses[$address]+x}" ]; then
+      seen_addresses[$address]=1
+      collected_addresses+=("$address")
+    fi
+  done <<< "$address_output"
+  # shellcheck disable=SC2034  # nameref 将结果写回调用方数组。
+  output_addresses=("${collected_addresses[@]}")
+}
+
+route_plan_values_are_valid() {
+  local run_id="$1" default4="$2" dev4="$3" default6="$4" dev6="$5"
+  local address parsed_device
+  shift 5
+
+  valid_uuid "$run_id" && [ -n "$default4" ] && [ -n "$dev4" ] || return 1
+  parsed_device="$(route_default_device "$default4")" || return 1
+  [ "$parsed_device" = "$dev4" ] && [ "$dev4" != "$VPN_INTERFACE" ] || return 1
+  [ "${#ROUTE_PLAN_RETURN4_ADDRESSES[@]}" -gt 0 ] || return 1
+  for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do valid_ipv4_address "$address" || return 1; done
+  if [ -n "$default6" ] || [ -n "$dev6" ]; then
+    [ -n "$default6" ] && [ -n "$dev6" ] || return 1
+    parsed_device="$(route_default_device "$default6")" || return 1
+    [ "$parsed_device" = "$dev6" ] && [ "$dev6" != "$VPN_INTERFACE" ] || return 1
+  elif [ "${#ROUTE_PLAN_RETURN6_ADDRESSES[@]}" -gt 0 ]; then
+    return 1
+  fi
+  for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do valid_ipv6_address "$address" || return 1; done
+  [ "$#" -eq 0 ]
+}
+
+build_route_plan() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" runtime_mode runtime_phase runtime_desired
+  local default_output line device="" default4="" default6="" count=0
+  local -a return4_addresses=() return6_addresses=()
+
+  acquire_state_lock || return 1
+  if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
+    release_state_lock
+    return 1
+  fi
+  runtime_mode="$MODE"; runtime_phase="$PHASE"; runtime_desired="$DESIRED_ACTIVE"
+  release_state_lock
+  [ "$runtime_mode" = global ] && [ "$runtime_phase" = PREPARING ] && [ "$runtime_desired" = 1 ] || return 1
+  route_resources_are_available || return 1
+
+  default_output="$(ip -4 route show default 2>/dev/null)" || return 1
+  count=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      blackhole\ default*|unreachable\ default*|prohibit\ default*) return 1 ;;
+    esac
+    device="$(route_default_device "$line")" || return 1
+    [ "$device" = "$VPN_INTERFACE" ] && continue
+    count=$((count + 1))
+    [ "$count" -eq 1 ] || return 1
+    default4="$line"
+    ROUTE_PLAN_BUILD_DEV4="$device"
+  done <<< "$default_output"
+  [ "$count" -eq 1 ] || return 1
+  collect_route_plan_addresses -4 "$ROUTE_PLAN_BUILD_DEV4" return4_addresses || return 1
+  [ "${#return4_addresses[@]}" -gt 0 ] || return 1
+
+  default_output="$(ip -6 route show default 2>/dev/null)" || return 1
+  count=0
+  ROUTE_PLAN_BUILD_DEV6=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      blackhole\ default*|unreachable\ default*|prohibit\ default*) return 1 ;;
+    esac
+    device="$(route_default_device "$line")" || return 1
+    [ "$device" = "$VPN_INTERFACE" ] && continue
+    count=$((count + 1))
+    [ "$count" -eq 1 ] || return 1
+    default6="$line"
+    ROUTE_PLAN_BUILD_DEV6="$device"
+  done <<< "$default_output"
+  if [ "$count" -eq 1 ]; then
+    collect_route_plan_addresses -6 "$ROUTE_PLAN_BUILD_DEV6" return6_addresses || return 1
+  else
+    collect_route_plan_addresses -6 "" return6_addresses || {
+      # 没有 IPv6 default 时只接受没有 global IPv6 地址的主机。
+      [ -z "$(ip -6 -o addr show scope global 2>/dev/null)" ] || return 1
+      return6_addresses=()
+    }
+  fi
+
+  ROUTE_PLAN_BUILD_RUN_ID="$expected_run_id"
+  ROUTE_PLAN_BUILD_DEFAULT4="$default4"
+  ROUTE_PLAN_BUILD_DEFAULT6="$default6"
+  ROUTE_PLAN_BUILD_RETURN4_ADDRESSES=("${return4_addresses[@]}")
+  ROUTE_PLAN_BUILD_RETURN6_ADDRESSES=("${return6_addresses[@]}")
+}
+
+write_route_plan() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" address
+  [ "${ROUTE_PLAN_BUILD_RUN_ID:-}" = "$expected_run_id" ] || return 1
+  ROUTE_PLAN_RETURN4_ADDRESSES=("${ROUTE_PLAN_BUILD_RETURN4_ADDRESSES[@]}")
+  ROUTE_PLAN_RETURN6_ADDRESSES=("${ROUTE_PLAN_BUILD_RETURN6_ADDRESSES[@]}")
+  route_plan_values_are_valid "$expected_run_id" "$ROUTE_PLAN_BUILD_DEFAULT4" "$ROUTE_PLAN_BUILD_DEV4" \
+    "$ROUTE_PLAN_BUILD_DEFAULT6" "$ROUTE_PLAN_BUILD_DEV6" || return 1
+  ensure_dirs
+  {
+    printf '%s\n' 'FORMAT_VERSION=1' "RUN_ID=$expected_run_id" \
+      "DEFAULT4=$ROUTE_PLAN_BUILD_DEFAULT4" "DEV4=$ROUTE_PLAN_BUILD_DEV4"
+    for address in "${ROUTE_PLAN_BUILD_RETURN4_ADDRESSES[@]}"; do printf 'RETURN4_ADDRESS=%s\n' "$address"; done
+    printf '%s\n' "DEFAULT6=$ROUTE_PLAN_BUILD_DEFAULT6" "DEV6=$ROUTE_PLAN_BUILD_DEV6"
+    for address in "${ROUTE_PLAN_BUILD_RETURN6_ADDRESSES[@]}"; do printf 'RETURN6_ADDRESS=%s\n' "$address"; done
+  } | atomic_replace_from_stdin "$ROUTE_PLAN_FILE" 0600 || return 1
+  load_route_plan "$expected_run_id"
+}
+
+load_route_plan() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" line key value address
+  local parsed_format="" parsed_run_id="" parsed_default4="" parsed_dev4="" parsed_default6="" parsed_dev6=""
+  local seen_format=0 seen_run_id=0 seen_default4=0 seen_dev4=0 seen_default6=0 seen_dev6=0
+  local -a parsed_return4=() parsed_return6=()
+  local -A seen_return4=() seen_return6=()
+
+  [ -f "$ROUTE_PLAN_FILE" ] && [ ! -L "$ROUTE_PLAN_FILE" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" == *=* ]] || return 1
+    IFS='=' read -r key value <<< "$line"
+    case "$key" in
+      FORMAT_VERSION) [ "$seen_format" -eq 0 ] || return 1; seen_format=1; parsed_format="$value" ;;
+      RUN_ID) [ "$seen_run_id" -eq 0 ] || return 1; seen_run_id=1; parsed_run_id="$value" ;;
+      DEFAULT4) [ "$seen_default4" -eq 0 ] || return 1; seen_default4=1; parsed_default4="$value" ;;
+      DEV4) [ "$seen_dev4" -eq 0 ] || return 1; seen_dev4=1; parsed_dev4="$value" ;;
+      DEFAULT6) [ "$seen_default6" -eq 0 ] || return 1; seen_default6=1; parsed_default6="$value" ;;
+      DEV6) [ "$seen_dev6" -eq 0 ] || return 1; seen_dev6=1; parsed_dev6="$value" ;;
+      RETURN4_ADDRESS)
+        valid_ipv4_address "$value" || return 1
+        if [ -z "${seen_return4[$value]+x}" ]; then seen_return4[$value]=1; parsed_return4+=("$value"); fi
+        ;;
+      RETURN6_ADDRESS)
+        valid_ipv6_address "$value" || return 1
+        if [ -z "${seen_return6[$value]+x}" ]; then seen_return6[$value]=1; parsed_return6+=("$value"); fi
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$ROUTE_PLAN_FILE"
+  [ "$seen_format" -eq 1 ] && [ "$seen_run_id" -eq 1 ] && [ "$seen_default4" -eq 1 ] \
+    && [ "$seen_dev4" -eq 1 ] && [ "$seen_default6" -eq 1 ] && [ "$seen_dev6" -eq 1 ] || return 1
+  [ "$parsed_format" = 1 ] && [ "$parsed_run_id" = "$expected_run_id" ] || return 1
+
+  ROUTE_PLAN_RETURN4_ADDRESSES=("${parsed_return4[@]}")
+  ROUTE_PLAN_RETURN6_ADDRESSES=("${parsed_return6[@]}")
+  route_plan_values_are_valid "$parsed_run_id" "$parsed_default4" "$parsed_dev4" "$parsed_default6" "$parsed_dev6" || return 1
+  ROUTE_PLAN_RUN_ID="$parsed_run_id"
+  ROUTE_PLAN_DEFAULT4="$parsed_default4"
+  ROUTE_PLAN_DEV4="$parsed_dev4"
+  ROUTE_PLAN_DEFAULT6="$parsed_default6"
+  ROUTE_PLAN_DEV6="$parsed_dev6"
+}
+
+validate_route_plan_against_snapshot() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" valid=1
+
+  load_route_plan "$expected_run_id" || return 1
+  acquire_state_lock || return 1
+  if load_runtime_state && [ "$RUN_ID" = "$expected_run_id" ] && [ "$MODE" = global ]; then valid=0; fi
+  release_state_lock
+  return "$valid"
+}
+
+write_route_owner_from_loaded_plan() {
+  [ "${ROUTE_PLAN_RUN_ID:-}" = "${1:-}" ] || return 1
+  printf '%s\n' \
+    "DEFAULT4=$ROUTE_PLAN_DEFAULT4" \
+    "DEFAULT6=$ROUTE_PLAN_DEFAULT6" \
+    | atomic_replace_from_stdin "$ROUTE_OWNER_FILE" 0600
+}
+
+route_get_uses_device() {
+  [ "$#" -eq 4 ] || return 1
+  local family="$1" destination="$2" source_address="$3" expected_device="$4"
+  local route_result line token device="" dev_count=0
+  local -a route_tokens=()
+
+  route_result="$(ip "$family" route get "$destination" from "$source_address" 2>/dev/null)" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    read -r -a route_tokens <<< "$line"
+    for ((token = 0; token < ${#route_tokens[@]}; token++)); do
+      [ "${route_tokens[$token]}" = dev ] || continue
+      token=$((token + 1))
+      [ "$token" -lt "${#route_tokens[@]}" ] || return 1
+      device="${route_tokens[$token]}"
+      dev_count=$((dev_count + 1))
+    done
+  done <<< "$route_result"
+  [ "$dev_count" -eq 1 ] && [ "$device" = "$expected_device" ]
+}
+
+apply_route_plan() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" address
+  local -a route_args4=() route_args6=()
+
+  validate_route_plan_against_snapshot "$expected_run_id" || return 1
+  state_allows_service_run "$expected_run_id" || return 1
+  route_resources_are_available || return 1
+  write_route_owner_from_loaded_plan "$expected_run_id" || return 1
+
+  read -r -a route_args4 <<< "$ROUTE_PLAN_DEFAULT4"
+  ip -4 route replace table "$RETURN4_TABLE" "${route_args4[@]}" || return 1
+  if [ -n "$ROUTE_PLAN_DEFAULT6" ]; then
+    read -r -a route_args6 <<< "$ROUTE_PLAN_DEFAULT6"
+    ip -6 route replace table "$RETURN6_TABLE" "${route_args6[@]}" || return 1
+  fi
+
+  for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do
+    ip -4 rule add priority "$RETURN4_PRIORITY" from "${address}/32" lookup "$RETURN4_TABLE" || return 1
+  done
+  for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
+    ip -6 rule add priority "$RETURN6_PRIORITY" from "${address}/128" lookup "$RETURN6_TABLE" || return 1
+  done
+  for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do
+    route_get_uses_device -4 1.1.1.1 "$address" "$ROUTE_PLAN_DEV4" || return 1
+  done
+  for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
+    route_get_uses_device -6 2606:4700:4700::1111 "$address" "$ROUTE_PLAN_DEV6" || return 1
+  done
+}
+
 route_state_conflicts() {
-  local rules4 rules6 routes4 routes6
-  rules4="$(ip -4 rule show 2>/dev/null || true)"
-  rules6="$(ip -6 rule show 2>/dev/null || true)"
-  routes4="$(ip -4 route show table "$RETURN4_TABLE" 2>/dev/null || true)"
-  routes6="$(ip -6 route show table "$RETURN6_TABLE" 2>/dev/null || true)"
-  grep -Eq "^[[:space:]]*${RETURN4_PRIORITY}:" <<< "$rules4" && return 0
-  grep -Eq "^[[:space:]]*${RETURN6_PRIORITY}:" <<< "$rules6" && return 0
-  grep -Eq "lookup ${RETURN4_TABLE}([[:space:]]|$)" <<< "$rules4" && return 0
-  grep -Eq "lookup ${RETURN6_TABLE}([[:space:]]|$)" <<< "$rules6" && return 0
-  [ -n "$routes4" ] && return 0
-  [ -n "$routes6" ] && return 0
-  return 1
+  ! route_resources_are_available
 }
 
 read_route_table_or_empty() {
@@ -994,37 +1331,207 @@ return_route_state_is_clean() {
   ! grep -Eq "^[[:space:]]*[0-9]+:[[:space:]]+${VPN_INTERFACE}(:|@)" <<< "$links" || return 1
 }
 
-cleanup_return_routes() {
-  [ -e "$ROUTE_OWNER_FILE" ] || return 0
-  local _ saved_default4="" saved_default6="" current_default="" default_routes=""
+exact_route_rule_exists() {
+  [ "$#" -eq 5 ] || return 2
+  local family="$1" priority="$2" address="$3" prefix="$4" table="$5" rules
+  rules="$(ip "$family" rule show 2>/dev/null)" || return 2
+  awk -v priority="$priority" -v address="$address" -v cidr="${address}/${prefix}" -v table="$table" '
+    $1 == priority ":" {
+      from_matches=0; table_matches=0
+      for (i = 2; i <= NF; i++) {
+        if ($i == "from" && (($(i + 1) == address) || ($(i + 1) == cidr))) from_matches=1
+        if ($i == "lookup" && $(i + 1) == table) table_matches=1
+      }
+      if (from_matches && table_matches) found=1
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<< "$rules"
+}
+
+legacy_route_rule_exists() {
+  [ "$#" -eq 3 ] || return 2
+  local family="$1" priority="$2" table="$3" rules
+  rules="$(ip "$family" rule show 2>/dev/null)" || return 2
+  policy_rule_output_is_parseable "$rules" || return 2
+  awk -v priority="$priority" -v table="$table" '
+    $1 == priority ":" {
+      for (i = 2; i <= NF; i++) {
+        if ($i == "lookup" && $(i + 1) == table) found=1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<< "$rules"
+}
+
+delete_legacy_route_rules() {
+  [ "$#" -eq 3 ] || return 1
+  local family="$1" priority="$2" table="$3" probe_status=0 _
+
+  for _ in {1..32}; do
+    if legacy_route_rule_exists "$family" "$priority" "$table"; then
+      :
+    else
+      probe_status=$?
+      [ "$probe_status" -eq 1 ] && return 0
+      return 1
+    fi
+    if ip "$family" rule del priority "$priority" lookup "$table" 2>/dev/null; then
+      continue
+    fi
+    if legacy_route_rule_exists "$family" "$priority" "$table"; then
+      return 1
+    else
+      probe_status=$?
+      [ "$probe_status" -eq 1 ] || return 1
+    fi
+  done
+
+  if legacy_route_rule_exists "$family" "$priority" "$table"; then
+    return 1
+  else
+    probe_status=$?
+    [ "$probe_status" -eq 1 ]
+  fi
+}
+
+delete_exact_route_rule() {
+  [ "$#" -eq 5 ] || return 1
+  local family="$1" priority="$2" address="$3" prefix="$4" table="$5"
+  if ip "$family" rule del priority "$priority" from "${address}/${prefix}" lookup "$table"; then
+    return 0
+  fi
+  if exact_route_rule_exists "$family" "$priority" "$address" "$prefix" "$table"; then
+    return 1
+  else
+    [ "$?" -eq 1 ]
+  fi
+}
+
+flush_managed_route_table() {
+  [ "$#" -eq 2 ] || return 1
+  local family="$1" table="$2" remaining
+  if ip "$family" route flush table "$table" 2>/dev/null; then return 0; fi
+  remaining="$(read_route_table_or_empty "$family" "$table")" || return 1
+  [ -z "$remaining" ]
+}
+
+delete_managed_vpn_link() {
+  local links
+  links="$(ip -o link show 2>/dev/null)" || return 1
+  if ! grep -Eq "^[[:space:]]*[0-9]+:[[:space:]]+${VPN_INTERFACE}(:|@)" <<< "$links"; then return 0; fi
+  if ip link del dev "$VPN_INTERFACE" 2>/dev/null; then return 0; fi
+  links="$(ip -o link show 2>/dev/null)" || return 1
+  ! grep -Eq "^[[:space:]]*[0-9]+:[[:space:]]+${VPN_INTERFACE}(:|@)" <<< "$links"
+}
+
+ensure_saved_default_if_needed() {
+  [ "$#" -eq 2 ] || return 1
+  local family="$1" saved_default="$2" default_routes current_default
+  local -a restore_args=()
+  [ -n "$saved_default" ] || return 0
+
+  default_routes="$(ip "$family" route show default 2>/dev/null)" || return 1
+  current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+  if [ -z "$current_default" ]; then
+    read -r -a restore_args <<< "$saved_default"
+    if ! ip "$family" route replace "${restore_args[@]}" 2>/dev/null; then
+      default_routes="$(ip "$family" route show default 2>/dev/null)" || return 1
+      current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+      [ -n "$current_default" ] || return 1
+      return 0
+    fi
+  fi
+  default_routes="$(ip "$family" route show default 2>/dev/null)" || return 1
+  current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+  [ -n "$current_default" ]
+}
+
+loaded_route_plan_baseline_is_available() {
+  local default_routes current_default address
+  default_routes="$(ip -4 route show default 2>/dev/null)" || return 1
+  current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+  [ -n "$current_default" ] || return 1
+  if [ -n "$ROUTE_PLAN_DEFAULT6" ]; then
+    default_routes="$(ip -6 route show default 2>/dev/null)" || return 1
+    current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
+    [ -n "$current_default" ] || return 1
+  fi
+  for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do
+    route_get_uses_device -4 1.1.1.1 "$address" "$ROUTE_PLAN_DEV4" || return 1
+  done
+  for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
+    route_get_uses_device -6 2606:4700:4700::1111 "$address" "$ROUTE_PLAN_DEV6" || return 1
+  done
+}
+
+cleanup_route_plan() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" address
+
+  if [ ! -e "$ROUTE_PLAN_FILE" ] && [ ! -L "$ROUTE_PLAN_FILE" ]; then
+    cleanup_legacy_return_routes
+    return
+  fi
+  validate_route_plan_against_snapshot "$expected_run_id" || return 1
+  if [ ! -e "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ]; then
+    route_resources_are_available || return 1
+    loaded_route_plan_baseline_is_available || return 1
+    rm -f -- "$ROUTE_PLAN_FILE"
+    return
+  fi
+  [ -f "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ] || return 1
+
+  for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do
+    delete_exact_route_rule -4 "$RETURN4_PRIORITY" "$address" 32 "$RETURN4_TABLE" || return 1
+  done
+  for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
+    delete_exact_route_rule -6 "$RETURN6_PRIORITY" "$address" 128 "$RETURN6_TABLE" || return 1
+  done
+  flush_managed_route_table -4 "$RETURN4_TABLE" || return 1
+  flush_managed_route_table -6 "$RETURN6_TABLE" || return 1
+  delete_managed_vpn_link || return 1
+  ensure_saved_default_if_needed -4 "$ROUTE_PLAN_DEFAULT4" || return 1
+  ensure_saved_default_if_needed -6 "$ROUTE_PLAN_DEFAULT6" || return 1
+  return_route_state_is_clean || return 1
+  for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do
+    route_get_uses_device -4 1.1.1.1 "$address" "$ROUTE_PLAN_DEV4" || return 1
+  done
+  for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
+    route_get_uses_device -6 2606:4700:4700::1111 "$address" "$ROUTE_PLAN_DEV6" || return 1
+  done
+  rm -f -- "$ROUTE_PLAN_FILE" "$ROUTE_OWNER_FILE"
+}
+
+cleanup_legacy_return_routes() {
+  if [ ! -e "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ]; then return 0; fi
+  [ -f "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ] \
+    || { log_err "旧版路由所有权证据不是普通文件；拒绝修改网络。"; return 1; }
+  local saved_default4="" saved_default6="" current_default="" default_routes=""
   saved_default4="$(sed -n 's/^DEFAULT4=//p' "$ROUTE_OWNER_FILE" | tail -n 1)"
   saved_default6="$(sed -n 's/^DEFAULT6=//p' "$ROUTE_OWNER_FILE" | tail -n 1)"
   [ -n "$saved_default4" ] || { log_err "路由所有权文件缺少原 IPv4 默认路由；为避免断开入站，拒绝自动清理。"; return 1; }
-  for _ in {1..32}; do
-    ip -4 rule del priority "$RETURN4_PRIORITY" lookup "$RETURN4_TABLE" 2>/dev/null || break
-  done
-  for _ in {1..32}; do
-    ip -6 rule del priority "$RETURN6_PRIORITY" lookup "$RETURN6_TABLE" 2>/dev/null || break
-  done
-  ip -4 route flush table "$RETURN4_TABLE" 2>/dev/null || true
-  ip -6 route flush table "$RETURN6_TABLE" 2>/dev/null || true
-  if ip link show dev "$VPN_INTERFACE" >/dev/null 2>&1; then
-    ip link del dev "$VPN_INTERFACE" 2>/dev/null || true
-  fi
+  delete_legacy_route_rules -4 "$RETURN4_PRIORITY" "$RETURN4_TABLE" \
+    || { log_err "无法删除旧版 IPv4 回程规则，保留路由所有权标记。"; return 1; }
+  delete_legacy_route_rules -6 "$RETURN6_PRIORITY" "$RETURN6_TABLE" \
+    || { log_err "无法删除旧版 IPv6 回程规则，保留路由所有权标记。"; return 1; }
+  flush_managed_route_table -4 "$RETURN4_TABLE" \
+    || { log_err "无法清空旧版 IPv4 回程表，保留路由所有权标记。"; return 1; }
+  flush_managed_route_table -6 "$RETURN6_TABLE" \
+    || { log_err "无法清空旧版 IPv6 回程表，保留路由所有权标记。"; return 1; }
+  delete_managed_vpn_link \
+    || { log_err "无法删除旧版 $VPN_INTERFACE 接口，保留路由所有权标记。"; return 1; }
 
   default_routes="$(ip -4 route show default 2>/dev/null)" || { log_err "无法读取 IPv4 默认路由，保留路由所有权标记。"; return 1; }
   current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
   if [ -z "$current_default" ] && [ -n "$saved_default4" ]; then
-    local -a restore_args4
-    read -r -a restore_args4 <<< "$saved_default4"
-    ip -4 route replace "${restore_args4[@]}" 2>/dev/null || true
+    ensure_saved_default_if_needed -4 "$saved_default4" \
+      || { log_err "IPv4 默认路由未恢复，保留路由所有权标记。"; return 1; }
   fi
   default_routes="$(ip -6 route show default 2>/dev/null)" || { log_err "无法读取 IPv6 默认路由，保留路由所有权标记。"; return 1; }
   current_default="$(first_usable_non_vpn_default <<< "$default_routes")"
   if [ -z "$current_default" ] && [ -n "$saved_default6" ]; then
-    local -a restore_args6
-    read -r -a restore_args6 <<< "$saved_default6"
-    ip -6 route replace "${restore_args6[@]}" 2>/dev/null || true
+    ensure_saved_default_if_needed -6 "$saved_default6" \
+      || { log_err "IPv6 默认路由未恢复，保留路由所有权标记。"; return 1; }
   fi
 
   if [ -n "$saved_default4" ]; then
@@ -1039,6 +1546,14 @@ cleanup_return_routes() {
   fi
   return_route_state_is_clean || { log_err "策略规则、专用路由表或 $VPN_INTERFACE 仍有残留，保留路由所有权标记。"; return 1; }
   rm -f -- "$ROUTE_OWNER_FILE"
+}
+
+cleanup_return_routes() {
+  if [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ]; then
+    cleanup_route_plan "${1:-}"
+  else
+    cleanup_legacy_return_routes
+  fi
 }
 
 setup_return_routes() {
@@ -1171,7 +1686,9 @@ service_run() {
   fi
   release_state_lock
 
-  if [ "$PROFILE_MODE" = "global" ]; then setup_return_routes; fi
+  if [ "$PROFILE_MODE" = "global" ] && ! apply_route_plan "$service_run_id"; then
+    return 1
+  fi
 
   local -a command=(
     openconnect "$VPN_HOST"
@@ -1221,7 +1738,7 @@ cleanup_run_generation() {
   cleanup_mode="$MODE"
   release_state_lock
 
-  if [ "$cleanup_mode" = global ] && ! cleanup_return_routes; then cleanup_result=1; fi
+  if [ "$cleanup_mode" = global ] && ! cleanup_return_routes "$expected_run_id"; then cleanup_result=1; fi
 
   if [ "$cleanup_result" -ne 0 ]; then
     acquire_state_lock || return 1
@@ -1689,6 +2206,21 @@ prepare_service_replacement() {
   elif [ "$needs_stop" -eq 1 ]; then
     stop_and_disable_managed_units || return 1
   fi
+  if [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ]; then
+    die "检测到未完成清理的代际路由计划，拒绝创建新的运行快照。"
+    return 1
+  fi
+  if [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ]; then
+    if ! cleanup_legacy_return_routes; then
+      die "旧版回程路由未能完整清理，拒绝创建新的运行快照。"
+      return 1
+    fi
+  fi
+  if [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ] \
+    || [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ]; then
+    die "回程路由清理证据仍然存在，拒绝创建新的运行快照。"
+    return 1
+  fi
   if [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ]; then
     die "检测到未完成清理的服务代际证据，拒绝创建新的运行快照。"
     return 1
@@ -1752,6 +2284,19 @@ start_mode() {
     return 1
   fi
   RUN_ID="$snapshot_run_id"
+  if [ "$mode" = global ]; then
+    if ! build_route_plan "$snapshot_run_id" \
+      || ! write_route_plan "$snapshot_run_id" \
+      || ! validate_route_plan_against_snapshot "$snapshot_run_id"; then
+      log_err "无法为当前运行代际建立安全回程计划，拒绝启动整机全局 VPN。"
+      if ! cleanup_start_attempt "$snapshot_run_id"; then
+        log_err "回程计划启动前检查失败，且本代际清理未完成；已保留恢复证据。"
+      fi
+      release_service_operation_lock
+      clear_start_signal_traps
+      return 1
+    fi
+  fi
   if ! transition_run_state "$snapshot_run_id" PREPARING STARTING 1 0; then
     log_err "无法提交运行状态，拒绝启动 VPN。"
     cleanup_start_attempt "$snapshot_run_id" || true

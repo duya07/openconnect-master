@@ -331,6 +331,9 @@ GLOBAL_RESULT="${TEST_ROOT}/global.result"
   confirm_service_replacement() { REPLACEMENT_CONFIRMED=0; }
   prepare_service_replacement() { [ "${1:-}" = "$REPLACEMENT_CONFIRMED" ]; }
   install_self_and_units() { :; }
+  build_route_plan() { [ "${1:-}" = "$RUN_A" ]; }
+  write_route_plan() { [ "${1:-}" = "$RUN_A" ]; }
+  validate_route_plan_against_snapshot() { [ "${1:-}" = "$RUN_A" ]; }
   start_managed_units() { :; }
   wait_until_healthy() { return 0; }
   systemctl() {
