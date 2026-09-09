@@ -409,7 +409,7 @@ state_matches_run() {
 transition_run_state() (
   [ "$#" -eq 5 ] || return 1
   local expected_run_id="$1" allowed_old_phases="$2" new_phase="$3"
-  local desired_active="$4" rollback_deadline="$5" phase state_lock_fd
+  local desired_active="$4" rollback_deadline="$5" phase transition_result=0
   local -a allowed_phase_list=()
 
   valid_run_state_values "$expected_run_id" "$new_phase" "$desired_active" "$rollback_deadline" || return 1
@@ -419,18 +419,22 @@ transition_run_state() (
     valid_state_phase "$phase" || return 1
   done
 
-  command -v flock >/dev/null 2>&1 || return 1
-  install -d -m 0755 "$(dirname -- "$STATE_LOCK_FILE")" || return 1
-  exec {state_lock_fd}>"$STATE_LOCK_FILE" || return 1
-  flock "$state_lock_fd" || return 1
-
-  load_runtime_state || return 1
-  [ "$RUN_ID" = "$expected_run_id" ] || return 1
+  acquire_state_lock || return 1
+  if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
+    release_state_lock
+    return 1
+  fi
   case ",$allowed_old_phases," in
     *",$PHASE,"*) ;;
-    *) return 1 ;;
+    *) release_state_lock; return 1 ;;
   esac
-  write_run_state "$expected_run_id" "$new_phase" "$desired_active" "$rollback_deadline"
+  if write_run_state "$expected_run_id" "$new_phase" "$desired_active" "$rollback_deadline"; then
+    transition_result=0
+  else
+    transition_result=$?
+  fi
+  release_state_lock
+  return "$transition_result"
 )
 
 is_systemd_host() {
@@ -1148,6 +1152,10 @@ service_run() {
   local service_run_id=""
 
   acquire_state_lock || return "$NON_RESTARTABLE_EXIT"
+  if [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ]; then
+    release_state_lock
+    return "$NON_RESTARTABLE_EXIT"
+  fi
   if ! load_runtime_configuration >/dev/null 2>&1; then
     release_state_lock
     return "$NON_RESTARTABLE_EXIT"
@@ -1202,7 +1210,7 @@ remove_service_run_id_if_matches() {
 
 cleanup_run_generation() {
   [ "$#" -eq 1 ] || return 1
-  local expected_run_id="$1" cleanup_mode="" desired_active=""
+  local expected_run_id="$1" cleanup_mode=""
   local cleanup_result=0
 
   acquire_state_lock || return 1
@@ -1211,34 +1219,44 @@ cleanup_run_generation() {
     return 0
   fi
   cleanup_mode="$MODE"
-  desired_active="$DESIRED_ACTIVE"
   release_state_lock
 
   if [ "$cleanup_mode" = global ] && ! cleanup_return_routes; then cleanup_result=1; fi
 
   if [ "$cleanup_result" -ne 0 ]; then
-    transition_run_state "$expected_run_id" \
-      'PREPARING,STARTING,RUNNING,AWAITING_CONFIRMATION,CONFIRMED,ROLLBACK_CLAIMED,STOPPING,CLEANUP_FAILED' \
-      CLEANUP_FAILED "$desired_active" 0 || true
+    acquire_state_lock || return 1
+    if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
+      release_state_lock
+      return 1
+    fi
+    if ! write_run_state "$expected_run_id" CLEANUP_FAILED "$DESIRED_ACTIVE" 0; then
+      release_state_lock
+      log_err "路由清理失败，且无法提交 CLEANUP_FAILED 状态；保留服务代际证据并禁止自动重启。"
+      return 1
+    fi
+    release_state_lock
     return 1
   fi
 
-  rm -f -- "$HEALTH_FAILURE_FILE"
-  remove_service_run_id_if_matches "$expected_run_id"
-  if [ "$desired_active" = 1 ]; then
-    return 0
-  fi
-  if transition_run_state "$expected_run_id" 'ROLLBACK_CLAIMED,STOPPING,CLEANUP_FAILED' CLEANED 0 0; then
-    return 0
-  fi
   acquire_state_lock || return 1
-  if load_runtime_state && [ "$RUN_ID" = "$expected_run_id" ] \
-    && [ "$PHASE" = CLEANED ] && [ "$DESIRED_ACTIVE" = 0 ]; then
+  if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
     release_state_lock
-    return 0
+    return 1
   fi
+  if [ "$DESIRED_ACTIVE" = 0 ] && [ "$PHASE" != CLEANED ]; then
+    case "$PHASE" in
+      ROLLBACK_CLAIMED|STOPPING|CLEANUP_FAILED) ;;
+      *) release_state_lock; return 1 ;;
+    esac
+    if ! write_run_state "$expected_run_id" CLEANED 0 0; then
+      release_state_lock
+      log_err "路由清理完成，但无法提交 CLEANED 状态；保留服务代际证据并禁止自动重启。"
+      return 1
+    fi
+  fi
+  remove_service_run_id_if_matches "$expected_run_id" || { release_state_lock; return 1; }
   release_state_lock
-  return 1
+  rm -f -- "$HEALTH_FAILURE_FILE"
 }
 
 service_cleanup() {
@@ -1448,13 +1466,54 @@ stop_and_disable_managed_units() {
   systemctl disable "$HEALTH_TIMER_NAME" "$SERVICE_NAME" >/dev/null 2>&1 || log_warn "服务已停止，但禁用开机自启失败；请检查 systemctl 状态。"
 }
 
+claim_run_stop() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1"
+
+  acquire_state_lock || return 1
+  if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
+    release_state_lock
+    return 1
+  fi
+  if [ "$PHASE" = CLEANED ] && [ "$DESIRED_ACTIVE" = 0 ]; then
+    release_state_lock
+    return 0
+  fi
+  case "$PHASE" in
+    PREPARING|STARTING|RUNNING|AWAITING_CONFIRMATION|CONFIRMED|ROLLBACK_CLAIMED|STOPPING|CLEANUP_FAILED) ;;
+    *) release_state_lock; return 1 ;;
+  esac
+  if ! write_run_state "$expected_run_id" STOPPING 0 0; then
+    release_state_lock
+    return 1
+  fi
+  release_state_lock
+}
+
+stop_run_transaction() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1"
+
+  claim_run_stop "$expected_run_id" || return 1
+  stop_and_disable_managed_units || return 1
+  cleanup_run_generation "$expected_run_id" || return 1
+
+  acquire_state_lock || return 1
+  if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ] \
+    || [ "$PHASE" != CLEANED ] || [ "$DESIRED_ACTIVE" != 0 ]; then
+    release_state_lock
+    return 1
+  fi
+  release_state_lock
+  cancel_rollback "$expected_run_id" \
+    || log_warn "连接已停止并完成清理，但独立回滚单元未能完全移除。"
+}
+
 cleanup_start_attempt() {
   local expected_run_id="${1:-}"
 
   if valid_uuid "$expected_run_id" && state_matches_run "$expected_run_id"; then
-    transition_run_state "$expected_run_id" \
-      'PREPARING,STARTING,RUNNING,AWAITING_CONFIRMATION,CONFIRMED,CLEANUP_FAILED' STOPPING 0 0 \
-      || return 1
+    if ! claim_run_stop "$expected_run_id"; then return 1; fi
     if ! stop_and_disable_managed_units; then
       log_err "无法确认隧道已经停止；为保护现有连接，保留受管状态和清理证据。"
       return 1
@@ -1583,23 +1642,56 @@ confirm_global_run() {
   fi
 }
 
-prepare_service_replacement() {
-  local answer="" service_state="" health_state="" timer_state="" state needs_stop=0
+managed_units_need_stop() {
+  local service_state="" health_state="" timer_state="" state
   service_state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
   health_state="$(systemctl is-active "$HEALTH_SERVICE_NAME" 2>/dev/null || true)"
   timer_state="$(systemctl is-active "$HEALTH_TIMER_NAME" 2>/dev/null || true)"
   for state in "$service_state" "$health_state" "$timer_state"; do
     case "$state" in
       inactive|failed) ;;
-      *) needs_stop=1 ;;
+      *) return 0 ;;
     esac
   done
+  return 1
+}
 
-  if [ "$needs_stop" -eq 1 ]; then
+confirm_service_replacement() {
+  local answer=""
+  REPLACEMENT_CONFIRMED=0
+  if managed_units_need_stop; then
     log_warn "已有 oc-master 受管单元正在运行或切换状态，继续会先将其完整停止。"
     read -r -p "确认替换？[y/N]: " answer
     [[ "$answer" =~ ^[yY]$ ]] || return 1
+    REPLACEMENT_CONFIRMED=1
+  fi
+}
+
+prepare_service_replacement() {
+  [ "$#" -eq 1 ] || return 1
+  local replacement_confirmed="$1" old_run_id="" needs_stop=0
+
+  if managed_units_need_stop; then needs_stop=1; fi
+  if [ "$needs_stop" -eq 1 ] && [ "$replacement_confirmed" != 1 ]; then
+    die "受管单元状态已变化，请重新执行启动并确认替换。"
+    return 1
+  fi
+
+  acquire_state_lock || return 1
+  if load_runtime_state >/dev/null 2>&1; then old_run_id="$RUN_ID"; fi
+  release_state_lock
+
+  if [ -n "$old_run_id" ]; then
+    if ! stop_run_transaction "$old_run_id"; then
+      log_err "旧运行代际未能完整停止和清理，拒绝创建新的运行快照。"
+      return 1
+    fi
+  elif [ "$needs_stop" -eq 1 ]; then
     stop_and_disable_managed_units || return 1
+  fi
+  if [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ]; then
+    die "检测到未完成清理的服务代际证据，拒绝创建新的运行快照。"
+    return 1
   fi
 
   local foreign_pids
@@ -1609,6 +1701,7 @@ prepare_service_replacement() {
 
 start_mode() {
   local mode="$1" socks_port="" answer="" snapshot_run_id=""
+  local selected_account_index="" selected_protocol="" selected_account_record=""
   ensure_dependencies "$mode"
   select_account
   if [ "$mode" = "proxy" ]; then
@@ -1619,15 +1712,24 @@ start_mode() {
     confirm_global_risk || return 0
   fi
 
+  selected_account_index="$ACCOUNT_INDEX"
+  selected_protocol="$VPN_PROTOCOL"
+  selected_account_record="$ACCOUNT_RECORD"
+  REPLACEMENT_CONFIRMED=0
+  confirm_service_replacement || return 1
+
   acquire_service_operation_lock wait || return 1
   if ! prepare_runtime_configuration_for_start; then
     release_service_operation_lock
     return 1
   fi
-  if ! prepare_service_replacement; then
+  if ! prepare_service_replacement "$REPLACEMENT_CONFIRMED"; then
     release_service_operation_lock
     return 1
   fi
+  ACCOUNT_INDEX="$selected_account_index"
+  VPN_PROTOCOL="$selected_protocol"
+  ACCOUNT_RECORD="$selected_account_record"
   if [ "$mode" = "proxy" ] && ! port_is_free "$socks_port"; then
     die "端口 $socks_port 已被占用。"
     release_service_operation_lock

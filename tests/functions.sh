@@ -227,7 +227,10 @@ if ! (
     esac
   }
   pgrep() { return 1; }
-  prepare_service_replacement <<< 'y' >/dev/null 2>&1
+  acquire_state_lock() { :; }
+  release_state_lock() { :; }
+  confirm_service_replacement <<< 'y' >/dev/null 2>&1
+  prepare_service_replacement "$REPLACEMENT_CONFIRMED" >/dev/null 2>&1
   [ "$MOCK_PREPARE_MAIN_STATE" = 'inactive' ]
 ); then
   fail "an activating auto-restart job was not stopped before profile replacement"
@@ -243,6 +246,7 @@ if (
     export ACCOUNT_RECORD='Global test|alice|secret|vpn.example.test||nc'
   }
   confirm_global_risk() { :; }
+  confirm_service_replacement() { REPLACEMENT_CONFIRMED=0; }
   prepare_service_replacement() { :; }
   install_self_and_units() { :; }
   create_run_snapshot() {

@@ -37,10 +37,26 @@ printf '%s\n' "$BOOT_A" > "$OCM_BOOT_ID_FILE"
 # shellcheck source=../oc_master.sh
 source oc_master.sh
 
-# Git Bash may not ship util-linux flock. State behavior remains testable there;
-# Linux CI exercises the same cases with the real advisory locks.
+# Git Bash may not ship util-linux flock. Keep the deterministic state-machine
+# coverage there, but never present the fallback as advisory-lock coverage.
+HAVE_REAL_FLOCK=1
 if ! command -v flock >/dev/null 2>&1; then
-  flock() { return 0; }
+  HAVE_REAL_FLOCK=0
+  # Preserve state/CAS coverage without pretending to exercise cross-process
+  # advisory locking. Task 8 supplies the required real-flock Linux gate.
+  acquire_state_lock() {
+    [ -z "${TEST_STATE_LOCK_HELD:-}" ] || return 1
+    TEST_STATE_LOCK_HELD=1
+  }
+  release_state_lock() { unset TEST_STATE_LOCK_HELD; }
+  acquire_service_operation_lock() {
+    [ "$#" -eq 1 ] || return 1
+    case "$1" in wait|try) ;; *) return 1 ;; esac
+    [ -z "${TEST_SERVICE_LOCK_HELD:-}" ] || return 0
+    TEST_SERVICE_LOCK_HELD=1
+  }
+  release_service_operation_lock() { unset TEST_SERVICE_LOCK_HELD; }
+  printf 'SKIP: lifecycle advisory-lock assertions (real flock unavailable)\n'
 fi
 
 check_root() { :; }
@@ -73,6 +89,208 @@ assert_state() {
   assert_eq "$deadline" "$ROLLBACK_DEADLINE" "$message: deadline"
 }
 
+REVIEW_FAILURES=0
+review_failure() {
+  printf 'review regression: %s\n' "$1" >&2
+  REVIEW_FAILURES=$((REVIEW_FAILURES + 1))
+}
+
+# Replacement confirmation is user input: it must happen before the service lock.
+rm -f -- "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE" "$SERVICE_RUN_ID_FILE"
+LOCKED_READ="${TEST_ROOT}/locked-read"
+set +e
+(
+  SERVICE_LOCK_HELD=0
+  acquire_service_operation_lock() { SERVICE_LOCK_HELD=1; }
+  release_service_operation_lock() { SERVICE_LOCK_HELD=0; }
+  ensure_dependencies() { :; }
+  prepare_runtime_configuration_for_start() { :; }
+  select_account() { export ACCOUNT_INDEX=0 VPN_PROTOCOL=nc ACCOUNT_RECORD="$ACCOUNT"; }
+  install_self_and_units() { :; }
+  stop_and_disable_managed_units() { :; }
+  start_managed_units() { :; }
+  wait_until_healthy() { return 0; }
+  port_is_free() { return 0; }
+  pgrep() { return 1; }
+  systemctl() {
+    case "$1" in is-active) printf 'active\n'; return 0 ;; *) return 0 ;; esac
+  }
+  read() {
+    local test_read_target="${!#}" test_read_value=""
+    case " $* " in
+      *' -p '*) ;;
+      *) builtin read "$@"; return ;;
+    esac
+    [ "$SERVICE_LOCK_HELD" -eq 0 ] || : > "$LOCKED_READ"
+    [ "$test_read_target" != answer ] || test_read_value=y
+    printf -v "$test_read_target" '%s' "$test_read_value"
+  }
+  create_run_snapshot() {
+    write_runtime_fixture "$RUN_A" "$BOOT_A" proxy PREPARING 1 0
+    printf '%s\n' "$RUN_A"
+  }
+  start_mode proxy >/dev/null 2>&1
+)
+LOCK_PROMPT_RC=$?
+set -e
+[ "$LOCK_PROMPT_RC" -eq 0 ] || review_failure 'replacement confirmation fixture did not complete'
+[ ! -e "$LOCKED_READ" ] || review_failure 'replacement confirmation read while holding the service-operation lock'
+
+# A unit-state TOCTOU after the prompt must be rejected without a second locked read.
+rm -f -- "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE" "$SERVICE_RUN_ID_FILE" "$LOCKED_READ"
+TOCTOU_SNAPSHOT="${TEST_ROOT}/toctou-snapshot"
+set +e
+(
+  SERVICE_LOCK_HELD=0
+  acquire_service_operation_lock() { SERVICE_LOCK_HELD=1; }
+  release_service_operation_lock() { SERVICE_LOCK_HELD=0; }
+  ensure_dependencies() { :; }
+  prepare_runtime_configuration_for_start() { :; }
+  select_account() { export ACCOUNT_INDEX=0 VPN_PROTOCOL=nc ACCOUNT_RECORD="$ACCOUNT"; }
+  install_self_and_units() { :; }
+  stop_and_disable_managed_units() { :; }
+  port_is_free() { return 0; }
+  pgrep() { return 1; }
+  systemctl() {
+    case "$1" in
+      is-active)
+        if [ "$SERVICE_LOCK_HELD" -eq 1 ]; then printf 'active\n'; return 0; fi
+        printf 'inactive\n'; return 3
+        ;;
+      *) return 0 ;;
+    esac
+  }
+  read() {
+    local test_read_target="${!#}"
+    case " $* " in
+      *' -p '*) ;;
+      *) builtin read "$@"; return ;;
+    esac
+    [ "$SERVICE_LOCK_HELD" -eq 0 ] || : > "$LOCKED_READ"
+    printf -v "$test_read_target" '%s' ''
+  }
+  create_run_snapshot() { : > "$TOCTOU_SNAPSHOT"; return 1; }
+  start_mode proxy >/dev/null 2>&1
+)
+TOCTOU_RC=$?
+set -e
+[ "$TOCTOU_RC" -ne 0 ] || review_failure 'unit-state TOCTOU unexpectedly started a replacement'
+[ ! -e "$LOCKED_READ" ] || review_failure 'unit-state TOCTOU caused a second user read under lock'
+[ ! -e "$TOCTOU_SNAPSHOT" ] || review_failure 'unit-state TOCTOU reached snapshot creation without confirmation'
+
+# Replacing an old generation must stop and explicitly clean it before a snapshot.
+write_runtime_fixture "$RUN_A" "$BOOT_A" global RUNNING 1 0
+printf '%s\n' "$RUN_A" > "$SERVICE_RUN_ID_FILE"
+REPLACE_SNAPSHOT="${TEST_ROOT}/replace-snapshot"
+set +e
+(
+  ensure_dependencies() { :; }
+  prepare_runtime_configuration_for_start() { :; }
+  select_account() { export ACCOUNT_INDEX=0 VPN_PROTOCOL=nc ACCOUNT_RECORD="$ACCOUNT"; }
+  install_self_and_units() { :; }
+  stop_and_disable_managed_units() { :; }
+  port_is_free() { return 0; }
+  pgrep() { return 1; }
+  systemctl() {
+    case "$1" in is-active) printf 'active\n'; return 0 ;; *) return 0 ;; esac
+  }
+  read() {
+    local test_read_target="${!#}" test_read_value=""
+    case " $* " in
+      *' -p '*) ;;
+      *) builtin read "$@"; return ;;
+    esac
+    [ "$test_read_target" != answer ] || test_read_value=y
+    printf -v "$test_read_target" '%s' "$test_read_value"
+  }
+  cleanup_return_routes() { return 1; }
+  create_run_snapshot() { : > "$REPLACE_SNAPSHOT"; return 1; }
+  start_mode proxy >/dev/null 2>&1
+)
+REPLACE_RC=$?
+set -e
+[ "$REPLACE_RC" -ne 0 ] || review_failure 'replacement continued after old-generation cleanup failed'
+[ ! -e "$REPLACE_SNAPSHOT" ] || review_failure 'new snapshot was attempted before old-generation cleanup completed'
+if load_run_state; then
+  [ "$RUN_ID" = "$RUN_A" ] || review_failure 'failed replacement overwrote the old generation id'
+  [ "$PHASE" = CLEANUP_FAILED ] || review_failure 'failed replacement did not retain CLEANUP_FAILED evidence'
+  [ "$DESIRED_ACTIVE" = 0 ] || review_failure 'failed replacement did not persist desired-active=0'
+else
+  review_failure 'failed replacement made the old generation unreadable'
+fi
+[ "$(cat "$SERVICE_RUN_ID_FILE" 2>/dev/null || true)" = "$RUN_A" ] \
+  || review_failure 'failed replacement discarded the old generation owner marker'
+
+# Cleanup failure must re-read desired-active after its unlocked route work.
+write_runtime_fixture "$RUN_A" "$BOOT_A" global RUNNING 1 0
+printf '%s\n' "$RUN_A" > "$SERVICE_RUN_ID_FILE"
+CLEANUP_READY="${TEST_ROOT}/cleanup-reread.ready"
+CLEANUP_RELEASE="${TEST_ROOT}/cleanup-reread.release"
+CLEANUP_RESULT="${TEST_ROOT}/cleanup-reread.result"
+(
+  cleanup_return_routes() {
+    : > "$CLEANUP_READY"
+    while [ ! -e "$CLEANUP_RELEASE" ]; do /usr/bin/sleep 0.01; done
+    return 1
+  }
+  if service_cleanup >/dev/null 2>&1; then printf '0\n' > "$CLEANUP_RESULT"; else printf '%s\n' "$?" > "$CLEANUP_RESULT"; fi
+) &
+CLEANUP_PID=$!
+BACKGROUND_PIDS="$BACKGROUND_PIDS $CLEANUP_PID"
+wait_for_file "$CLEANUP_READY" 'cleanup failure desired-active re-read'
+transition_run_state "$RUN_A" RUNNING STOPPING 0 0 \
+  || review_failure 'stop could not update desired-active during route cleanup'
+: > "$CLEANUP_RELEASE"
+wait "$CLEANUP_PID"
+BACKGROUND_PIDS="${BACKGROUND_PIDS/ $CLEANUP_PID/}"
+[ "$(cat "$CLEANUP_RESULT")" -ne 0 ] || review_failure 'route cleanup failure returned success'
+if load_run_state; then
+  [ "$PHASE" = CLEANUP_FAILED ] || review_failure 'route cleanup failure did not persist CLEANUP_FAILED'
+  [ "$DESIRED_ACTIVE" = 0 ] || review_failure 'route cleanup failure restored stale desired-active=1'
+else
+  review_failure 'route cleanup failure left unreadable state'
+fi
+
+# If CLEANUP_FAILED cannot be committed, the retained owner marker must block restart.
+write_runtime_fixture "$RUN_A" "$BOOT_A" global RUNNING 1 0
+printf '%s\n' "$RUN_A" > "$SERVICE_RUN_ID_FILE"
+CLEANUP_COMMIT_OUTPUT="${TEST_ROOT}/cleanup-commit.output"
+set +e
+(
+  cleanup_return_routes() { return 1; }
+  write_run_state() {
+    [ "${2:-}" != CLEANUP_FAILED ] || return 1
+    return 0
+  }
+  service_cleanup
+) >"$CLEANUP_COMMIT_OUTPUT" 2>&1
+CLEANUP_COMMIT_RC=$?
+set -e
+[ "$CLEANUP_COMMIT_RC" -ne 0 ] || review_failure 'failed CLEANUP_FAILED commit returned success'
+grep -F 'CLEANUP_FAILED' "$CLEANUP_COMMIT_OUTPUT" >/dev/null 2>&1 \
+  || review_failure 'failed CLEANUP_FAILED commit was silently swallowed'
+[ "$(cat "$SERVICE_RUN_ID_FILE" 2>/dev/null || true)" = "$RUN_A" ] \
+  || review_failure 'failed cleanup-state commit removed the owner marker'
+SERVICE_SIDE_EFFECTS="${TEST_ROOT}/service-restart.side-effects"
+MOCK_BIN="${TEST_ROOT}/mock-bin"
+mkdir -p -- "$MOCK_BIN"
+printf '#!/usr/bin/env bash\nprintf "openconnect\\n" >> "$SERVICE_SIDE_EFFECTS"\n' > "$MOCK_BIN/openconnect"
+chmod 0700 "$MOCK_BIN/openconnect"
+set +e
+(
+  export SERVICE_SIDE_EFFECTS
+  PATH="$MOCK_BIN:$PATH"
+  setup_return_routes() { printf 'routes\n' >> "$SERVICE_SIDE_EFFECTS"; }
+  service_run >/dev/null 2>&1
+)
+SERVICE_RESTART_RC=$?
+set -e
+[ "$SERVICE_RESTART_RC" -eq "$NON_RESTARTABLE_EXIT" ] \
+  || review_failure 'unresolved cleanup owner did not fail closed with exit 78'
+[ ! -e "$SERVICE_SIDE_EFFECTS" ] || review_failure 'fail-closed service restart touched routes or OpenConnect'
+
+[ "$REVIEW_FAILURES" -eq 0 ] || fail "$REVIEW_FAILURES review regression(s) detected"
+
 # A stale rollback worker must not touch the current generation.
 write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
 STALE_CALLS="${TEST_ROOT}/stale-rollback.calls"
@@ -89,6 +307,7 @@ rm -f -- "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE"
 ensure_dependencies() { :; }
 prepare_runtime_configuration_for_start() { :; }
 select_account() { export ACCOUNT_INDEX=0 VPN_PROTOCOL=nc ACCOUNT_RECORD="$ACCOUNT"; }
+confirm_service_replacement() { REPLACEMENT_CONFIRMED=0; }
 prepare_service_replacement() { :; }
 install_self_and_units() { :; }
 start_managed_units() { :; }
@@ -96,7 +315,8 @@ wait_until_healthy() { return 0; }
 start_mode proxy <<< '' >/dev/null || fail 'proxy lifecycle rejected a healthy start'
 assert_state RUNNING 1 0 'proxy lifecycle did not finish in RUNNING'
 unset -f ensure_dependencies prepare_runtime_configuration_for_start select_account \
-  prepare_service_replacement install_self_and_units start_managed_units wait_until_healthy
+  confirm_service_replacement prepare_service_replacement install_self_and_units \
+  start_managed_units wait_until_healthy
 
 # Global lifecycle must expose AWAITING_CONFIRMATION before reading KEEP.
 rm -f -- "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE"
@@ -108,7 +328,8 @@ GLOBAL_RESULT="${TEST_ROOT}/global.result"
   prepare_runtime_configuration_for_start() { :; }
   select_account() { export ACCOUNT_INDEX=0 VPN_PROTOCOL=nc ACCOUNT_RECORD="$ACCOUNT"; }
   confirm_global_risk() { :; }
-  prepare_service_replacement() { :; }
+  confirm_service_replacement() { REPLACEMENT_CONFIRMED=0; }
+  prepare_service_replacement() { [ "${1:-}" = "$REPLACEMENT_CONFIRMED" ]; }
   install_self_and_units() { :; }
   start_managed_units() { :; }
   wait_until_healthy() { return 0; }
@@ -247,8 +468,10 @@ TIMER_PID=$!
 BACKGROUND_PIDS="$BACKGROUND_PIDS $TIMER_PID"
 wait_for_file "$TIMER_READY" 'early rollback sleep'
 assert_eq 120 "$(cat "$TIMER_SLEEP_ARG")" 'rollback timer did not sleep only the remaining deadline'
-acquire_service_operation_lock try || fail 'rollback timer held service-operation lock while sleeping'
-release_service_operation_lock
+if [ "$HAVE_REAL_FLOCK" -eq 1 ]; then
+  acquire_service_operation_lock try || fail 'rollback timer held service-operation lock while sleeping'
+  release_service_operation_lock
+fi
 transition_run_state "$RUN_A" AWAITING_CONFIRMATION CONFIRMED 1 0 \
   || fail 'KEEP could not win while early rollback worker slept'
 : > "$TIMER_RELEASE"
@@ -366,9 +589,24 @@ assert_state RUNNING 1 0 'stale ExecStopPost changed current state'
 printf '%s\n' "$RUN_B" > "$SERVICE_RUN_ID_FILE"
 service_cleanup >/dev/null || fail 'active-generation ExecStopPost cleanup failed'
 assert_state RUNNING 1 0 'unexpected exit disabled an active generation'
+[ ! -e "$SERVICE_RUN_ID_FILE" ] && [ ! -L "$SERVICE_RUN_ID_FILE" ] \
+  || fail 'successful active-generation cleanup retained the restart-blocking owner marker'
+rm -f -- "$SERVICE_SIDE_EFFECTS"
+if ! (
+  export SERVICE_SIDE_EFFECTS
+  PATH="$MOCK_BIN:$PATH"
+  openconnect_option_supported() { return 1; }
+  service_run
+) >/dev/null 2>&1; then
+  fail 'successful cleanup prevented a legal service restart'
+fi
+grep -Fx openconnect "$SERVICE_SIDE_EFFECTS" >/dev/null \
+  || fail 'legal service restart did not reach OpenConnect'
 write_run_state "$RUN_B" STOPPING 0 0
 printf '%s\n' "$RUN_B" > "$SERVICE_RUN_ID_FILE"
 service_cleanup >/dev/null || fail 'inactive-generation ExecStopPost cleanup failed'
 assert_state CLEANED 0 0 'inactive-generation ExecStopPost did not commit CLEANED'
+[ ! -e "$SERVICE_RUN_ID_FILE" ] && [ ! -L "$SERVICE_RUN_ID_FILE" ] \
+  || fail 'successful inactive-generation cleanup retained the owner marker'
 
 printf 'lifecycle checks passed\n'
