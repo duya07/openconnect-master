@@ -6,16 +6,17 @@ export PATH
 
 cd -- "${BASH_SOURCE[0]%/*}/.."
 
-"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh
+"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh
+  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh
 fi
 
 "${BASH}" tests/functions.sh
 "${BASH}" tests/compat.sh
 "${BASH}" tests/state.sh
 "${BASH}" tests/snapshot.sh
+"${BASH}" tests/lifecycle.sh
 
 if command -v jq >/dev/null 2>&1; then
   jq -e . examples/sing-box-selected-inbound.json examples/sing-box-all-tcp.json >/dev/null
@@ -48,6 +49,7 @@ fi
 grep -F -- '--reconnect-timeout=86400' oc_master.sh >/dev/null
 grep -F -- '--tcp-keepalive=30' oc_master.sh >/dev/null
 grep -F 'Restart=always' oc_master.sh >/dev/null
+grep -F 'RestartPreventExitStatus=78' oc_master.sh >/dev/null
 grep -F 'http_data_probe' oc_master.sh >/dev/null
 grep -F 'chmod 600 "$ACCOUNTS_FILE"' oc_master.sh >/dev/null
 grep -F 'chown 0:0 "$ACCOUNTS_FILE"' oc_master.sh >/dev/null

@@ -14,6 +14,8 @@ export OCM_SHORTCUT_PATH="${TEST_ROOT}/bin/ocm"
 export OCM_CONFIG_DIR="${TEST_ROOT}/config"
 export OCM_RUNTIME_DIR="${TEST_ROOT}/run"
 export OCM_LOCK_FILE="${TEST_ROOT}/lock/oc-master.lock"
+export OCM_STATE_LOCK_FILE="${TEST_ROOT}/lock/oc-master-state.lock"
+export OCM_SERVICE_LOCK_FILE="${TEST_ROOT}/lock/oc-master-service.lock"
 export OCM_DDNS_SCAN_ROOT="${TEST_ROOT}/scan"
 
 # shellcheck source=../oc_master.sh
@@ -169,13 +171,16 @@ if ! (
   fail "verified clean return-route state did not release its ownership marker"
 fi
 
-if (
+MOCK_MARKERLESS_CLEANUP_CALLS="${TEST_ROOT}/markerless-cleanup.calls"
+if ! (
   check_root() { :; }
-  cleanup_return_routes() { return 1; }
+  cleanup_return_routes() { printf '%s\n' cleanup >> "$MOCK_MARKERLESS_CLEANUP_CALLS"; return 1; }
   service_cleanup >/dev/null 2>&1
 ); then
-  fail "service cleanup hid a return-route cleanup failure"
+  fail "markerless service cleanup did not exit harmlessly"
 fi
+[ ! -e "$MOCK_MARKERLESS_CLEANUP_CALLS" ] \
+  || fail "markerless service cleanup touched return routes"
 
 MOCK_SYSTEMCTL_CALLS="${TEST_ROOT}/systemctl.calls"
 systemctl() {
@@ -230,17 +235,33 @@ fi
 
 MOCK_GLOBAL_START_CALLS="${TEST_ROOT}/global-start.calls"
 if (
+  TEST_GLOBAL_RUN_ID='123e4567-e89b-42d3-a456-426614174030'
+  TEST_GLOBAL_BOOT_ID="$(current_boot_id)"
   ensure_dependencies() { :; }
-  select_account() { export ACCOUNT_INDEX=0 VPN_PROTOCOL='nc'; }
+  select_account() {
+    export ACCOUNT_INDEX=0 VPN_PROTOCOL='nc'
+    export ACCOUNT_RECORD='Global test|alice|secret|vpn.example.test||nc'
+  }
   confirm_global_risk() { :; }
   prepare_service_replacement() { :; }
   install_self_and_units() { :; }
-  write_profile() { :; }
-  cancel_rollback() { printf '%s\n' cancel >> "$MOCK_GLOBAL_START_CALLS"; }
+  create_run_snapshot() {
+    write_active_run "$TEST_GLOBAL_RUN_ID" "$TEST_GLOBAL_BOOT_ID" global 0 nc '' "$ACCOUNT_RECORD"
+    write_run_state "$TEST_GLOBAL_RUN_ID" PREPARING 1 0
+    printf '%s\n' "$TEST_GLOBAL_RUN_ID"
+  }
+  cancel_rollback() {
+    [ "$#" -eq 1 ] && [ "$1" = "$TEST_GLOBAL_RUN_ID" ] || return 1
+    printf '%s\n' cancel >> "$MOCK_GLOBAL_START_CALLS"
+  }
   systemd-run() { printf '%s\n' rollback >> "$MOCK_GLOBAL_START_CALLS"; return 1; }
   start_managed_units() { printf '%s\n' start >> "$MOCK_GLOBAL_START_CALLS"; return 0; }
   wait_until_healthy() { return 1; }
-  cleanup_start_attempt() { printf '%s\n' cleanup >> "$MOCK_GLOBAL_START_CALLS"; return 0; }
+  cleanup_start_attempt() {
+    [ "$#" -eq 1 ] && [ "$1" = "$TEST_GLOBAL_RUN_ID" ] || return 1
+    printf '%s\n' cleanup >> "$MOCK_GLOBAL_START_CALLS"
+  }
+  flock() { return 0; }
   journalctl() { :; }
   log_info() { :; }
   log_warn() { :; }
@@ -464,23 +485,41 @@ fi
 MOCK_CLEANUP_CALLS="${TEST_ROOT}/cleanup.calls"
 MOCK_STOP_RESULT=0
 MOCK_CLEANUP_RESULT=0
+FUNCTION_RUN_ID='123e4567-e89b-42d3-a456-426614174031'
+FUNCTION_BOOT_ID='123e4567-e89b-42d3-a456-426614174032'
+FUNCTION_ACCOUNT='Function test|alice|secret|vpn.example.test||nc'
+if ! command -v flock >/dev/null 2>&1; then flock() { return 0; }; fi
+write_function_runtime() {
+  local mode="$1" phase="$2" desired="$3" deadline="$4" socks_port=1080
+  [ "$mode" = proxy ] || socks_port=''
+  mkdir -p -- "$RUNTIME_DIR"
+  write_active_run "$FUNCTION_RUN_ID" "$FUNCTION_BOOT_ID" "$mode" 0 nc "$socks_port" "$FUNCTION_ACCOUNT"
+  write_run_state "$FUNCTION_RUN_ID" "$phase" "$desired" "$deadline"
+  printf '%s\n' "$FUNCTION_RUN_ID" > "$SERVICE_RUN_ID_FILE"
+}
 stop_and_disable_managed_units() {
   printf '%s\n' stop >> "$MOCK_CLEANUP_CALLS"
   return "$MOCK_STOP_RESULT"
 }
-service_cleanup() {
+cleanup_run_generation() {
+  [ "$#" -eq 1 ] && [ "$1" = "$FUNCTION_RUN_ID" ] || return 1
   printf '%s\n' cleanup >> "$MOCK_CLEANUP_CALLS"
   return "$MOCK_CLEANUP_RESULT"
 }
-cancel_rollback() { printf '%s\n' cancel >> "$MOCK_CLEANUP_CALLS"; }
+cancel_rollback() {
+  [ "$#" -eq 1 ] && [ "$1" = "$FUNCTION_RUN_ID" ] || return 1
+  printf '%s\n' cancel >> "$MOCK_CLEANUP_CALLS"
+}
 
-cleanup_start_attempt || fail "confirmed stopped start attempt was not cleaned"
+write_function_runtime proxy STARTING 1 0
+cleanup_start_attempt "$FUNCTION_RUN_ID" || fail "confirmed stopped start attempt was not cleaned"
 [ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop cleanup cancel ' ] \
   || fail "start-attempt cleanup order is wrong"
 
 : > "$MOCK_CLEANUP_CALLS"
 MOCK_STOP_RESULT=1
-if cleanup_start_attempt >/dev/null 2>&1; then
+write_function_runtime proxy STARTING 1 0
+if cleanup_start_attempt "$FUNCTION_RUN_ID" >/dev/null 2>&1; then
   fail "failed service stop was accepted during start-attempt cleanup"
 fi
 [ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop ' ] \
@@ -489,7 +528,8 @@ fi
 : > "$MOCK_CLEANUP_CALLS"
 MOCK_STOP_RESULT=0
 MOCK_CLEANUP_RESULT=1
-if cleanup_start_attempt >/dev/null 2>&1; then
+write_function_runtime proxy STARTING 1 0
+if cleanup_start_attempt "$FUNCTION_RUN_ID" >/dev/null 2>&1; then
   fail "failed route cleanup was accepted during start-attempt cleanup"
 fi
 [ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop cleanup ' ] \
@@ -500,6 +540,7 @@ MOCK_STOP_RESULT=0
 MOCK_CLEANUP_RESULT=1
 check_root() { :; }
 log() { printf '%s\n' log >> "$MOCK_CLEANUP_CALLS"; }
+write_function_runtime proxy RUNNING 1 0
 if stop_vpn >/dev/null 2>&1; then
   fail "manual stop reported success after incomplete route cleanup"
 fi
@@ -508,13 +549,15 @@ fi
 
 : > "$MOCK_CLEANUP_CALLS"
 MOCK_CLEANUP_RESULT=0
+write_function_runtime proxy RUNNING 1 0
 stop_vpn
 [ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop cleanup cancel log ' ] \
   || fail "manual stop did not preserve stop-cleanup-cancel order"
 
 : > "$MOCK_CLEANUP_CALLS"
 MOCK_STOP_RESULT=1
-if rollback_now >/dev/null 2>&1; then
+write_function_runtime global AWAITING_CONFIRMATION 1 0
+if rollback_now "$FUNCTION_RUN_ID" >/dev/null 2>&1; then
   fail "automatic rollback reported success without confirming the tunnel stopped"
 fi
 [ "$(tr '\n' ' ' < "$MOCK_CLEANUP_CALLS")" = 'stop ' ] \
