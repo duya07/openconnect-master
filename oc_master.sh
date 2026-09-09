@@ -404,10 +404,16 @@ check_all_dependencies() {
 ensure_accounts_file() {
   ensure_dirs
   if [ ! -e "$ACCOUNTS_FILE" ]; then
-    printf '%s\n' '# 显示名|用户名|密码|VPN主机|认证组(可空)|协议(anyconnect/nc/pulse)' > "$ACCOUNTS_FILE"
+    printf '%s\n' '# 显示名|用户名|密码|VPN主机|认证组(可空)|协议(anyconnect/nc/pulse)' \
+      | replace_accounts_from_stdin
   fi
   chown 0:0 "$ACCOUNTS_FILE"
   chmod 600 "$ACCOUNTS_FILE"
+}
+
+replace_accounts_from_stdin() {
+  [ -d "$(dirname -- "$ACCOUNTS_FILE")" ] || return 1
+  atomic_replace_from_stdin "$ACCOUNTS_FILE" 0600
 }
 
 read_accounts() {
@@ -457,7 +463,8 @@ load_account_by_index() {
   read_accounts
   [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -lt "${#ACCOUNTS[@]}" ] || { die "账户索引无效：$index"; return 1; }
   ACCOUNT_INDEX="$index"
-  parse_account_line "${ACCOUNTS[$index]}" || return 1
+  ACCOUNT_RECORD="${ACCOUNTS[$index]}"
+  parse_account_line "$ACCOUNT_RECORD" || return 1
 }
 
 select_account() {
@@ -512,23 +519,27 @@ manage_accounts() {
         [[ "$new_desc$new_user$new_pass$new_host$new_group" != *'|'* ]] \
           || { log_err "字段内容不能包含竖线字符 |。"; continue; }
         choose_protocol "" || continue
-        printf '%s|%s|%s|%s|%s|%s\n' "$new_desc" "$new_user" "$new_pass" "$new_host" "$new_group" "$VPN_PROTOCOL" >> "$ACCOUNTS_FILE"
-        chmod 600 "$ACCOUNTS_FILE"
+        {
+          cat -- "$ACCOUNTS_FILE"
+          if [ -s "$ACCOUNTS_FILE" ] && [ "$(tail -c 1 -- "$ACCOUNTS_FILE" | wc -l | tr -d '[:space:]')" -eq 0 ]; then
+            printf '\n'
+          fi
+          printf '%s|%s|%s|%s|%s|%s\n' "$new_desc" "$new_user" "$new_pass" "$new_host" "$new_group" "$VPN_PROTOCOL"
+        } | replace_accounts_from_stdin \
+          || { log_err "账户文件写入失败。"; return 1; }
         log "已添加账户：$new_desc"
         ;;
       2)
         [ "${#ACCOUNTS[@]}" -gt 0 ] || { log_warn "没有可删除的账户。"; continue; }
-        local delete_index="" tmp=""
+        local delete_index=""
         read -r -p "输入要删除的序号: " delete_index
         [[ "$delete_index" =~ ^[0-9]+$ ]] && [ "$delete_index" -ge 1 ] && [ "$delete_index" -le "${#ACCOUNTS[@]}" ] \
           || { log_err "无效序号。"; continue; }
-        tmp="$(mktemp "${CONFIG_DIR}/accounts.XXXXXX")"
         awk -v target="$delete_index" '
           /^[[:space:]]*(#|$)/ { print; next }
           { n++; if (n != target) print }
-        ' "$ACCOUNTS_FILE" > "$tmp"
-        install -m 0600 "$tmp" "$ACCOUNTS_FILE"
-        rm -f "$tmp"
+        ' "$ACCOUNTS_FILE" | replace_accounts_from_stdin \
+          || { log_err "账户文件写入失败。"; return 1; }
         log "账户已删除。"
         ;;
       0) return 0 ;;
@@ -559,35 +570,131 @@ profile_value() {
 }
 
 write_profile() {
-  local mode="$1" account_index="$2" protocol="$3" socks_port="${4:-}" tmp
+  local mode="$1" account_index="$2" protocol="$3" socks_port="${4:-}"
   [ "$mode" = "proxy" ] || [ "$mode" = "global" ] || { die "内部模式无效：$mode"; return 1; }
   [[ "$account_index" =~ ^[0-9]+$ ]] || { die "内部账户索引无效。"; return 1; }
   valid_protocol "$protocol" || { die "内部协议无效。"; return 1; }
   if [ "$mode" = "proxy" ]; then valid_port "$socks_port" || { die "内部 SOCKS 端口无效。"; return 1; }; fi
+  if [ "$mode" = "global" ]; then [ -z "$socks_port" ] || { die "全局模式不应设置 SOCKS 端口。"; return 1; }; fi
 
   ensure_dirs
-  tmp="$(mktemp "${CONFIG_DIR}/profile.XXXXXX")"
-  {
-    printf 'MODE=%s\n' "$mode"
-    printf 'ACCOUNT_INDEX=%s\n' "$account_index"
-    printf 'VPN_PROTOCOL=%s\n' "$protocol"
-    printf 'SOCKS_PORT=%s\n' "$socks_port"
-  } > "$tmp"
-  install -m 0600 "$tmp" "$PROFILE_FILE"
-  rm -f "$tmp"
+  printf '%s\n' \
+    "MODE=$mode" \
+    "ACCOUNT_INDEX=$account_index" \
+    "VPN_PROTOCOL=$protocol" \
+    "SOCKS_PORT=$socks_port" \
+    | atomic_replace_from_stdin "$PROFILE_FILE" 0600
 }
 
-load_profile() {
-  [ -r "$PROFILE_FILE" ] || { die "未找到活动配置：$PROFILE_FILE"; return 1; }
-  PROFILE_MODE="$(profile_value MODE || true)"
-  PROFILE_ACCOUNT_INDEX="$(profile_value ACCOUNT_INDEX || true)"
-  PROFILE_PROTOCOL="$(profile_value VPN_PROTOCOL || true)"
-  PROFILE_SOCKS_PORT="$(profile_value SOCKS_PORT || true)"
+load_profile_values() {
+  local line key value
+  local parsed_mode="" parsed_account_index="" parsed_protocol="" parsed_socks_port=""
+  local seen_mode=0 seen_account_index=0 seen_protocol=0 seen_socks_port=0
+
+  [ -f "$PROFILE_FILE" ] && [ ! -L "$PROFILE_FILE" ] || { die "未找到活动配置：$PROFILE_FILE"; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" == *=* ]] || { die "活动配置格式无效。"; return 1; }
+    IFS='=' read -r key value <<< "$line"
+    case "$key" in
+      MODE)
+        [ "$seen_mode" -eq 0 ] || { die "活动配置包含重复字段。"; return 1; }
+        seen_mode=1; parsed_mode="$value"
+        ;;
+      ACCOUNT_INDEX)
+        [ "$seen_account_index" -eq 0 ] || { die "活动配置包含重复字段。"; return 1; }
+        seen_account_index=1; parsed_account_index="$value"
+        ;;
+      VPN_PROTOCOL)
+        [ "$seen_protocol" -eq 0 ] || { die "活动配置包含重复字段。"; return 1; }
+        seen_protocol=1; parsed_protocol="$value"
+        ;;
+      SOCKS_PORT)
+        [ "$seen_socks_port" -eq 0 ] || { die "活动配置包含重复字段。"; return 1; }
+        seen_socks_port=1; parsed_socks_port="$value"
+        ;;
+      *) die "活动配置包含未知字段。"; return 1 ;;
+    esac
+  done < "$PROFILE_FILE"
+  [ "$seen_mode" -eq 1 ] && [ "$seen_account_index" -eq 1 ] && [ "$seen_protocol" -eq 1 ] \
+    && [ "$seen_socks_port" -eq 1 ] || { die "活动配置缺少必需字段。"; return 1; }
+
+  PROFILE_MODE="$parsed_mode"
+  PROFILE_ACCOUNT_INDEX="$parsed_account_index"
+  PROFILE_PROTOCOL="$parsed_protocol"
+  PROFILE_SOCKS_PORT="$parsed_socks_port"
   [ "$PROFILE_MODE" = "proxy" ] || [ "$PROFILE_MODE" = "global" ] || { die "活动配置中的 MODE 无效。"; return 1; }
   [[ "$PROFILE_ACCOUNT_INDEX" =~ ^[0-9]+$ ]] || { die "活动配置中的账户索引无效。"; return 1; }
   valid_protocol "$PROFILE_PROTOCOL" || { die "活动配置中的协议无效。"; return 1; }
   if [ "$PROFILE_MODE" = "proxy" ]; then valid_port "$PROFILE_SOCKS_PORT" || { die "活动配置中的 SOCKS 端口无效。"; return 1; }; fi
+  if [ "$PROFILE_MODE" = "global" ]; then [ -z "$PROFILE_SOCKS_PORT" ] || { die "全局活动配置不应设置 SOCKS 端口。"; return 1; }; fi
+}
+
+load_legacy_profile_account() {
+  load_profile_values || return 1
   load_account_by_index "$PROFILE_ACCOUNT_INDEX" || return 1
+}
+
+load_runtime_configuration() {
+  load_runtime_state || { die "运行快照或代际状态缺失、损坏或不匹配。"; return 1; }
+  PROFILE_MODE="$MODE"
+  PROFILE_ACCOUNT_INDEX="$ACCOUNT_INDEX"
+  PROFILE_PROTOCOL="$VPN_PROTOCOL"
+  PROFILE_SOCKS_PORT="$SOCKS_PORT"
+  parse_account_line "$ACCOUNT_RECORD" || return 1
+}
+
+load_profile() {
+  load_runtime_configuration
+}
+
+create_run_snapshot() {
+  [ "$#" -eq 5 ] || return 1
+  local mode="$1" account_index="$2" protocol="$3" socks_port="$4" account_line="$5"
+  local run_id boot_id loaded_run_id
+
+  run_id="$(new_run_id)" || { die "无法读取新的运行代际标识。"; return 1; }
+  boot_id="$(current_boot_id)" || { die "无法读取当前启动标识。"; return 1; }
+  valid_active_run_values "$run_id" "$boot_id" "$mode" "$account_index" "$protocol" "$socks_port" "$account_line" \
+    || { die "拒绝创建无效的运行快照。"; return 1; }
+
+  ensure_dirs
+  write_run_state "$run_id" PREPARING 1 0 || return 1
+  write_active_run "$run_id" "$boot_id" "$mode" "$account_index" "$protocol" "$socks_port" "$account_line" || return 1
+  write_profile "$mode" "$account_index" "$protocol" "$socks_port" || return 1
+  load_profile_values || return 1
+  [ "$PROFILE_MODE" = "$mode" ] \
+    && [ "$PROFILE_ACCOUNT_INDEX" = "$account_index" ] \
+    && [ "$PROFILE_PROTOCOL" = "$protocol" ] \
+    && [ "$PROFILE_SOCKS_PORT" = "$socks_port" ] \
+    || { die "兼容活动配置写入后校验失败。"; return 1; }
+  load_runtime_configuration || return 1
+  loaded_run_id="$RUN_ID"
+  [ "$loaded_run_id" = "$run_id" ] && [ "$PHASE" = PREPARING ] || return 1
+  printf '%s\n' "$loaded_run_id"
+}
+
+migrate_legacy_profile() {
+  local account_line
+
+  if [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
+    || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; then
+    return 1
+  fi
+  load_legacy_profile_account || return 1
+  account_line="$ACCOUNT_RECORD"
+  create_run_snapshot "$PROFILE_MODE" "$PROFILE_ACCOUNT_INDEX" "$PROFILE_PROTOCOL" "$PROFILE_SOCKS_PORT" "$account_line"
+}
+
+prepare_runtime_configuration_for_start() {
+  if [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
+    || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; then
+    load_runtime_configuration >/dev/null \
+      || { die "检测到不完整或非法的新运行状态，拒绝按旧账户索引回退。"; return 1; }
+    return 0
+  fi
+  [ ! -e "$PROFILE_FILE" ] && [ ! -L "$PROFILE_FILE" ] && return 0
+  migrate_legacy_profile >/dev/null \
+    || { die "旧活动配置迁移失败。"; return 1; }
 }
 
 shortcut_is_ours() {
@@ -906,7 +1013,7 @@ http_data_probe() {
 }
 
 health_once() {
-  load_profile >/dev/null 2>&1 || return 1
+  load_runtime_configuration >/dev/null 2>&1 || return 1
   openconnect_process_is_alive || return 1
   case "$PROFILE_MODE" in
     proxy)
@@ -934,7 +1041,7 @@ wait_until_healthy() {
 service_run() {
   check_root
   ensure_dirs
-  load_profile
+  load_runtime_configuration
   if [ "$PROFILE_MODE" = "global" ]; then setup_return_routes; fi
 
   local -a command=(
@@ -1129,8 +1236,9 @@ prepare_service_replacement() {
 }
 
 start_mode() {
-  local mode="$1" socks_port="" answer=""
+  local mode="$1" socks_port="" answer="" snapshot_run_id=""
   ensure_dependencies "$mode"
+  prepare_runtime_configuration_for_start
   select_account
   if [ "$mode" = "proxy" ]; then
     read -r -p "本地 SOCKS5 端口 [1080]: " socks_port
@@ -1143,8 +1251,6 @@ start_mode() {
   prepare_service_replacement
   [ "$mode" != "proxy" ] || port_is_free "$socks_port" || { die "端口 $socks_port 已被占用。"; return 1; }
   install_self_and_units
-  write_profile "$mode" "$ACCOUNT_INDEX" "$VPN_PROTOCOL" "$socks_port"
-  rm -f "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"
 
   trap 'handle_interrupted_start SIGINT 130' INT
   trap 'handle_interrupted_start SIGTERM 143' TERM
@@ -1156,6 +1262,14 @@ start_mode() {
     clear_start_signal_traps
     return 1
   fi
+  if ! snapshot_run_id="$(create_run_snapshot "$mode" "$ACCOUNT_INDEX" "$VPN_PROTOCOL" "$socks_port" "$ACCOUNT_RECORD")"; then
+    log_err "无法创建运行快照，拒绝启动 VPN。"
+    cleanup_start_attempt || true
+    clear_start_signal_traps
+    return 1
+  fi
+  RUN_ID="$snapshot_run_id"
+  rm -f "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"
   if ! start_managed_units; then
     log_err "systemd 启动链失败，正在立即停止、禁用并清理本项目状态。"
     cleanup_start_attempt || true
@@ -1221,7 +1335,8 @@ show_status() {
   printf '%b  🚀 OpenConnect Master Manager v%s 🚀%b\n' "$C_BOLD" "$VERSION" "$C_RESET"
   printf '%b%s%b\n' "$C_BOLD" '========================================================' "$C_RESET"
   sep
-  if [ ! -r "$PROFILE_FILE" ]; then
+  if [ ! -r "$PROFILE_FILE" ] && [ ! -e "$ACTIVE_RUN_FILE" ] && [ ! -L "$ACTIVE_RUN_FILE" ] \
+    && [ ! -e "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ]; then
     printf '  %bVPN 状态:%b %b🔴 停止%b\n' "$C_BOLD" "$C_RESET" "$C_RED" "$C_RESET"
     printf '    %b运行模式:%b 未配置\n' "$C_BOLD" "$C_RESET"
     printf '    %b自动守护:%b 未启用（首次启动后自动配置）\n' "$C_BOLD" "$C_RESET"
@@ -1231,7 +1346,7 @@ show_status() {
     return 0
   fi
 
-  if ! load_profile; then return 1; fi
+  if ! load_runtime_configuration; then return 1; fi
   local active="否" healthy="否" exit_ip="未检测" mode_name="未知" main_pid="-" guard="未启用"
   local host_ipv4 host_ipv6 status_color="$C_RED" status_icon="🔴" status_label="停止"
   systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && active="是"
