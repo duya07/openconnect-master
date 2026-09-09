@@ -650,7 +650,7 @@ load_profile() {
 create_run_snapshot() {
   [ "$#" -eq 5 ] || return 1
   local mode="$1" account_index="$2" protocol="$3" socks_port="$4" account_line="$5"
-  local run_id boot_id loaded_run_id
+  local run_id boot_id
 
   run_id="$(new_run_id)" || { die "无法读取新的运行代际标识。"; return 1; }
   boot_id="$(current_boot_id)" || { die "无法读取当前启动标识。"; return 1; }
@@ -668,9 +668,18 @@ create_run_snapshot() {
     && [ "$PROFILE_SOCKS_PORT" = "$socks_port" ] \
     || { die "兼容活动配置写入后校验失败。"; return 1; }
   load_runtime_configuration || return 1
-  loaded_run_id="$RUN_ID"
-  [ "$loaded_run_id" = "$run_id" ] && [ "$PHASE" = PREPARING ] || return 1
-  printf '%s\n' "$loaded_run_id"
+  [ "$RUN_ID" = "$run_id" ] \
+    && [ "$CREATED_BOOT_ID" = "$boot_id" ] \
+    && [ "$MODE" = "$mode" ] \
+    && [ "$ACCOUNT_INDEX" = "$account_index" ] \
+    && [ "$VPN_PROTOCOL" = "$protocol" ] \
+    && [ "$SOCKS_PORT" = "$socks_port" ] \
+    && [ "$ACCOUNT_RECORD" = "$account_line" ] \
+    && [ "$PHASE" = PREPARING ] \
+    && [ "$DESIRED_ACTIVE" = 1 ] \
+    && [ "$ROLLBACK_DEADLINE" = 0 ] \
+    || { die "运行快照写入后校验失败。"; return 1; }
+  printf '%s\n' "$RUN_ID"
 }
 
 migrate_legacy_profile() {
