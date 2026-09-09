@@ -58,6 +58,49 @@ load_file_exact() {
   FILE_CONTENT="${FILE_CONTENT%$'\001'}"
 }
 
+write_mismatched_active_run() {
+  local run_id="$1" boot_id="$2" mode="$3" account_index="$4"
+  local protocol="$5" socks_port="$6" account_record="$7"
+
+  case "$MISMATCH_FIELD" in
+    CREATED_BOOT_ID) boot_id="$SNAPSHOT_RUN_ID" ;;
+    MODE) mode=global; socks_port="" ;;
+    ACCOUNT_INDEX) account_index=0 ;;
+    VPN_PROTOCOL) protocol=anyconnect ;;
+    SOCKS_PORT) socks_port=1081 ;;
+    ACCOUNT_RECORD) account_record="$ACCOUNT_A" ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' \
+    'FORMAT_VERSION=1' \
+    "RUN_ID=$run_id" \
+    "CREATED_BOOT_ID=$boot_id" \
+    "MODE=$mode" \
+    "ACCOUNT_INDEX=$account_index" \
+    "VPN_PROTOCOL=$protocol" \
+    "SOCKS_PORT=$socks_port" \
+    "ACCOUNT_RECORD=$account_record" \
+    | atomic_replace_from_stdin "$ACTIVE_RUN_FILE" 0600
+}
+
+write_mismatched_run_state() {
+  local run_id="$1" phase="$2" desired_active="$3" rollback_deadline="$4"
+
+  case "$MISMATCH_FIELD" in
+    PHASE) phase=STARTING ;;
+    DESIRED_ACTIVE) desired_active=0 ;;
+    ROLLBACK_DEADLINE) rollback_deadline=1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' \
+    'FORMAT_VERSION=1' \
+    "RUN_ID=$run_id" \
+    "PHASE=$phase" \
+    "DESIRED_ACTIVE=$desired_active" \
+    "ROLLBACK_DEADLINE=$rollback_deadline" \
+    | atomic_replace_from_stdin "$RUN_STATE_FILE" 0600
+}
+
 # Regression proof: the old implementation follows ACCOUNT_INDEX after a reorder.
 # Once snapshots exist, the same scenario must load the immutable B record instead.
 write_accounts_fixture
@@ -185,6 +228,30 @@ if (
 fi
 load_run_state || fail 'missing-profile failure did not preserve valid PREPARING evidence'
 assert_eq PREPARING "$PHASE" 'missing-profile failure advanced beyond PREPARING'
+
+# A writer that reports success with valid but mismatched persisted values must be rejected.
+for mismatch_field in \
+  CREATED_BOOT_ID MODE ACCOUNT_INDEX VPN_PROTOCOL SOCKS_PORT ACCOUNT_RECORD \
+  PHASE DESIRED_ACTIVE ROLLBACK_DEADLINE; do
+  rm -f -- "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE" "$PROFILE_FILE"
+  if (
+    MISMATCH_FIELD="$mismatch_field"
+    case "$MISMATCH_FIELD" in
+      CREATED_BOOT_ID|MODE|ACCOUNT_INDEX|VPN_PROTOCOL|SOCKS_PORT|ACCOUNT_RECORD)
+        write_active_run() { write_mismatched_active_run "$@"; }
+        ;;
+      PHASE|DESIRED_ACTIVE|ROLLBACK_DEADLINE)
+        write_run_state() { write_mismatched_run_state "$@"; }
+        ;;
+    esac
+    create_run_snapshot proxy 1 nc 1080 "$ACCOUNT_B"
+  ) >/dev/null 2>"$FAILURE_ERROR"; then
+    fail "snapshot creation accepted mismatched persisted ${mismatch_field}"
+  fi
+  if grep -F 'beta-secret' "$FAILURE_ERROR" >/dev/null 2>&1; then
+    fail "mismatched ${mismatch_field} failure exposed the account password"
+  fi
+done
 
 # Complete account replacement must preserve non-account lines, ordering and mode.
 ORIGINAL_ACCOUNTS=$'# first comment\n\nAccount A|alice|alpha-secret|vpn-a.example.test|group-a|nc\n# middle comment\nAccount B|bob|beta-secret|vpn-b.example.test|group-b|nc\n'
