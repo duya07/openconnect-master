@@ -145,6 +145,9 @@ cat > "$MOCK_STDIN"
 EOF
 chmod +x "${MOCK_BIN}/openconnect"
 export MOCK_ARGS MOCK_STDIN
+if ! command -v flock >/dev/null 2>&1; then flock() { return 0; }; fi
+transition_run_state "$SNAPSHOT_RUN_ID" PREPARING STARTING 1 0 \
+  || fail 'worker fixture could not commit STARTING'
 if ! (
   PATH="${MOCK_BIN}:${PATH}"
   check_root() { :; }

@@ -82,6 +82,54 @@ acquire_manager_lock() {
   flock -n "$MANAGER_LOCK_FD" || { die "另一个 oc-master 管理操作正在进行，请稍后重试。"; return 1; }
 }
 
+acquire_service_operation_lock() {
+  [ "$#" -eq 1 ] || return 1
+  local mode="$1"
+
+  case "$mode" in wait|try) ;; *) return 1 ;; esac
+  [ -z "${SERVICE_OPERATION_LOCK_FD:-}" ] || return 0
+  command -v flock >/dev/null 2>&1 || { die "缺少 flock（util-linux），无法安全串行化服务操作。"; return 1; }
+  install -d -m 0755 "$(dirname -- "$SERVICE_LOCK_FILE")" || return 1
+  exec {SERVICE_OPERATION_LOCK_FD}>"$SERVICE_LOCK_FILE" || return 1
+  if [ "$mode" = try ]; then
+    flock -n "$SERVICE_OPERATION_LOCK_FD" || {
+      exec {SERVICE_OPERATION_LOCK_FD}>&-
+      unset SERVICE_OPERATION_LOCK_FD
+      return 1
+    }
+  elif ! flock "$SERVICE_OPERATION_LOCK_FD"; then
+    exec {SERVICE_OPERATION_LOCK_FD}>&-
+    unset SERVICE_OPERATION_LOCK_FD
+    return 1
+  fi
+}
+
+release_service_operation_lock() {
+  [ -n "${SERVICE_OPERATION_LOCK_FD:-}" ] || return 0
+  flock -u "$SERVICE_OPERATION_LOCK_FD" >/dev/null 2>&1 || true
+  exec {SERVICE_OPERATION_LOCK_FD}>&-
+  unset SERVICE_OPERATION_LOCK_FD
+}
+
+acquire_state_lock() {
+  [ -z "${STATE_LOCK_FD:-}" ] || return 1
+  command -v flock >/dev/null 2>&1 || return 1
+  install -d -m 0755 "$(dirname -- "$STATE_LOCK_FILE")" || return 1
+  exec {STATE_LOCK_FD}>"$STATE_LOCK_FILE" || return 1
+  if ! flock "$STATE_LOCK_FD"; then
+    exec {STATE_LOCK_FD}>&-
+    unset STATE_LOCK_FD
+    return 1
+  fi
+}
+
+release_state_lock() {
+  [ -n "${STATE_LOCK_FD:-}" ] || return 0
+  flock -u "$STATE_LOCK_FD" >/dev/null 2>&1 || true
+  exec {STATE_LOCK_FD}>&-
+  unset STATE_LOCK_FD
+}
+
 valid_uuid() {
   [[ "${1:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
 }
@@ -315,6 +363,47 @@ load_runtime_state() {
   active_run_id="$RUN_ID"
   load_run_state || return 1
   [ "$RUN_ID" = "$active_run_id" ]
+}
+
+loaded_state_allows_service_run() {
+  [ "$#" -eq 1 ] || return 1
+  local expected_run_id="$1" boot_id
+
+  [ "$RUN_ID" = "$expected_run_id" ] && [ "$DESIRED_ACTIVE" = 1 ] || return 1
+  case "$PHASE" in
+    STARTING|RUNNING|AWAITING_CONFIRMATION|CONFIRMED) ;;
+    *) return 1 ;;
+  esac
+  if [ "$MODE" = global ]; then
+    boot_id="$(current_boot_id)" || return 1
+    if [ "$CREATED_BOOT_ID" != "$boot_id" ]; then
+      case "$PHASE" in
+        PREPARING|STARTING|AWAITING_CONFIRMATION|ROLLBACK_CLAIMED) return 1 ;;
+      esac
+    fi
+  fi
+}
+
+state_allows_service_run() {
+  [ "$#" -eq 1 ] || return 1
+  local expected_run_id="$1" allowed=1
+
+  acquire_state_lock || return 1
+  if load_runtime_state && loaded_state_allows_service_run "$expected_run_id"; then
+    allowed=0
+  fi
+  release_state_lock
+  return "$allowed"
+}
+
+state_matches_run() {
+  [ "$#" -eq 1 ] || return 1
+  local expected_run_id="$1" matches=1
+
+  acquire_state_lock || return 1
+  if load_runtime_state && [ "$RUN_ID" = "$expected_run_id" ]; then matches=0; fi
+  release_state_lock
+  return "$matches"
 }
 
 transition_run_state() (
@@ -762,6 +851,7 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${INSTALL_PATH} _service_run
 ExecStopPost=-${INSTALL_PATH} _service_cleanup
 Restart=always
+RestartPreventExitStatus=78
 RestartSec=15s
 TimeoutStopSec=30s
 KillMode=control-group
@@ -1022,7 +1112,12 @@ http_data_probe() {
 }
 
 health_once() {
-  load_runtime_configuration >/dev/null 2>&1 || return 1
+  acquire_state_lock || return 1
+  if ! load_runtime_configuration >/dev/null 2>&1; then
+    release_state_lock
+    return 1
+  fi
+  release_state_lock
   openconnect_process_is_alive || return 1
   case "$PROFILE_MODE" in
     proxy)
@@ -1050,7 +1145,24 @@ wait_until_healthy() {
 service_run() {
   check_root
   ensure_dirs
-  load_runtime_configuration
+  local service_run_id=""
+
+  acquire_state_lock || return "$NON_RESTARTABLE_EXIT"
+  if ! load_runtime_configuration >/dev/null 2>&1; then
+    release_state_lock
+    return "$NON_RESTARTABLE_EXIT"
+  fi
+  service_run_id="$RUN_ID"
+  if ! loaded_state_allows_service_run "$service_run_id"; then
+    release_state_lock
+    return "$NON_RESTARTABLE_EXIT"
+  fi
+  if ! printf '%s\n' "$service_run_id" | atomic_replace_from_stdin "$SERVICE_RUN_ID_FILE" 0600; then
+    release_state_lock
+    return 1
+  fi
+  release_state_lock
+
   if [ "$PROFILE_MODE" = "global" ]; then setup_return_routes; fi
 
   local -a command=(
@@ -1079,46 +1191,203 @@ service_run() {
   exec "${command[@]}" <<< "$VPN_PASS"
 }
 
+remove_service_run_id_if_matches() {
+  [ "$#" -eq 1 ] || return 1
+  local expected_run_id="$1" recorded_run_id=""
+
+  recorded_run_id="$(read_single_uuid_file "$SERVICE_RUN_ID_FILE" 2>/dev/null || true)"
+  [ "$recorded_run_id" = "$expected_run_id" ] || return 0
+  rm -f -- "$SERVICE_RUN_ID_FILE"
+}
+
+cleanup_run_generation() {
+  [ "$#" -eq 1 ] || return 1
+  local expected_run_id="$1" cleanup_mode="" desired_active=""
+  local cleanup_result=0
+
+  acquire_state_lock || return 1
+  if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
+    release_state_lock
+    return 0
+  fi
+  cleanup_mode="$MODE"
+  desired_active="$DESIRED_ACTIVE"
+  release_state_lock
+
+  if [ "$cleanup_mode" = global ] && ! cleanup_return_routes; then cleanup_result=1; fi
+
+  if [ "$cleanup_result" -ne 0 ]; then
+    transition_run_state "$expected_run_id" \
+      'PREPARING,STARTING,RUNNING,AWAITING_CONFIRMATION,CONFIRMED,ROLLBACK_CLAIMED,STOPPING,CLEANUP_FAILED' \
+      CLEANUP_FAILED "$desired_active" 0 || true
+    return 1
+  fi
+
+  rm -f -- "$HEALTH_FAILURE_FILE"
+  remove_service_run_id_if_matches "$expected_run_id"
+  if [ "$desired_active" = 1 ]; then
+    return 0
+  fi
+  if transition_run_state "$expected_run_id" 'ROLLBACK_CLAIMED,STOPPING,CLEANUP_FAILED' CLEANED 0 0; then
+    return 0
+  fi
+  acquire_state_lock || return 1
+  if load_runtime_state && [ "$RUN_ID" = "$expected_run_id" ] \
+    && [ "$PHASE" = CLEANED ] && [ "$DESIRED_ACTIVE" = 0 ]; then
+    release_state_lock
+    return 0
+  fi
+  release_state_lock
+  return 1
+}
+
 service_cleanup() {
   check_root
-  cleanup_return_routes || return 1
-  rm -f "$HEALTH_FAILURE_FILE"
+  local service_run_id=""
+
+  service_run_id="$(read_single_uuid_file "$SERVICE_RUN_ID_FILE" 2>/dev/null || true)"
+  [ -n "$service_run_id" ] || return 0
+  cleanup_run_generation "$service_run_id"
+}
+
+read_generation_value() {
+  [ "$#" -eq 2 ] || return 1
+  local path="$1" expected_run_id="$2" line=""
+  local -a lines=()
+
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  mapfile -t lines < "$path" || return 1
+  [ "${#lines[@]}" -eq 1 ] || return 1
+  line="${lines[0]}"
+  case "$line" in
+    "${expected_run_id}="*) ;;
+    *) return 1 ;;
+  esac
+  line="${line#*=}"
+  [[ "$line" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  printf '%s\n' "$line"
+}
+
+record_health_result() {
+  [ "$#" -eq 2 ] || return 1
+  local expected_run_id="$1" result="$2" failures=0
+
+  acquire_state_lock || return 1
+  if ! load_runtime_state || ! loaded_state_allows_service_run "$expected_run_id"; then
+    release_state_lock
+    return 1
+  fi
+  if [ "$result" = healthy ]; then
+    rm -f -- "$HEALTH_FAILURE_FILE"
+    release_state_lock
+    printf '0\n'
+    return 0
+  fi
+  failures="$(read_generation_value "$HEALTH_FAILURE_FILE" "$expected_run_id" 2>/dev/null || printf '0')"
+  failures=$((failures + 1))
+  if ! printf '%s=%s\n' "$expected_run_id" "$failures" \
+    | atomic_replace_from_stdin "$HEALTH_FAILURE_FILE" 0600; then
+    release_state_lock
+    return 1
+  fi
+  release_state_lock
+  printf '%s\n' "$failures"
+}
+
+claim_health_restart() {
+  [ "$#" -eq 2 ] || return 1
+  local expected_run_id="$1" now="$2" last_restart=0
+
+  acquire_state_lock || return 1
+  if ! load_runtime_state || ! loaded_state_allows_service_run "$expected_run_id"; then
+    release_state_lock
+    return 1
+  fi
+  last_restart="$(read_generation_value "$HEALTH_RESTART_FILE" "$expected_run_id" 2>/dev/null || printf '0')"
+  if [ $((now - last_restart)) -lt 900 ]; then
+    release_state_lock
+    return 2
+  fi
+  if ! printf '%s=%s\n' "$expected_run_id" "$now" \
+    | atomic_replace_from_stdin "$HEALTH_RESTART_FILE" 0600; then
+    release_state_lock
+    return 1
+  fi
+  rm -f -- "$HEALTH_FAILURE_FILE"
+  release_state_lock
 }
 
 service_health() {
   check_root
   ensure_dirs
-  systemctl is-active --quiet "$SERVICE_NAME" || exit 0
+  local health_run_id="" failures=0 now=0 restart_claim_rc=0
+
+  acquire_state_lock || exit 0
+  if load_runtime_state && loaded_state_allows_service_run "$RUN_ID"; then health_run_id="$RUN_ID"; fi
+  release_state_lock
+  [ -n "$health_run_id" ] || exit 0
+
+  acquire_service_operation_lock try || exit 0
+  if ! state_allows_service_run "$health_run_id"; then
+    release_service_operation_lock
+    exit 0
+  fi
+  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    release_service_operation_lock
+    exit 0
+  fi
   if health_once; then
-    rm -f "$HEALTH_FAILURE_FILE"
+    record_health_result "$health_run_id" healthy >/dev/null || true
+    release_service_operation_lock
     exit 0
   fi
 
-  local failures=0 now last_restart=0
-  [ ! -r "$HEALTH_FAILURE_FILE" ] || failures="$(cat "$HEALTH_FAILURE_FILE" 2>/dev/null || printf '0')"
-  [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
-  failures=$((failures + 1))
-  printf '%s\n' "$failures" > "$HEALTH_FAILURE_FILE"
+  failures="$(record_health_result "$health_run_id" failed 2>/dev/null || true)"
+  [[ "$failures" =~ ^[0-9]+$ ]] || {
+    release_service_operation_lock
+    exit 0
+  }
   system_log "data-plane health check failed (${failures}/3)"
-  [ "$failures" -ge 3 ] || exit 0
+  if [ "$failures" -lt 3 ]; then
+    release_service_operation_lock
+    exit 0
+  fi
 
   now="$(date +%s)"
-  [ ! -r "$HEALTH_RESTART_FILE" ] || last_restart="$(cat "$HEALTH_RESTART_FILE" 2>/dev/null || printf '0')"
-  [[ "$last_restart" =~ ^[0-9]+$ ]] || last_restart=0
-  if [ $((now - last_restart)) -lt 900 ]; then
+  if claim_health_restart "$health_run_id" "$now"; then
+    restart_claim_rc=0
+  else
+    restart_claim_rc=$?
+  fi
+  if [ "$restart_claim_rc" -eq 2 ]; then
     system_log "health restart suppressed by 15-minute authentication safety cooldown"
+    release_service_operation_lock
     exit 0
   fi
-
-  printf '%s\n' "$now" > "$HEALTH_RESTART_FILE"
-  rm -f "$HEALTH_FAILURE_FILE"
+  if [ "$restart_claim_rc" -ne 0 ] || ! state_allows_service_run "$health_run_id"; then
+    release_service_operation_lock
+    exit 0
+  fi
   system_log "restarting tunnel after three consecutive data-plane failures"
-  systemctl restart "$SERVICE_NAME"
+  if systemctl restart "$SERVICE_NAME"; then restart_claim_rc=0; else restart_claim_rc=$?; fi
+  release_service_operation_lock
+  return "$restart_claim_rc"
 }
 
 cancel_rollback() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" unit state failed=0
+
+  state_matches_run "$expected_run_id" || return 1
   systemctl stop "${ROLLBACK_UNIT}.timer" "${ROLLBACK_UNIT}.service" 2>/dev/null || true
   systemctl reset-failed "${ROLLBACK_UNIT}.service" 2>/dev/null || true
+  for unit in "${ROLLBACK_UNIT}.timer" "${ROLLBACK_UNIT}.service"; do
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    case "$state" in
+      active|activating|reloading|deactivating|failed) failed=1 ;;
+    esac
+  done
+  return "$failed"
 }
 
 stop_and_disable_managed_units() {
@@ -1180,12 +1449,28 @@ stop_and_disable_managed_units() {
 }
 
 cleanup_start_attempt() {
+  local expected_run_id="${1:-}"
+
+  if valid_uuid "$expected_run_id" && state_matches_run "$expected_run_id"; then
+    transition_run_state "$expected_run_id" \
+      'PREPARING,STARTING,RUNNING,AWAITING_CONFIRMATION,CONFIRMED,CLEANUP_FAILED' STOPPING 0 0 \
+      || return 1
+    if ! stop_and_disable_managed_units; then
+      log_err "无法确认隧道已经停止；为保护现有连接，保留受管状态和清理证据。"
+      return 1
+    fi
+    cleanup_run_generation "$expected_run_id" \
+      || { log_err "隧道已停止，但本项目网络状态未能完整清理。"; return 1; }
+    cancel_rollback "$expected_run_id" \
+      || log_warn "连接已停止并完成清理，但独立回滚单元未能完全移除。"
+    return 0
+  fi
+
   if ! stop_and_disable_managed_units; then
     log_err "无法确认隧道已经停止；为保护现有连接，保留受管状态和已武装的回滚任务。"
     return 1
   fi
   service_cleanup || { log_err "隧道已停止，但本项目网络状态未能完整清理。"; return 1; }
-  cancel_rollback
 }
 
 clear_start_signal_traps() {
@@ -1196,7 +1481,12 @@ handle_interrupted_start() {
   local signal_name="$1" exit_code="$2"
   clear_start_signal_traps
   log_warn "启动过程收到 ${signal_name}，正在停止受管隧道并清理本项目状态..."
-  cleanup_start_attempt || true
+  if acquire_service_operation_lock wait; then
+    cleanup_start_attempt "${RUN_ID:-}" || true
+    release_service_operation_lock
+  else
+    log_err "无法取得服务操作锁；保留当前状态供独立回滚或后续恢复。"
+  fi
   exit "$exit_code"
 }
 
@@ -1208,16 +1498,89 @@ start_managed_units() {
 }
 
 arm_rollback() {
-  cancel_rollback
-  systemd-run --quiet --unit="$ROLLBACK_UNIT" --on-active=3m -- "$INSTALL_PATH" _rollback || return 1
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1"
+
+  state_allows_service_run "$expected_run_id" || return 1
+  cancel_rollback "$expected_run_id" || return 1
+  systemd-run --quiet --unit="$ROLLBACK_UNIT" --on-active=3m -- \
+    "$INSTALL_PATH" _rollback "$expected_run_id" || return 1
   log_warn "已武装独立回滚：3 分钟内未确认，将停止并禁用全局 VPN。"
 }
 
 rollback_now() {
   check_root
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" now=0 remaining=0 claimed=0
+
+  while :; do
+    now="$(date +%s)" || return 1
+    [[ "$now" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    acquire_service_operation_lock wait || return 1
+    acquire_state_lock || { release_service_operation_lock; return 1; }
+    if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
+      release_state_lock
+      release_service_operation_lock
+      return 0
+    fi
+    if [ "$DESIRED_ACTIVE" != 1 ]; then
+      release_state_lock
+      release_service_operation_lock
+      return 0
+    fi
+    case "$PHASE" in
+      STARTING)
+        claimed=1
+        ;;
+      AWAITING_CONFIRMATION)
+        if [ "$ROLLBACK_DEADLINE" -gt "$now" ]; then
+          remaining=$((ROLLBACK_DEADLINE - now))
+          release_state_lock
+          release_service_operation_lock
+          sleep "$remaining"
+          continue
+        fi
+        claimed=1
+        ;;
+      *)
+        release_state_lock
+        release_service_operation_lock
+        return 0
+        ;;
+    esac
+    if [ "$claimed" -eq 1 ] \
+      && ! write_run_state "$expected_run_id" ROLLBACK_CLAIMED 0 0; then
+      release_state_lock
+      release_service_operation_lock
+      return 1
+    fi
+    release_state_lock
+    break
+  done
+
   system_log "global-mode safety rollback triggered"
-  stop_and_disable_managed_units || return 1
-  service_cleanup || return 1
+  if ! stop_and_disable_managed_units; then
+    release_service_operation_lock
+    return 1
+  fi
+  if ! cleanup_run_generation "$expected_run_id"; then
+    release_service_operation_lock
+    return 1
+  fi
+  release_service_operation_lock
+}
+
+confirm_global_run() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1"
+
+  transition_run_state "$expected_run_id" AWAITING_CONFIRMATION CONFIRMED 1 0 || return 1
+  if cancel_rollback "$expected_run_id"; then
+    log "已确认入站正常，取消独立回滚。"
+  else
+    log "已确认入站正常，持久状态已禁止独立回滚。"
+    log_warn "独立回滚单元清理失败；确认仍然有效，请检查 ${ROLLBACK_UNIT}.timer 和 ${ROLLBACK_UNIT}.service。"
+  fi
 }
 
 prepare_service_replacement() {
@@ -1247,7 +1610,6 @@ prepare_service_replacement() {
 start_mode() {
   local mode="$1" socks_port="" answer="" snapshot_run_id=""
   ensure_dependencies "$mode"
-  prepare_runtime_configuration_for_start
   select_account
   if [ "$mode" = "proxy" ]; then
     read -r -p "本地 SOCKS5 端口 [1080]: " socks_port
@@ -1257,61 +1619,118 @@ start_mode() {
     confirm_global_risk || return 0
   fi
 
-  prepare_service_replacement
-  [ "$mode" != "proxy" ] || port_is_free "$socks_port" || { die "端口 $socks_port 已被占用。"; return 1; }
-  install_self_and_units
+  acquire_service_operation_lock wait || return 1
+  if ! prepare_runtime_configuration_for_start; then
+    release_service_operation_lock
+    return 1
+  fi
+  if ! prepare_service_replacement; then
+    release_service_operation_lock
+    return 1
+  fi
+  if [ "$mode" = "proxy" ] && ! port_is_free "$socks_port"; then
+    die "端口 $socks_port 已被占用。"
+    release_service_operation_lock
+    return 1
+  fi
+  if ! install_self_and_units; then
+    release_service_operation_lock
+    return 1
+  fi
 
   trap 'handle_interrupted_start SIGINT 130' INT
   trap 'handle_interrupted_start SIGTERM 143' TERM
   trap 'handle_interrupted_start SIGHUP 129' HUP
 
-  if [ "$mode" = "global" ] && ! arm_rollback; then
-    log_err "无法创建独立安全回滚，拒绝启动整机全局 VPN。"
-    cleanup_start_attempt || true
-    clear_start_signal_traps
-    return 1
-  fi
   if ! snapshot_run_id="$(create_run_snapshot "$mode" "$ACCOUNT_INDEX" "$VPN_PROTOCOL" "$socks_port" "$ACCOUNT_RECORD")"; then
     log_err "无法创建运行快照，拒绝启动 VPN。"
-    cleanup_start_attempt || true
+    cleanup_start_attempt "" || true
+    release_service_operation_lock
     clear_start_signal_traps
     return 1
   fi
   RUN_ID="$snapshot_run_id"
-  rm -f "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"
-  if ! start_managed_units; then
-    log_err "systemd 启动链失败，正在立即停止、禁用并清理本项目状态。"
-    cleanup_start_attempt || true
+  if ! transition_run_state "$snapshot_run_id" PREPARING STARTING 1 0; then
+    log_err "无法提交运行状态，拒绝启动 VPN。"
+    cleanup_start_attempt "$snapshot_run_id" || true
+    release_service_operation_lock
     clear_start_signal_traps
     return 1
   fi
+  rm -f "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"
+  if [ "$mode" = "global" ] && ! arm_rollback "$snapshot_run_id"; then
+    log_err "无法创建独立安全回滚，拒绝启动整机全局 VPN。"
+    cleanup_start_attempt "$snapshot_run_id" || true
+    release_service_operation_lock
+    clear_start_signal_traps
+    return 1
+  fi
+  if ! start_managed_units; then
+    log_err "systemd 启动链失败，正在立即停止、禁用并清理本项目状态。"
+    cleanup_start_attempt "$snapshot_run_id" || true
+    release_service_operation_lock
+    clear_start_signal_traps
+    return 1
+  fi
+  release_service_operation_lock
 
   log_info "等待真实数据面可用（最长 60 秒）..."
   if ! wait_until_healthy; then
     log_err "连接没有通过数据面检查，正在停止并清理。"
-    cleanup_start_attempt || true
+    if acquire_service_operation_lock wait; then
+      cleanup_start_attempt "$snapshot_run_id" || true
+      release_service_operation_lock
+    else
+      log_err "无法取得服务操作锁；保留当前状态供独立回滚或后续恢复。"
+    fi
     clear_start_signal_traps
     journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
     return 1
   fi
 
   if [ "$mode" = "proxy" ]; then
+    if ! transition_run_state "$snapshot_run_id" STARTING RUNNING 1 0; then
+      log_err "连接健康，但无法提交运行状态，正在停止并清理。"
+      if acquire_service_operation_lock wait; then
+        cleanup_start_attempt "$snapshot_run_id" || true
+        release_service_operation_lock
+      else
+        log_err "无法取得服务操作锁；保留当前状态供后续恢复。"
+      fi
+      clear_start_signal_traps
+      return 1
+    fi
     clear_start_signal_traps
     log "SOCKS5 已可用：127.0.0.1:${socks_port}；宿主机默认路由未修改。"
     return 0
   fi
 
+  if ! transition_run_state "$snapshot_run_id" STARTING AWAITING_CONFIRMATION 1 "$(( $(date +%s) + 120 ))"; then
+    log_err "连接健康，但无法进入入站确认阶段，正在停止并清理。"
+    if acquire_service_operation_lock wait; then
+      cleanup_start_attempt "$snapshot_run_id" || true
+      release_service_operation_lock
+    else
+      log_err "无法取得服务操作锁；保留当前状态供后续恢复。"
+    fi
+    clear_start_signal_traps
+    return 1
+  fi
   log "全局 VPN 数据面已可用。"
   printf '%s\n' "请现在从外部新建一次 SSH 或其他入站连接，确认回程正常。"
   read -r -t 120 -p "确认无误后在 120 秒内输入 KEEP: " answer || answer=""
   printf '\n'
   if [ "$answer" = "KEEP" ]; then
-    cancel_rollback
+    if ! confirm_global_run "$snapshot_run_id"; then
+      log_err "独立回滚已接管或运行状态已变化，本次 KEEP 未生效。"
+      clear_start_signal_traps
+      return 1
+    fi
     clear_start_signal_traps
-    log "已确认入站正常，取消独立回滚。"
   else
     log_warn "未收到 KEEP，立即执行安全回滚。"
-    cleanup_start_attempt || true
+    transition_run_state "$snapshot_run_id" AWAITING_CONFIRMATION AWAITING_CONFIRMATION 1 0 || true
+    rollback_now "$snapshot_run_id" || true
     clear_start_signal_traps
     return 1
   fi
@@ -1319,9 +1738,42 @@ start_mode() {
 
 stop_vpn() {
   check_root
-  stop_and_disable_managed_units || return 1
-  service_cleanup || return 1
-  cancel_rollback
+  local stop_run_id=""
+
+  acquire_service_operation_lock wait || return 1
+  if ! acquire_state_lock; then
+    release_service_operation_lock
+    return 1
+  fi
+  if load_runtime_state >/dev/null 2>&1; then stop_run_id="$RUN_ID"; fi
+  release_state_lock
+  if [ -z "$stop_run_id" ]; then
+    if ! stop_and_disable_managed_units; then release_service_operation_lock; return 1; fi
+    if ! service_cleanup; then release_service_operation_lock; return 1; fi
+    release_service_operation_lock
+    log "VPN 已停止，oc-master 的策略路由已清理。"
+    return 0
+  fi
+
+  if [ "$PHASE" != CLEANED ]; then
+    if ! transition_run_state "$stop_run_id" \
+      'PREPARING,STARTING,RUNNING,AWAITING_CONFIRMATION,CONFIRMED,ROLLBACK_CLAIMED,STOPPING,CLEANUP_FAILED' \
+      STOPPING 0 0; then
+      release_service_operation_lock
+      return 1
+    fi
+  fi
+  if ! stop_and_disable_managed_units; then
+    release_service_operation_lock
+    return 1
+  fi
+  if ! cleanup_run_generation "$stop_run_id"; then
+    release_service_operation_lock
+    return 1
+  fi
+  cancel_rollback "$stop_run_id" \
+    || log_warn "VPN 已停止并完成清理，但独立回滚单元未能完全移除。"
+  release_service_operation_lock
   log "VPN 已停止，oc-master 的策略路由已清理。"
 }
 
@@ -1465,7 +1917,11 @@ run_main() {
     _service_run) service_run ;;
     _service_health) service_health ;;
     _service_cleanup) service_cleanup ;;
-    _rollback) rollback_now ;;
+    _rollback)
+      [ "$#" -eq 2 ] && valid_uuid "$2" \
+        || { log_err "独立回滚任务缺少有效代际参数。"; return "$NON_RESTARTABLE_EXIT"; }
+      rollback_now "$2"
+      ;;
     start-proxy) check_root; acquire_manager_lock; start_mode proxy ;;
     start-global) check_root; acquire_manager_lock; start_mode global ;;
     stop) check_root; acquire_manager_lock; stop_vpn ;;
