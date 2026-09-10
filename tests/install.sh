@@ -110,6 +110,7 @@ assert_legacy_restored() {
   cmp -s "$TEST_ROOT/original-main" "${OCM_SYSTEMD_DIR}/${SERVICE_NAME}" || fail "main unit was not restored"
   cmp -s "$TEST_ROOT/original-health" "${OCM_SYSTEMD_DIR}/${HEALTH_SERVICE_NAME}" || fail "health unit was not restored"
   cmp -s "$TEST_ROOT/original-timer" "${OCM_SYSTEMD_DIR}/${HEALTH_TIMER_NAME}" || fail "timer unit was not restored"
+  [ ! -e "$OCM_SHORTCUT_PATH" ] && [ ! -L "$OCM_SHORTCUT_PATH" ] || fail 'new shortcut was not removed'
   assert_no_transaction_leftovers
 }
 
@@ -178,7 +179,91 @@ assert_deployed_mode "$OCM_INSTALL_PATH" 755
 assert_no_transaction_leftovers
 rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
 
-for failure in program health-unit daemon-reload show-properties; do
+# A failed restoration must preserve the only old-program backup and report
+# failure; deleting that evidence would turn a deployment error into data loss.
+seed_legacy_units
+save_legacy_originals
+MOCK_HEALTH_STAGE_FAIL=1
+MOCK_PROGRAM_RESTORE_FAIL=1
+MOCK_PROGRAM_INSTALL_MOVES=0
+mv() {
+  local destination="${!#}"
+  if [ "$destination" = "${OCM_SYSTEMD_DIR}/${HEALTH_SERVICE_NAME}" ] && [ "${MOCK_HEALTH_STAGE_FAIL:-0}" = 1 ]; then
+    MOCK_HEALTH_STAGE_FAIL=0
+    return 1
+  fi
+  if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
+    MOCK_PROGRAM_INSTALL_MOVES=$((MOCK_PROGRAM_INSTALL_MOVES + 1))
+  fi
+  if [ "$destination" = "$OCM_INSTALL_PATH" ] && [ "$MOCK_PROGRAM_INSTALL_MOVES" -eq 2 ] && [ "${MOCK_PROGRAM_RESTORE_FAIL:-0}" = 1 ]; then
+    MOCK_PROGRAM_RESTORE_FAIL=0
+    return 1
+  fi
+  command mv "$@"
+}
+if install_self_and_units >"$TEST_ROOT/install-restore-failure.out" 2>&1; then
+  fail 'install succeeded although restoration failed'
+fi
+unset -f mv
+find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q . \
+  || fail 'failed restoration deleted the old-program backup'
+[ ! -e "$OCM_INSTALL_PATH" ] || fail 'failed restoration left a replacement program in place'
+rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+printf 'rollback-failure preservation test passed\n'
+
+# The public `ocm install` path has the same transactional obligation as the
+# unit installer.  Exercise both of its commit renames against a real staged
+# program and symlink when the filesystem supports symlinks.
+if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
+  && ln -s -- probe "${OCM_SHORTCUT_PATH}.probe" 2>/dev/null; then
+  rm -f -- "${OCM_SHORTCUT_PATH}.probe"
+  for failure in managed-program managed-shortcut; do
+    mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+    printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
+    cp -- "$OCM_INSTALL_PATH" "$TEST_ROOT/original-managed-program"
+    MOCK_MANAGED_PROGRAM_MOVES=0
+    mv() {
+      local destination="${!#}"
+      if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
+        MOCK_MANAGED_PROGRAM_MOVES=$((MOCK_MANAGED_PROGRAM_MOVES + 1))
+      fi
+      if [ "$failure" = managed-program ] && [ "$destination" = "$OCM_INSTALL_PATH" ] && [ "$MOCK_MANAGED_PROGRAM_MOVES" -eq 1 ]; then return 1; fi
+      if [ "$failure" = managed-shortcut ] && [ "$destination" = "$OCM_SHORTCUT_PATH" ]; then return 1; fi
+      command mv "$@"
+    }
+    if install_managed_copy >"$TEST_ROOT/${failure}.out" 2>&1; then
+      fail "install_managed_copy unexpectedly succeeded after $failure failure"
+    fi
+    unset -f mv
+    cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail "install_managed_copy did not restore old program after $failure failure"
+    [ ! -e "$OCM_SHORTCUT_PATH" ] && [ ! -L "$OCM_SHORTCUT_PATH" ] || fail "install_managed_copy left shortcut after $failure failure"
+    assert_no_transaction_leftovers
+    rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+  done
+  mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+  printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
+  MOCK_MANAGED_PROGRAM_MOVES=0
+  mv() {
+    local destination="${!#}"
+    if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
+      MOCK_MANAGED_PROGRAM_MOVES=$((MOCK_MANAGED_PROGRAM_MOVES + 1))
+      [ "$MOCK_MANAGED_PROGRAM_MOVES" -le 2 ] && return 1
+    fi
+    command mv "$@"
+  }
+  if install_managed_copy >"$TEST_ROOT/managed-restore-failure.out" 2>&1; then
+    fail 'install_managed_copy succeeded although its restoration failed'
+  fi
+  unset -f mv
+  find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q . \
+    || fail 'install_managed_copy deleted backup after restoration failure'
+  [ ! -e "$OCM_INSTALL_PATH" ] || fail 'install_managed_copy left replacement after restoration failure'
+  rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+else
+  printf 'managed-copy shortcut rollback checks skipped: filesystem does not expose POSIX symlinks\n'
+fi
+
+for failure in program main-unit health-unit timer-unit shortcut daemon-reload show-properties; do
   printf 'testing failure recovery: %s\n' "$failure"
   seed_legacy_units
   save_legacy_originals
@@ -191,8 +276,20 @@ for failure in program health-unit daemon-reload show-properties; do
       MOCK_MV_FAIL_DEST="$OCM_INSTALL_PATH"
       MOCK_MV_FAIL_ONCE=1
       ;;
+    main-unit)
+      MOCK_MV_FAIL_DEST="${OCM_SYSTEMD_DIR}/${SERVICE_NAME}"
+      MOCK_MV_FAIL_ONCE=1
+      ;;
     health-unit)
       MOCK_MV_FAIL_DEST="${OCM_SYSTEMD_DIR}/${HEALTH_SERVICE_NAME}"
+      MOCK_MV_FAIL_ONCE=1
+      ;;
+    timer-unit)
+      MOCK_MV_FAIL_DEST="${OCM_SYSTEMD_DIR}/${HEALTH_TIMER_NAME}"
+      MOCK_MV_FAIL_ONCE=1
+      ;;
+    shortcut)
+      MOCK_MV_FAIL_DEST="$OCM_SHORTCUT_PATH"
       MOCK_MV_FAIL_ONCE=1
       ;;
     daemon-reload) MOCK_DAEMON_RELOAD_FAIL=1 ;;

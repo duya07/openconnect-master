@@ -888,31 +888,72 @@ stage_shortcut() {
 }
 
 install_managed_copy() {
-  local program_tmp shortcut_tmp="" program_backup="" had_program=0
+  local program_tmp shortcut_tmp="" program_backup="" had_program=0 program_installed=0 cleanup_failed=0
   preflight_managed_shortcut || return 1
   program_tmp="$(stage_managed_program)" || return 1
-  shortcut_tmp="$(stage_shortcut)" || { rm -f -- "$program_tmp"; return 1; }
+  shortcut_tmp="$(stage_shortcut)" || {
+    rm -f -- "$program_tmp" || { log_err "安装暂存清理失败，保留文件：$program_tmp"; return 1; }
+    return 1
+  }
 
   if [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; then
     had_program=1
     program_backup="${program_tmp}.backup"
     if ! mv -f -- "$INSTALL_PATH" "$program_backup"; then
-      rm -f -- "$program_tmp" "$shortcut_tmp"
+      for temporary in "$program_tmp" "$shortcut_tmp"; do
+        [ -n "$temporary" ] && { [ ! -e "$temporary" ] && [ ! -L "$temporary" ]; } || rm -f -- "$temporary" || cleanup_failed=1
+      done
+      [ "$cleanup_failed" -eq 0 ] || log_err "安装暂存清理失败，保留可诊断文件。"
       return 1
     fi
   fi
   if ! mv -f -- "$program_tmp" "$INSTALL_PATH"; then
-    [ "$had_program" -eq 0 ] || mv -f -- "$program_backup" "$INSTALL_PATH" || true
-    rm -f -- "$program_tmp" "$shortcut_tmp" "$program_backup"
+    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
+      log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+    fi
     return 1
   fi
+  program_installed=1
   if [ -n "$shortcut_tmp" ] && ! mv -f -- "$shortcut_tmp" "$SHORTCUT_PATH"; then
-    rm -f -- "$INSTALL_PATH"
-    [ "$had_program" -eq 0 ] || mv -f -- "$program_backup" "$INSTALL_PATH" || true
-    rm -f -- "$shortcut_tmp" "$program_backup"
+    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
+      log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+    fi
     return 1
   fi
-  rm -f -- "$program_backup"
+  if [ -n "$program_backup" ] && { [ -e "$program_backup" ] || [ -L "$program_backup" ]; } && ! rm -f -- "$program_backup"; then
+    log_err "安装备份清理失败，保留旧程序备份：$program_backup"
+    return 1
+  fi
+}
+
+restore_managed_copy_transaction() {
+  [ "$#" -eq 5 ] || return 1
+  local had_program="$1" program_installed="$2" program_backup="$3" program_tmp="$4" shortcut_tmp="$5" failed=0
+  if [ "$program_installed" = 1 ] && { [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; } && ! rm -f -- "$INSTALL_PATH"; then
+    log_err "安装回滚失败，无法删除新程序：$INSTALL_PATH"
+    failed=1
+  fi
+  if [ "$had_program" = 1 ]; then
+    if [ ! -e "$program_backup" ] && [ ! -L "$program_backup" ]; then
+      log_err "安装回滚失败，旧程序备份丢失：$program_backup"
+      failed=1
+    elif [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; then
+      log_err "安装回滚失败，目标仍存在；保留旧程序备份：$program_backup"
+      failed=1
+    elif ! mv -f -- "$program_backup" "$INSTALL_PATH"; then
+      log_err "安装回滚失败，保留旧程序备份：$program_backup"
+      failed=1
+    fi
+  fi
+  for temporary in "$program_tmp" "$shortcut_tmp"; do
+    [ -n "$temporary" ] || continue
+    if { [ -e "$temporary" ] || [ -L "$temporary" ]; } && ! rm -f -- "$temporary"; then
+      log_err "安装回滚暂存清理失败，保留文件：$temporary"
+      failed=1
+    fi
+  done
+  [ "$failed" -eq 0 ] || log_err "安装事务回滚失败；已保留可恢复证据。"
+  return "$failed"
 }
 
 service_state_allows_install() {
@@ -1011,15 +1052,45 @@ verify_installed_units() {
 }
 
 restore_install_transaction() {
-  local index target backup
+  local index target backup stage failed=0 restored=0
   for ((index = ${#INSTALL_TX_TARGETS[@]} - 1; index >= 0; index--)); do
     target="${INSTALL_TX_TARGETS[index]}"
     backup="${INSTALL_TX_BACKUPS[index]:-}"
-    if [ "${INSTALL_TX_INSTALLED[index]:-0}" = 1 ]; then rm -f -- "$target"; fi
-    if [ "${INSTALL_TX_HAD_OLD[index]:-0}" = 1 ] && [ -e "$backup" ]; then mv -f -- "$backup" "$target" || true; fi
-    rm -f -- "${INSTALL_TX_STAGES[index]:-}" "$backup"
+    stage="${INSTALL_TX_STAGES[index]:-}"
+    restored=0
+    if [ "${INSTALL_TX_INSTALLED[index]:-0}" = 1 ] && { [ -e "$target" ] || [ -L "$target" ]; } && ! rm -f -- "$target"; then
+      log_err "安装回滚失败，无法删除新文件：$target"
+      failed=1
+    fi
+    if [ "${INSTALL_TX_HAD_OLD[index]:-0}" = 1 ]; then
+      if [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
+        log_err "安装回滚失败，旧文件备份丢失：$backup"
+        failed=1
+      elif [ -e "$target" ] || [ -L "$target" ]; then
+        log_err "安装回滚失败，目标仍存在；保留旧文件备份：$backup"
+        failed=1
+      elif ! mv -f -- "$backup" "$target"; then
+        log_err "安装回滚失败，保留旧文件备份：$backup"
+        failed=1
+      else
+        restored=1
+      fi
+    fi
+    if [ -n "$stage" ] && { [ -e "$stage" ] || [ -L "$stage" ]; } && ! rm -f -- "$stage"; then
+      log_err "安装回滚暂存清理失败，保留文件：$stage"
+      failed=1
+    fi
+    if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; } && [ "$restored" -eq 1 ]; then
+      log_err "安装回滚失败，旧文件备份仍存在：$backup"
+      failed=1
+    fi
   done
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl daemon-reload; then
+    log_err "安装回滚失败，systemd daemon-reload 未成功；请在保留的备份旁手动恢复后重试。"
+    failed=1
+  fi
+  [ "$failed" -eq 0 ] || log_err "安装事务回滚失败；已保留可恢复证据。"
+  return "$failed"
 }
 
 install_self_and_units() {
@@ -1033,14 +1104,32 @@ install_self_and_units() {
   INSTALL_TX_STAGES+=( "$stage" )
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     if ! stage="$(stage_unit_file "$unit")"; then
-      for target in "${INSTALL_TX_STAGES[@]}"; do rm -f -- "$target"; done
+      local cleanup_failed=0
+      for target in "${INSTALL_TX_STAGES[@]}"; do
+        if { [ -e "$target" ] || [ -L "$target" ]; } && ! rm -f -- "$target"; then
+          log_err "安装暂存清理失败，保留文件：$target"
+          cleanup_failed=1
+        fi
+      done
+      [ "$cleanup_failed" -eq 0 ] || log_err "安装事务暂存失败；已保留可诊断文件。"
       return 1
     fi
     INSTALL_TX_STAGES+=( "$stage" )
   done
   if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && ! shortcut_is_ours; then
     INSTALL_TX_TARGETS+=( "$SHORTCUT_PATH" )
-    INSTALL_TX_STAGES+=( "$(stage_shortcut)" ) || { restore_install_transaction; return 1; }
+    if ! stage="$(stage_shortcut)"; then
+      local shortcut_cleanup_failed=0
+      for target in "${INSTALL_TX_STAGES[@]}"; do
+        if { [ -e "$target" ] || [ -L "$target" ]; } && ! rm -f -- "$target"; then
+          log_err "安装暂存清理失败，保留文件：$target"
+          shortcut_cleanup_failed=1
+        fi
+      done
+      [ "$shortcut_cleanup_failed" -eq 0 ] || log_err "安装事务暂存失败；已保留可诊断文件。"
+      return 1
+    fi
+    INSTALL_TX_STAGES+=( "$stage" )
   fi
   for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
     INSTALL_TX_BACKUPS[index]="${INSTALL_TX_STAGES[index]}.backup"
@@ -1050,18 +1139,18 @@ install_self_and_units() {
     if [ -e "$target" ] || [ -L "$target" ]; then
       INSTALL_TX_HAD_OLD[index]=1
       if ! mv -f -- "$target" "${INSTALL_TX_BACKUPS[index]}"; then
-        restore_install_transaction
+        restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
         return 1
       fi
     fi
     if ! mv -f -- "${INSTALL_TX_STAGES[index]}" "$target"; then
-      restore_install_transaction
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
       return 1
     fi
     INSTALL_TX_INSTALLED[index]=1
   done
   if ! systemctl daemon-reload || ! verify_installed_units; then
-    restore_install_transaction
+    restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
     return 1
   fi
   for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do rm -f -- "${INSTALL_TX_BACKUPS[index]}"; done
