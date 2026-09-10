@@ -12,6 +12,7 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 readonly INSTALL_PATH="${OCM_INSTALL_PATH:-/usr/local/sbin/oc-master}"
 readonly SHORTCUT_PATH="${OCM_SHORTCUT_PATH:-/usr/local/bin/ocm}"
+readonly SYSTEMD_DIR="${OCM_SYSTEMD_DIR:-/etc/systemd/system}"
 readonly CONFIG_DIR="${OCM_CONFIG_DIR:-/etc/oc-master}"
 readonly PROFILE_FILE="${OCM_PROFILE_FILE:-${CONFIG_DIR}/profile.conf}"
 readonly ACCOUNTS_FILE="${OCM_ACCOUNTS_FILE:-/root/.vpn_accounts.env}"
@@ -804,44 +805,133 @@ shortcut_is_ours() {
   [ -L "$SHORTCUT_PATH" ] && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null || true)" = "$INSTALL_PATH" ]
 }
 
-install_managed_copy() {
+unit_path() {
+  [ "$#" -eq 1 ] || return 1
+  printf '%s/%s\n' "$SYSTEMD_DIR" "$1"
+}
+
+unit_is_ours() {
+  [ "$#" -eq 2 ] || return 1
+  local file="$1" kind="$2"
+
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  head -n 1 -- "$file" 2>/dev/null | grep -Fx '# Managed by oc-master' >/dev/null && return 0
+  case "$kind" in
+    "$SERVICE_NAME")
+      grep -Fx 'Description=OpenConnect Master managed tunnel' "$file" >/dev/null \
+        && grep -Fx "ExecStart=${INSTALL_PATH} _service_run" "$file" >/dev/null \
+        && grep -Fx "ExecStopPost=-${INSTALL_PATH} _service_cleanup" "$file" >/dev/null
+      ;;
+    "$HEALTH_SERVICE_NAME")
+      grep -Fx 'Description=OpenConnect Master data-plane health check' "$file" >/dev/null \
+        && grep -Fx "ExecStart=${INSTALL_PATH} _service_health" "$file" >/dev/null
+      ;;
+    "$HEALTH_TIMER_NAME")
+      grep -Fx 'Description=Run OpenConnect Master health checks' "$file" >/dev/null \
+        && grep -Fx "Unit=${HEALTH_SERVICE_NAME}" "$file" >/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+preflight_managed_shortcut() {
   if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } && ! shortcut_is_ours; then
     die "快捷命令路径已被其他文件占用：$SHORTCUT_PATH；为避免覆盖，拒绝安装。"
     return 1
   fi
-
-  install -d -m 0755 "$(dirname "$INSTALL_PATH")" "$(dirname "$SHORTCUT_PATH")"
-  if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ] || ! cmp -s "$SCRIPT_PATH" "$INSTALL_PATH" 2>/dev/null; then
-    install -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH"
-  fi
-  if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && ! shortcut_is_ours; then
-    ln -s -- "$INSTALL_PATH" "$SHORTCUT_PATH"
-  fi
 }
 
-remove_managed_shortcut() {
-  [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] || return 0
-  if shortcut_is_ours; then
-    rm -f -- "$SHORTCUT_PATH"
-  elif [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; then
-    log_warn "保留非本项目拥有的快捷命令：$SHORTCUT_PATH"
-  fi
+preflight_install_targets() {
+  local unit
+  preflight_managed_shortcut || return 1
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    local path
+    path="$(unit_path "$unit")" || return 1
+    if { [ -e "$path" ] || [ -L "$path" ]; } && ! unit_is_ours "$path" "$unit"; then
+      die "systemd 单元路径已被其他文件占用：$path；为避免覆盖，拒绝安装。"
+      return 1
+    fi
+  done
 }
 
-install_command() {
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    die "连接运行期间拒绝替换受控脚本；请先执行 sudo ocm stop。"
+# shellcheck disable=SC2120 # 不接受参数，调用点与部署目标固定。
+stage_managed_program() {
+  [ "$#" -eq 0 ] || return 1
+  local directory temporary
+  directory="$(dirname -- "$INSTALL_PATH")"
+  install -d -m 0755 -- "$directory" || return 1
+  temporary="$(mktemp "${directory}/.${TAG}.program.XXXXXX")" || return 1
+  if ! install -m 0755 -- "$SCRIPT_PATH" "$temporary" \
+    || ! "${BASH}" -n -- "$temporary" \
+    || ! [ -x "$temporary" ]; then
+    rm -f -- "$temporary"
     return 1
   fi
-  install_managed_copy
-  log "快捷命令已安装：sudo ocm"
+  printf '%s\n' "$temporary"
 }
 
-install_self_and_units() {
-  ensure_dirs
-  install_managed_copy
+# shellcheck disable=SC2120 # 不接受参数，调用点与部署目标固定。
+stage_shortcut() {
+  [ "$#" -eq 0 ] || return 1
+  [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] || return 0
+  shortcut_is_ours && return 0
+  local directory temporary
+  directory="$(dirname -- "$SHORTCUT_PATH")"
+  install -d -m 0755 -- "$directory" || return 1
+  temporary="$(mktemp "${directory}/.${TAG}.shortcut.XXXXXX")" || return 1
+  rm -f -- "$temporary"
+  if ! ln -s -- "$INSTALL_PATH" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  printf '%s\n' "$temporary"
+}
 
-  cat > "/etc/systemd/system/${SERVICE_NAME}" <<EOF
+install_managed_copy() {
+  local program_tmp shortcut_tmp="" program_backup="" had_program=0
+  preflight_managed_shortcut || return 1
+  program_tmp="$(stage_managed_program)" || return 1
+  shortcut_tmp="$(stage_shortcut)" || { rm -f -- "$program_tmp"; return 1; }
+
+  if [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; then
+    had_program=1
+    program_backup="${program_tmp}.backup"
+    if ! mv -f -- "$INSTALL_PATH" "$program_backup"; then
+      rm -f -- "$program_tmp" "$shortcut_tmp"
+      return 1
+    fi
+  fi
+  if ! mv -f -- "$program_tmp" "$INSTALL_PATH"; then
+    [ "$had_program" -eq 0 ] || mv -f -- "$program_backup" "$INSTALL_PATH" || true
+    rm -f -- "$program_tmp" "$shortcut_tmp" "$program_backup"
+    return 1
+  fi
+  if [ -n "$shortcut_tmp" ] && ! mv -f -- "$shortcut_tmp" "$SHORTCUT_PATH"; then
+    rm -f -- "$INSTALL_PATH"
+    [ "$had_program" -eq 0 ] || mv -f -- "$program_backup" "$INSTALL_PATH" || true
+    rm -f -- "$shortcut_tmp" "$program_backup"
+    return 1
+  fi
+  rm -f -- "$program_backup"
+}
+
+service_state_allows_install() {
+  local state load_state
+  command -v systemctl >/dev/null 2>&1 || return 0
+  state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+  case "$state" in inactive|failed) return 0 ;; esac
+  load_state="$(systemctl show "$SERVICE_NAME" --property=LoadState --value 2>/dev/null || true)"
+  [ "$load_state" = not-found ] && return 0
+  die "连接运行期间拒绝替换受控脚本；请先执行 sudo ocm stop。"
+  return 1
+}
+
+write_unit_file() {
+  [ "$#" -eq 2 ] || return 1
+  local unit="$1" temporary="$2"
+  case "$unit" in
+    "$SERVICE_NAME") cat > "$temporary" <<EOF
+# Managed by oc-master
 [Unit]
 Description=OpenConnect Master managed tunnel
 Wants=network-online.target
@@ -864,8 +954,9 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  cat > "/etc/systemd/system/${HEALTH_SERVICE_NAME}" <<EOF
+      ;;
+    "$HEALTH_SERVICE_NAME") cat > "$temporary" <<EOF
+# Managed by oc-master
 [Unit]
 Description=OpenConnect Master data-plane health check
 After=${SERVICE_NAME}
@@ -875,8 +966,9 @@ Type=oneshot
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${INSTALL_PATH} _service_health
 EOF
-
-  cat > "/etc/systemd/system/${HEALTH_TIMER_NAME}" <<EOF
+      ;;
+    "$HEALTH_TIMER_NAME") cat > "$temporary" <<EOF
+# Managed by oc-master
 [Unit]
 Description=Run OpenConnect Master health checks
 
@@ -889,9 +981,117 @@ Unit=${HEALTH_SERVICE_NAME}
 [Install]
 WantedBy=timers.target
 EOF
+      ;;
+    *) return 1 ;;
+  esac
+  chmod 0644 -- "$temporary" && [ -r "$temporary" ]
+}
 
-  chmod 0644 "/etc/systemd/system/${SERVICE_NAME}" "/etc/systemd/system/${HEALTH_SERVICE_NAME}" "/etc/systemd/system/${HEALTH_TIMER_NAME}"
-  systemctl daemon-reload
+stage_unit_file() {
+  [ "$#" -eq 1 ] || return 1
+  local unit="$1" temporary
+  install -d -m 0755 -- "$SYSTEMD_DIR" || return 1
+  temporary="$(mktemp "${SYSTEMD_DIR}/.${unit}.${TAG}.XXXXXX")" || return 1
+  if ! write_unit_file "$unit" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  printf '%s\n' "$temporary"
+}
+
+verify_installed_units() {
+  local main_properties health_properties
+  main_properties="$(systemctl show "$SERVICE_NAME" --property=ExecStart --property=ExecStopPost --property=Restart --property=RestartPreventExitStatus)" || return 1
+  health_properties="$(systemctl show "$HEALTH_SERVICE_NAME" --property=ExecStart)" || return 1
+  grep -F "${INSTALL_PATH} _service_run" <<< "$main_properties" >/dev/null \
+    && grep -F "${INSTALL_PATH} _service_cleanup" <<< "$main_properties" >/dev/null \
+    && grep -Fx 'Restart=always' <<< "$main_properties" >/dev/null \
+    && grep -Fx 'RestartPreventExitStatus=78' <<< "$main_properties" >/dev/null \
+    && grep -F "${INSTALL_PATH} _service_health" <<< "$health_properties" >/dev/null
+}
+
+restore_install_transaction() {
+  local index target backup
+  for ((index = ${#INSTALL_TX_TARGETS[@]} - 1; index >= 0; index--)); do
+    target="${INSTALL_TX_TARGETS[index]}"
+    backup="${INSTALL_TX_BACKUPS[index]:-}"
+    if [ "${INSTALL_TX_INSTALLED[index]:-0}" = 1 ]; then rm -f -- "$target"; fi
+    if [ "${INSTALL_TX_HAD_OLD[index]:-0}" = 1 ] && [ -e "$backup" ]; then mv -f -- "$backup" "$target" || true; fi
+    rm -f -- "${INSTALL_TX_STAGES[index]:-}" "$backup"
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+install_self_and_units() {
+  local unit index target stage
+  local -a INSTALL_TX_TARGETS INSTALL_TX_STAGES INSTALL_TX_BACKUPS INSTALL_TX_HAD_OLD INSTALL_TX_INSTALLED
+  preflight_install_targets || return 1
+  ensure_dirs || return 1
+
+  INSTALL_TX_TARGETS=( "$INSTALL_PATH" "$(unit_path "$SERVICE_NAME")" "$(unit_path "$HEALTH_SERVICE_NAME")" "$(unit_path "$HEALTH_TIMER_NAME")" )
+  stage="$(stage_managed_program)" || return 1
+  INSTALL_TX_STAGES+=( "$stage" )
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    if ! stage="$(stage_unit_file "$unit")"; then
+      for target in "${INSTALL_TX_STAGES[@]}"; do rm -f -- "$target"; done
+      return 1
+    fi
+    INSTALL_TX_STAGES+=( "$stage" )
+  done
+  if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && ! shortcut_is_ours; then
+    INSTALL_TX_TARGETS+=( "$SHORTCUT_PATH" )
+    INSTALL_TX_STAGES+=( "$(stage_shortcut)" ) || { restore_install_transaction; return 1; }
+  fi
+  for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
+    INSTALL_TX_BACKUPS[index]="${INSTALL_TX_STAGES[index]}.backup"
+    INSTALL_TX_HAD_OLD[index]=0
+    INSTALL_TX_INSTALLED[index]=0
+    target="${INSTALL_TX_TARGETS[index]}"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      INSTALL_TX_HAD_OLD[index]=1
+      if ! mv -f -- "$target" "${INSTALL_TX_BACKUPS[index]}"; then
+        restore_install_transaction
+        return 1
+      fi
+    fi
+    if ! mv -f -- "${INSTALL_TX_STAGES[index]}" "$target"; then
+      restore_install_transaction
+      return 1
+    fi
+    INSTALL_TX_INSTALLED[index]=1
+  done
+  if ! systemctl daemon-reload || ! verify_installed_units; then
+    restore_install_transaction
+    return 1
+  fi
+  for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do rm -f -- "${INSTALL_TX_BACKUPS[index]}"; done
+}
+
+remove_managed_shortcut() {
+  [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] || return 0
+  if shortcut_is_ours; then
+    rm -f -- "$SHORTCUT_PATH"
+  elif [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; then
+    log_warn "保留非本项目拥有的快捷命令：$SHORTCUT_PATH"
+  fi
+}
+
+remove_managed_units() {
+  local unit path
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    path="$(unit_path "$unit")" || return 1
+    if unit_is_ours "$path" "$unit"; then
+      rm -f -- "$path"
+    elif [ -e "$path" ] || [ -L "$path" ]; then
+      log_warn "保留非本项目拥有的 systemd 单元：$path"
+    fi
+  done
+}
+
+install_command() {
+  service_state_allows_install || return 1
+  install_managed_copy || return 1
+  log "快捷命令已安装：sudo ocm"
 }
 
 ddns_automation_detected() {
@@ -2541,7 +2741,7 @@ uninstall_manager() {
   read -r -p "将停止 VPN，并删除 oc-master 的 systemd 单元、程序副本和活动配置；账户文件默认保留。输入 REMOVE 确认: " answer
   [ "$answer" = "REMOVE" ] || { log_info "已取消。"; return 0; }
   stop_vpn
-  rm -f "/etc/systemd/system/${SERVICE_NAME}" "/etc/systemd/system/${HEALTH_SERVICE_NAME}" "/etc/systemd/system/${HEALTH_TIMER_NAME}"
+  remove_managed_units
   remove_managed_shortcut
   rm -f "$INSTALL_PATH" "$PROFILE_FILE" "$ROUTE_OWNER_FILE"
   rmdir "$CONFIG_DIR" 2>/dev/null || true
