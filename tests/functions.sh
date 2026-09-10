@@ -11,6 +11,7 @@ trap cleanup EXIT
 
 export OCM_INSTALL_PATH="${TEST_ROOT}/sbin/oc-master"
 export OCM_SHORTCUT_PATH="${TEST_ROOT}/bin/ocm"
+export OCM_SYSTEMD_DIR="${TEST_ROOT}/systemd"
 export OCM_CONFIG_DIR="${TEST_ROOT}/config"
 export OCM_RUNTIME_DIR="${TEST_ROOT}/run"
 export OCM_LOCK_FILE="${TEST_ROOT}/lock/oc-master.lock"
@@ -193,6 +194,23 @@ fi
 [ "$(wc -l < "$MOCK_SYSTEMCTL_CALLS" | tr -d ' ')" = '3' ] || fail "systemd chain continued after a failed service start"
 unset -f systemctl
 
+mkdir -p -- "$SYSTEMD_DIR"
+for owned_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  printf '%s\n' '# Managed by oc-master' > "$(unit_path "$owned_unit")"
+done
+mock_owned_unit_source_query() {
+  [ "$#" -eq 4 ] && [ "$1" = show ] && [ "$4" = --value ] || return 1
+  case "$2" in
+    "$SERVICE_NAME"|"$HEALTH_SERVICE_NAME"|"$HEALTH_TIMER_NAME") ;;
+    *) return 1 ;;
+  esac
+  case "$3" in
+    --property=LoadState) printf '%s\n' loaded ;;
+    --property=FragmentPath) unit_path "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
 if ! (
   MOCK_PREPARE_MAIN_STATE='activating'
   MOCK_PREPARE_HEALTH_STATE='inactive'
@@ -221,7 +239,12 @@ if ! (
           esac
         done
         ;;
-      show) printf '0\n' ;;
+      show)
+        if ! mock_owned_unit_source_query "$action" "$@"; then
+          [ "$*" = "-p MainPID --value $SERVICE_NAME" ] || return 1
+          printf '0\n'
+        fi
+        ;;
       disable) : ;;
       *) : ;;
     esac
@@ -300,6 +323,7 @@ service_main_pid() {
 MOCK_STOP_STATE='active'
 systemctl() {
   case "$1" in
+    show) mock_owned_unit_source_query "$@" ;;
     stop) [ "$MOCK_STOP_STATE" = 'inactive' ] ;;
     is-active)
       [ "$MOCK_STOP_STATE" = 'unknown' ] && return 1
@@ -329,6 +353,7 @@ if ! (
     local action="$1" unit
     shift
     case "$action" in
+      show) mock_owned_unit_source_query "$action" "$@" ;;
       stop)
         for unit in "$@"; do
           case "$unit" in
@@ -369,6 +394,7 @@ if (
     local action="$1" state
     shift
     case "$action" in
+      show) mock_owned_unit_source_query "$action" "$@" ;;
       stop)
         case "$1" in
           "$SERVICE_NAME")
@@ -411,6 +437,7 @@ if (
     local action="$1"
     shift
     case "$action" in
+      show) mock_owned_unit_source_query "$action" "$@" ;;
       stop)
         case "$1" in
           "$HEALTH_SERVICE_NAME") return 1 ;;
@@ -439,6 +466,7 @@ if (
     local action="$1"
     shift
     case "$action" in
+      show) mock_owned_unit_source_query "$action" "$@" ;;
       stop|disable) : ;;
       is-active)
         case "$1" in

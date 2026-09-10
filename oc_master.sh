@@ -923,7 +923,7 @@ unit_is_ours() {
 }
 
 preflight_managed_units_ownership() {
-  local unit path
+  local unit path load_state fragment_path
 
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     path="$(unit_path "$unit")" || return 1
@@ -931,6 +931,27 @@ preflight_managed_units_ownership() {
       die "检测到不属于 oc-master 的同名单元 $unit；为避免停止或禁用 foreign unit，拒绝继续。"
       return 1
     fi
+    if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)"; then
+      die "无法核验 systemd 单元 $unit 的加载状态；为避免操作 foreign unit，拒绝继续。"
+      return 1
+    fi
+    case "$load_state" in
+      not-found) continue ;;
+      loaded)
+        if ! fragment_path="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null)"; then
+          die "无法核验 systemd 单元 $unit 的实际来源；为避免操作 foreign unit，拒绝继续。"
+          return 1
+        fi
+        if [ "$fragment_path" != "$path" ] || ! unit_is_ours "$path" "$unit"; then
+          die "systemd 单元 $unit 的实际来源不属于 oc-master；拒绝停止或禁用。"
+          return 1
+        fi
+        ;;
+      *)
+        die "systemd 单元 $unit 的加载状态不可证明安全（${load_state:-空}）；拒绝停止或禁用。"
+        return 1
+        ;;
+    esac
   done
 }
 
