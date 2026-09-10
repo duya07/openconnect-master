@@ -27,6 +27,7 @@ readonly STATE_LOCK_FILE="${OCM_STATE_LOCK_FILE:-/run/lock/oc-master-state.lock}
 readonly SERVICE_LOCK_FILE="${OCM_SERVICE_LOCK_FILE:-/run/lock/oc-master-service.lock}"
 # shellcheck disable=SC2034  # 后续服务代际任务消费。
 readonly SERVICE_RUN_ID_FILE="${OCM_SERVICE_RUN_ID_FILE:-${RUNTIME_DIR}/service.run-id}"
+readonly PROC_ROOT="${OCM_PROC_ROOT:-/proc}"
 readonly BOOT_ID_FILE="${OCM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 readonly UUID_FILE="${OCM_UUID_FILE:-/proc/sys/kernel/random/uuid}"
 # shellcheck disable=SC2034  # 后续 systemd restart 策略任务消费。
@@ -652,6 +653,57 @@ tcp_port_is_listening() {
   awk -v port="$port" '$4 ~ (":" port "$") { found=1 } END { exit(found ? 0 : 1) }' <<< "$listeners"
 }
 
+service_control_group() {
+  local control_group=""
+
+  control_group="$(systemctl show "$SERVICE_NAME" --property=ControlGroup --value 2>/dev/null)" || return 1
+  [[ "$control_group" == /* ]] && [ "$control_group" != / ] && [[ "$control_group" != *$'\n'* ]] || return 1
+  printf '%s\n' "$control_group"
+}
+
+listener_pids_for_tcp_port() {
+  [ "$#" -eq 1 ] && valid_port "$1" || return 1
+  local port="$1" listeners=""
+
+  listeners="$(ss -H -ltnp 2>/dev/null)" || return 1
+  awk -v port="$port" '
+    $4 ~ (":" port "$") {
+      line=$0
+      while (match(line, /pid=[0-9]+/)) {
+        print substr(line, RSTART + 4, RLENGTH - 4)
+        line=substr(line, RSTART + RLENGTH)
+      }
+    }
+  ' <<< "$listeners"
+}
+
+pid_belongs_to_service_cgroup() {
+  [ "$#" -eq 2 ] || return 1
+  local pid="$1" control_group="$2" line="" process_group=""
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$control_group" == /* ]] && [ "$control_group" != / ] || return 1
+  [ -r "$PROC_ROOT/$pid/cgroup" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    process_group="${line##*:}"
+    case "$process_group" in
+      "$control_group"|"$control_group"/*) return 0 ;;
+    esac
+  done < "$PROC_ROOT/$pid/cgroup"
+  return 1
+}
+
+managed_tcp_listener_is_ready() {
+  [ "$#" -eq 1 ] && valid_port "$1" || return 1
+  local port="$1" control_group="" pid=""
+
+  control_group="$(service_control_group)" || return 1
+  while IFS= read -r pid; do
+    pid_belongs_to_service_cgroup "$pid" "$control_group" && return 0
+  done < <(listener_pids_for_tcp_port "$port")
+  return 1
+}
+
 port_is_free() {
   local port="$1"
   ! tcp_port_is_listening "$port"
@@ -795,9 +847,42 @@ prepare_runtime_configuration_for_start() {
       || { die "检测到不完整或非法的新运行状态，拒绝按旧账户索引回退。"; return 1; }
     return 0
   fi
+  recover_legacy_installation || { die "旧版安装未能完整停止和清理，拒绝创建新的运行快照。"; return 1; }
   [ ! -e "$PROFILE_FILE" ] && [ ! -L "$PROFILE_FILE" ] && return 0
   migrate_legacy_profile >/dev/null \
     || { die "旧活动配置迁移失败。"; return 1; }
+}
+
+new_runtime_artifact_exists() {
+  [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
+    || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ] \
+    || [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ] \
+    || [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ]
+}
+
+legacy_installation_exists() {
+  local unit path
+
+  if [ -e "$PROFILE_FILE" ] || [ -L "$PROFILE_FILE" ] \
+    || [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ]; then
+    return 0
+  fi
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    path="$(unit_path "$unit")" || return 1
+    unit_is_ours "$path" "$unit" && return 0
+  done
+  return 1
+}
+
+recover_legacy_installation() {
+  new_runtime_artifact_exists && return 1
+  legacy_installation_exists || return 0
+
+  stop_and_disable_managed_units || return 1
+  if [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ]; then
+    cleanup_legacy_return_routes || return 1
+  fi
+  [ ! -e "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ]
 }
 
 shortcut_is_ours() {
@@ -1933,7 +2018,7 @@ service_main_pid() {
 openconnect_process_is_alive() {
   local pid
   pid="$(service_main_pid)"
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ] && [ -r "/proc/${pid}/comm" ] && [ "$(cat "/proc/${pid}/comm")" = "openconnect" ]
+  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ] && [ -r "$PROC_ROOT/${pid}/comm" ] && [ "$(cat "$PROC_ROOT/${pid}/comm")" = "openconnect" ]
 }
 
 openconnect_option_supported() {
@@ -1964,13 +2049,21 @@ health_once() {
   openconnect_process_is_alive || return 1
   case "$PROFILE_MODE" in
     proxy)
-      tcp_port_is_listening "$PROFILE_SOCKS_PORT" || return 1
+      managed_tcp_listener_is_ready "$PROFILE_SOCKS_PORT" || return 1
       http_data_probe "socks5h://127.0.0.1:${PROFILE_SOCKS_PORT}"
       ;;
     global)
       local global_route
+      validate_route_plan_against_snapshot "$RUN_ID" || return 1
       global_route="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
       grep -Eq "dev ${VPN_INTERFACE}([[:space:]]|$)" <<< "$global_route" || return 1
+      local address
+      for address in "${ROUTE_PLAN_RETURN4_ADDRESSES[@]}"; do
+        route_get_uses_device -4 1.1.1.1 "$address" "$ROUTE_PLAN_DEV4" || return 1
+      done
+      for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
+        route_get_uses_device -6 2606:4700:4700::1111 "$address" "$ROUTE_PLAN_DEV6" || return 1
+      done
       http_data_probe ""
       ;;
   esac
@@ -2724,6 +2817,12 @@ stop_vpn() {
   if load_runtime_state >/dev/null 2>&1; then stop_run_id="$RUN_ID"; fi
   release_state_lock
   if [ -z "$stop_run_id" ]; then
+    if legacy_installation_exists; then
+      if ! recover_legacy_installation; then release_service_operation_lock; return 1; fi
+      release_service_operation_lock
+      log "VPN 已停止，oc-master 的策略路由已清理。"
+      return 0
+    fi
     if ! stop_and_disable_managed_units; then release_service_operation_lock; return 1; fi
     if ! service_cleanup; then release_service_operation_lock; return 1; fi
     release_service_operation_lock
@@ -2839,12 +2938,34 @@ uninstall_manager() {
   local answer=""
   read -r -p "将停止 VPN，并删除 oc-master 的 systemd 单元、程序副本和活动配置；账户文件默认保留。输入 REMOVE 确认: " answer
   [ "$answer" = "REMOVE" ] || { log_info "已取消。"; return 0; }
-  stop_vpn
-  remove_managed_units
-  remove_managed_shortcut
-  rm -f "$INSTALL_PATH" "$PROFILE_FILE" "$ROUTE_OWNER_FILE"
-  rmdir "$CONFIG_DIR" 2>/dev/null || true
-  systemctl daemon-reload
+  stop_vpn || { log_err "无法确认停止和清理已完成；保留所有恢复证据。"; return 1; }
+  if new_runtime_artifact_exists; then
+    acquire_state_lock || return 1
+    if ! load_runtime_state || [ "$PHASE" != CLEANED ] || [ "$DESIRED_ACTIVE" != 0 ]; then
+      release_state_lock
+      log_err "未取得 CLEANED 状态证明；保留所有恢复证据。"
+      return 1
+    fi
+    release_state_lock
+  fi
+  remove_managed_units || return 1
+  if ! systemctl daemon-reload; then
+    log_err "systemctl daemon-reload 失败；磁盘上的已删除单元尚未由 systemd 重载，已保留运行快照和其余恢复证据。"
+    return 1
+  fi
+  remove_managed_shortcut || return 1
+  if [ -f "$INSTALL_PATH" ] && [ ! -L "$INSTALL_PATH" ]; then
+    if cmp -s -- "$SCRIPT_PATH" "$INSTALL_PATH"; then
+      rm -f -- "$INSTALL_PATH" || return 1
+    else
+      log_warn "保留无法确认属于本项目的程序副本：$INSTALL_PATH"
+    fi
+  elif [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; then
+    log_warn "保留无法确认属于本项目的程序副本：$INSTALL_PATH"
+  fi
+  rm -f -- "$PROFILE_FILE" "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE" "$ROUTE_PLAN_FILE" "$ROUTE_OWNER_FILE" \
+    "$SERVICE_RUN_ID_FILE" "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE" || return 1
+  rmdir "$CONFIG_DIR" "$RUNTIME_DIR" 2>/dev/null || true
   log "管理器已卸载；未卸载软件包，账户文件仍保留在 $ACCOUNTS_FILE。"
 }
 
