@@ -133,7 +133,8 @@ write_profile proxy 0 nc 1080
 printf '%s\n' 'DEFAULT4=default via 192.0.2.1 dev eth0' > "$ROUTE_OWNER_FILE"
 make_foreign_units
 unit_mutation_calls="${TEST_ROOT}/unit-mutation.calls"
-systemctl() { printf '%s\n' "$*" >> "$unit_mutation_calls"; return 0; }
+record_systemctl_call() { printf '%s\n' "$*" >> "$unit_mutation_calls"; return 0; }
+systemctl() { record_systemctl_call "$@"; }
 if recover_legacy_installation; then fail 'all-foreign legacy recovery was accepted'; fi
 [ ! -s "$unit_mutation_calls" ] || fail 'all-foreign recovery mutated a unit before ownership failure'
 [ -f "$PROFILE_FILE" ] || fail 'all-foreign recovery removed the legacy profile'
@@ -151,6 +152,7 @@ printf '%s\n' '# Managed by oc-master' > "$(unit_path "$SERVICE_NAME")"
 printf '%s\n' '# foreign unit' > "$(unit_path "$HEALTH_SERVICE_NAME")"
 printf '%s\n' '# foreign unit' > "$(unit_path "$HEALTH_TIMER_NAME")"
 : > "$unit_mutation_calls"
+systemctl() { record_systemctl_call "$@"; }
 if recover_legacy_installation; then fail 'mixed legacy recovery was accepted'; fi
 [ ! -s "$unit_mutation_calls" ] || fail 'mixed recovery mutated an owned unit before foreign preflight completed'
 [ -f "$PROFILE_FILE" ] || fail 'mixed recovery removed the legacy profile'
@@ -168,6 +170,7 @@ make_foreign_units
 check_root() { :; }
 acquire_service_operation_lock() { :; }
 release_service_operation_lock() { :; }
+systemctl() { record_systemctl_call "$@"; }
 if stop_vpn; then fail 'stateless stop accepted foreign units'; fi
 [ ! -s "$unit_mutation_calls" ] || fail 'stateless stop mutated a foreign unit'
 
