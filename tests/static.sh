@@ -6,12 +6,13 @@ export PATH
 
 cd -- "${BASH_SOURCE[0]%/*}/.."
 
-"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh
+"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/install.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh
+  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/install.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh
 fi
 
+"${BASH}" tests/install.sh
 "${BASH}" tests/functions.sh
 "${BASH}" tests/compat.sh
 "${BASH}" tests/state.sh
