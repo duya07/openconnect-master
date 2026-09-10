@@ -1020,11 +1020,22 @@ policy_rule_output_is_parseable() {
   done <<< "$rules"
 }
 
+policy_rule_output_is_safe_for_preflight() {
+  local rules="$1" line
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    [[ "$line" =~ ^[[:space:]]*(0:[[:space:]]+from[[:space:]]+all[[:space:]]+lookup[[:space:]]+local|32766:[[:space:]]+from[[:space:]]+all[[:space:]]+lookup[[:space:]]+main|32767:[[:space:]]+from[[:space:]]+all[[:space:]]+lookup[[:space:]]+default)[[:space:]]*$ ]] \
+      || return 1
+  done <<< "$rules"
+}
+
 route_resources_are_available() {
   local rules4 rules6 routes4 routes6 links
   rules4="$(ip -4 rule show 2>/dev/null)" || return 1
   rules6="$(ip -6 rule show 2>/dev/null)" || return 1
-  policy_rule_output_is_parseable "$rules4" && policy_rule_output_is_parseable "$rules6" || return 1
+  policy_rule_output_is_safe_for_preflight "$rules4" \
+    && policy_rule_output_is_safe_for_preflight "$rules6" || return 1
   routes4="$(read_route_table_or_empty -4 "$RETURN4_TABLE")" || return 1
   routes6="$(read_route_table_or_empty -6 "$RETURN6_TABLE")" || return 1
   links="$(ip -o link show 2>/dev/null)" || return 1
@@ -1464,9 +1475,22 @@ loaded_route_plan_baseline_is_available() {
   done
 }
 
+remove_route_cleanup_evidence() {
+  [ "$#" -eq 1 ] || return 1
+  case "$1" in 0|1) ;; *) return 1 ;; esac
+
+  rm -f -- "$ROUTE_OWNER_FILE" || return 1
+  [ ! -e "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ] || return 1
+  [ "$1" = 1 ] && return 0
+  rm -f -- "$ROUTE_PLAN_FILE" || return 1
+  [ ! -e "$ROUTE_PLAN_FILE" ] && [ ! -L "$ROUTE_PLAN_FILE" ]
+}
+
 cleanup_route_plan() {
-  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
-  local expected_run_id="$1" address
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" retain_plan="${2:-0}" address
+
+  case "$retain_plan" in 0|1) ;; *) return 1 ;; esac
 
   if [ ! -e "$ROUTE_PLAN_FILE" ] && [ ! -L "$ROUTE_PLAN_FILE" ]; then
     cleanup_legacy_return_routes
@@ -1476,8 +1500,8 @@ cleanup_route_plan() {
   if [ ! -e "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ]; then
     route_resources_are_available || return 1
     loaded_route_plan_baseline_is_available || return 1
-    rm -f -- "$ROUTE_PLAN_FILE"
-    return
+    remove_route_cleanup_evidence "$retain_plan"
+    return $?
   fi
   [ -f "$ROUTE_OWNER_FILE" ] && [ ! -L "$ROUTE_OWNER_FILE" ] || return 1
 
@@ -1499,7 +1523,7 @@ cleanup_route_plan() {
   for address in "${ROUTE_PLAN_RETURN6_ADDRESSES[@]}"; do
     route_get_uses_device -6 2606:4700:4700::1111 "$address" "$ROUTE_PLAN_DEV6" || return 1
   done
-  rm -f -- "$ROUTE_PLAN_FILE" "$ROUTE_OWNER_FILE"
+  remove_route_cleanup_evidence "$retain_plan"
 }
 
 cleanup_legacy_return_routes() {
@@ -1549,8 +1573,9 @@ cleanup_legacy_return_routes() {
 }
 
 cleanup_return_routes() {
+  [ "$#" -le 2 ] || return 1
   if [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ]; then
-    cleanup_route_plan "${1:-}"
+    cleanup_route_plan "${1:-}" "${2:-0}"
   else
     cleanup_legacy_return_routes
   fi
@@ -1728,7 +1753,7 @@ remove_service_run_id_if_matches() {
 cleanup_run_generation() {
   [ "$#" -eq 1 ] || return 1
   local expected_run_id="$1" cleanup_mode=""
-  local cleanup_result=0
+  local cleanup_result=0 remove_plan=0
 
   acquire_state_lock || return 1
   if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
@@ -1738,7 +1763,7 @@ cleanup_run_generation() {
   cleanup_mode="$MODE"
   release_state_lock
 
-  if [ "$cleanup_mode" = global ] && ! cleanup_return_routes "$expected_run_id"; then cleanup_result=1; fi
+  if [ "$cleanup_mode" = global ] && ! cleanup_return_routes "$expected_run_id" 1; then cleanup_result=1; fi
 
   if [ "$cleanup_result" -ne 0 ]; then
     acquire_state_lock || return 1
@@ -1770,6 +1795,11 @@ cleanup_run_generation() {
       log_err "路由清理完成，但无法提交 CLEANED 状态；保留服务代际证据并禁止自动重启。"
       return 1
     fi
+  fi
+  [ "$cleanup_mode" = global ] && [ "$DESIRED_ACTIVE" = 0 ] && remove_plan=1
+  if [ "$remove_plan" -eq 1 ] && ! remove_route_cleanup_evidence 0; then
+    release_state_lock
+    return 1
   fi
   remove_service_run_id_if_matches "$expected_run_id" || { release_state_lock; return 1; }
   release_state_lock
