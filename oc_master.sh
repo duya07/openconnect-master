@@ -888,7 +888,7 @@ stage_shortcut() {
 }
 
 install_managed_copy() {
-  local program_tmp shortcut_tmp="" program_backup="" had_program=0 program_installed=0 cleanup_failed=0
+  local program_tmp shortcut_tmp="" program_backup="" had_program=0 program_installed=0 shortcut_installed=0 cleanup_failed=0
   preflight_managed_shortcut || return 1
   program_tmp="$(stage_managed_program)" || return 1
   shortcut_tmp="$(stage_shortcut)" || {
@@ -908,21 +908,22 @@ install_managed_copy() {
     fi
   fi
   if ! mv -f -- "$program_tmp" "$INSTALL_PATH"; then
-    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
+    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$shortcut_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
       log_err "安装事务回滚未完成；请使用保留的备份恢复。"
     fi
     return 1
   fi
   program_installed=1
   if [ -n "$shortcut_tmp" ] && ! mv -f -- "$shortcut_tmp" "$SHORTCUT_PATH"; then
-    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
+    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$shortcut_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
       log_err "安装事务回滚未完成；请使用保留的备份恢复。"
     fi
     return 1
   fi
+  [ -n "$shortcut_tmp" ] && shortcut_installed=1
   if [ -n "$program_backup" ] && { [ -e "$program_backup" ] || [ -L "$program_backup" ]; } && ! rm -f -- "$program_backup"; then
     log_err "安装备份清理失败，保留旧程序备份：$program_backup"
-    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
+    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$shortcut_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
       log_err "安装事务回滚未完成；请使用保留的备份恢复。"
     fi
     return 1
@@ -930,10 +931,14 @@ install_managed_copy() {
 }
 
 restore_managed_copy_transaction() {
-  [ "$#" -eq 5 ] || return 1
-  local had_program="$1" program_installed="$2" program_backup="$3" program_tmp="$4" shortcut_tmp="$5" failed=0
+  [ "$#" -eq 6 ] || return 1
+  local had_program="$1" program_installed="$2" shortcut_installed="$3" program_backup="$4" program_tmp="$5" shortcut_tmp="$6" failed=0
   if [ "$program_installed" = 1 ] && { [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; } && ! rm -f -- "$INSTALL_PATH"; then
     log_err "安装回滚失败，无法删除新程序：$INSTALL_PATH"
+    failed=1
+  fi
+  if [ "$shortcut_installed" = 1 ] && { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } && ! rm -f -- "$SHORTCUT_PATH"; then
+    log_err "安装回滚失败，无法删除新快捷命令：$SHORTCUT_PATH"
     failed=1
   fi
   if [ "$had_program" = 1 ]; then
