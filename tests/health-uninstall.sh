@@ -79,7 +79,7 @@ reset_runtime() {
   rm -rf -- "$CONFIG_DIR" "$RUNTIME_DIR" "$OCM_PROC_ROOT" "$SYSTEMD_DIR" \
     "$(dirname -- "$INSTALL_PATH")" "$(dirname -- "$SHORTCUT_PATH")"
   rm -f -- "$ACCOUNTS_FILE"
-  unset -f systemctl ss ip openconnect_process_is_alive http_data_probe cleanup_legacy_return_routes stop_and_disable_managed_units stop_vpn 2>/dev/null || true
+  unset -f systemctl ss ip openconnect_process_is_alive http_data_probe cleanup_legacy_return_routes 2>/dev/null || true
 }
 
 # RED: the current port-only health check incorrectly accepts this foreign
@@ -116,6 +116,60 @@ mkdir -p -- "$OCM_PROC_ROOT/200"
 printf '%s\n' '0::/system.slice/oc-master.service' > "$OCM_PROC_ROOT/200/cgroup"
 systemctl() { return 1; }
 if health_once; then fail 'unknown systemd ControlGroup was accepted'; fi
+
+# Legacy recovery must prove ownership of every same-named unit before the
+# first stop/disable mutation. A foreign unit must fail closed and preserve all
+# legacy evidence; a mixed set must not stop the owned subset first.
+make_foreign_units() {
+  mkdir -p -- "$SYSTEMD_DIR"
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    printf '%s\n' '# foreign unit' > "$(unit_path "$unit")"
+  done
+}
+
+reset_runtime
+ensure_dirs
+write_profile proxy 0 nc 1080
+printf '%s\n' 'DEFAULT4=default via 192.0.2.1 dev eth0' > "$ROUTE_OWNER_FILE"
+make_foreign_units
+unit_mutation_calls="${TEST_ROOT}/unit-mutation.calls"
+systemctl() { printf '%s\n' "$*" >> "$unit_mutation_calls"; return 0; }
+if recover_legacy_installation; then fail 'all-foreign legacy recovery was accepted'; fi
+[ ! -s "$unit_mutation_calls" ] || fail 'all-foreign recovery mutated a unit before ownership failure'
+[ -f "$PROFILE_FILE" ] || fail 'all-foreign recovery removed the legacy profile'
+[ -f "$ROUTE_OWNER_FILE" ] || fail 'all-foreign recovery removed route ownership evidence'
+for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  [ -f "$(unit_path "$unit")" ] || fail "all-foreign recovery removed $unit evidence"
+done
+
+reset_runtime
+ensure_dirs
+write_profile proxy 0 nc 1080
+printf '%s\n' 'DEFAULT4=default via 192.0.2.1 dev eth0' > "$ROUTE_OWNER_FILE"
+mkdir -p -- "$SYSTEMD_DIR"
+printf '%s\n' '# Managed by oc-master' > "$(unit_path "$SERVICE_NAME")"
+printf '%s\n' '# foreign unit' > "$(unit_path "$HEALTH_SERVICE_NAME")"
+printf '%s\n' '# foreign unit' > "$(unit_path "$HEALTH_TIMER_NAME")"
+: > "$unit_mutation_calls"
+if recover_legacy_installation; then fail 'mixed legacy recovery was accepted'; fi
+[ ! -s "$unit_mutation_calls" ] || fail 'mixed recovery mutated an owned unit before foreign preflight completed'
+[ -f "$PROFILE_FILE" ] || fail 'mixed recovery removed the legacy profile'
+[ -f "$ROUTE_OWNER_FILE" ] || fail 'mixed recovery removed route ownership evidence'
+[ -f "$(unit_path "$SERVICE_NAME")" ] || fail 'mixed recovery removed the owned unit evidence'
+[ -f "$(unit_path "$HEALTH_SERVICE_NAME")" ] || fail 'mixed recovery removed foreign health unit evidence'
+[ -f "$(unit_path "$HEALTH_TIMER_NAME")" ] || fail 'mixed recovery removed foreign timer evidence'
+
+# With no valid runtime state, the stop path must use the same ownership gate
+# before it can call systemctl stop/disable.
+reset_runtime
+ensure_dirs
+make_foreign_units
+: > "$unit_mutation_calls"
+check_root() { :; }
+acquire_service_operation_lock() { :; }
+release_service_operation_lock() { :; }
+if stop_vpn; then fail 'stateless stop accepted foreign units'; fi
+[ ! -s "$unit_mutation_calls" ] || fail 'stateless stop mutated a foreign unit'
 
 # Global health binds plan generation and both data-plane directions: ordinary
 # traffic uses ocm0 and each saved source address retains its planned egress.
@@ -161,6 +215,30 @@ legacy_migration_called=0
 migrate_legacy_profile() { legacy_migration_called=1; }
 if prepare_runtime_configuration_for_start >/dev/null 2>&1; then fail 'partial new state fell back to legacy'; fi
 [ "$legacy_migration_called" = 0 ] || fail 'partial new state invoked legacy migration'
+
+# Each health evidence artifact is itself a new-runtime marker. Test each one
+# in isolation, including non-regular forms that must remain fail-closed.
+for health_artifact in "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"; do
+  for artifact_kind in regular symlink directory; do
+    reset_runtime
+    ensure_dirs
+    write_profile proxy 0 nc 1080
+    case "$artifact_kind" in
+      regular) printf '%s\n' evidence > "$health_artifact" ;;
+      symlink) printf '%s\n' target > "${TEST_ROOT}/health-target"; ln -s -- "${TEST_ROOT}/health-target" "$health_artifact" ;;
+      directory) mkdir -p -- "$health_artifact" ;;
+    esac
+    legacy_cleanup_called=0
+    legacy_migration_called=0
+    stop_and_disable_managed_units() { legacy_cleanup_called=1; }
+    migrate_legacy_profile() { legacy_migration_called=1; }
+    if prepare_runtime_configuration_for_start >/dev/null 2>&1; then
+      fail "${health_artifact##*/} ${artifact_kind} was treated as legacy-only state"
+    fi
+    [ "$legacy_cleanup_called" = 0 ] || fail "${health_artifact##*/} ${artifact_kind} attempted legacy unit cleanup"
+    [ "$legacy_migration_called" = 0 ] || fail "${health_artifact##*/} ${artifact_kind} invoked legacy migration"
+  done
+done
 
 make_owned_install() {
   mkdir -p -- "$SYSTEMD_DIR" "$(dirname -- "$INSTALL_PATH")" "$(dirname -- "$SHORTCUT_PATH")"
