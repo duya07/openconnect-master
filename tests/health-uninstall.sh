@@ -152,7 +152,13 @@ printf '%s\n' '# Managed by oc-master' > "$(unit_path "$SERVICE_NAME")"
 printf '%s\n' '# foreign unit' > "$(unit_path "$HEALTH_SERVICE_NAME")"
 printf '%s\n' '# foreign unit' > "$(unit_path "$HEALTH_TIMER_NAME")"
 : > "$unit_mutation_calls"
-systemctl() { record_systemctl_call "$@"; }
+systemctl() {
+  case "$*" in
+    "show $SERVICE_NAME --property=LoadState --value") printf '%s\n' loaded ;;
+    "show $SERVICE_NAME --property=FragmentPath --value") unit_path "$SERVICE_NAME" ;;
+    *) record_systemctl_call "$@" ;;
+  esac
+}
 if recover_legacy_installation; then fail 'mixed legacy recovery was accepted'; fi
 [ ! -s "$unit_mutation_calls" ] || fail 'mixed recovery mutated an owned unit before foreign preflight completed'
 [ -f "$PROFILE_FILE" ] || fail 'mixed recovery removed the legacy profile'
@@ -173,6 +179,122 @@ release_service_operation_lock() { :; }
 systemctl() { record_systemctl_call "$@"; }
 if stop_vpn; then fail 'stateless stop accepted foreign units'; fi
 [ ! -s "$unit_mutation_calls" ] || fail 'stateless stop mutated a foreign unit'
+
+# A missing file in SYSTEMD_DIR does not prove that systemd has no same-named
+# unit: it may be loaded from a vendor, generator, or transient search path.
+# Read-only show/is-active probes are not mutations and must not satisfy the
+# zero-side-effect assertion.
+external_fragment_systemctl() {
+  local action="${1:-}"
+  case "$action" in
+    show)
+      case "$*" in
+        "show $SERVICE_NAME --property=LoadState --value") printf '%s\n' not-found ;;
+        "show $HEALTH_SERVICE_NAME --property=LoadState --value") printf '%s\n' loaded ;;
+        "show $HEALTH_SERVICE_NAME --property=FragmentPath --value")
+          printf '/usr/lib/systemd/system/%s\n' "$HEALTH_SERVICE_NAME"
+          ;;
+        "show $HEALTH_TIMER_NAME --property=LoadState --value") printf '%s\n' not-found ;;
+        'show -p MainPID --value '*) printf '0\n' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    is-active) printf '%s\n' inactive; return 3 ;;
+    stop|disable|reset-failed|restart|start|enable|reenable|reload|daemon-reload)
+      record_systemctl_call "$@"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+reset_runtime
+ensure_dirs
+: > "$unit_mutation_calls"
+for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  [ ! -e "$(unit_path "$unit")" ] && [ ! -L "$(unit_path "$unit")" ] \
+    || fail "external-fragment fixture unexpectedly created $unit"
+done
+systemctl() { external_fragment_systemctl "$@"; }
+external_stop_rc=0
+stop_vpn >/dev/null 2>&1 || external_stop_rc=$?
+[ ! -s "$unit_mutation_calls" ] || fail 'stateless stop mutated a vendor-path unit before source rejection'
+[ "$external_stop_rc" -ne 0 ] || fail 'stateless stop accepted a vendor-path unit'
+
+reset_runtime
+ensure_dirs
+write_profile proxy 0 nc 1080
+printf '%s\n' 'DEFAULT4=default via 192.0.2.1 dev eth0' > "$ROUTE_OWNER_FILE"
+: > "$unit_mutation_calls"
+systemctl() { external_fragment_systemctl "$@"; }
+external_recovery_rc=0
+recover_legacy_installation >/dev/null 2>&1 || external_recovery_rc=$?
+[ ! -s "$unit_mutation_calls" ] || fail 'legacy recovery mutated a vendor-path unit before source rejection'
+[ "$external_recovery_rc" -ne 0 ] || fail 'legacy recovery accepted a vendor-path unit'
+[ -f "$PROFILE_FILE" ] || fail 'vendor-path recovery removed the legacy profile'
+[ -f "$ROUTE_OWNER_FILE" ] || fail 'vendor-path recovery removed route ownership evidence'
+
+# Every unprovable source state fails closed. Conversely, an explicit
+# not-found result is safe, and a loaded unit is accepted only when its exact
+# fragment path exists and carries oc-master ownership evidence.
+SOURCE_PROBE_MODE=''
+unit_source_probe_systemctl() {
+  local action="${1:-}" unit="${2:-}" property="${3:-}"
+  if [ "$action" != show ]; then
+    record_systemctl_call "$@"
+    return 0
+  fi
+  [ "${4:-}" = --value ] || return 1
+  case "$unit" in
+    "$SERVICE_NAME"|"$HEALTH_SERVICE_NAME"|"$HEALTH_TIMER_NAME") ;;
+    *) return 1 ;;
+  esac
+  case "$property" in
+    --property=LoadState)
+      [ "$SOURCE_PROBE_MODE" != load-query-failure ] || return 1
+      case "$SOURCE_PROBE_MODE" in
+        not-found) printf '%s\n' not-found ;;
+        unexpected-load) printf '%s\n' masked ;;
+        *) printf '%s\n' loaded ;;
+      esac
+      ;;
+    --property=FragmentPath)
+      [ "$SOURCE_PROBE_MODE" != fragment-query-failure ] || return 1
+      case "$SOURCE_PROBE_MODE" in
+        empty-fragment) : ;;
+        owned|missing-owned-fragment) unit_path "$unit" ;;
+        *) printf '/run/systemd/transient/%s\n' "$unit" ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+for SOURCE_PROBE_MODE in load-query-failure unexpected-load fragment-query-failure empty-fragment transient-fragment missing-owned-fragment; do
+  reset_runtime
+  ensure_dirs
+  : > "$unit_mutation_calls"
+  systemctl() { unit_source_probe_systemctl "$@"; }
+  if preflight_managed_units_ownership >/dev/null 2>&1; then
+    fail "unit source probe accepted $SOURCE_PROBE_MODE"
+  fi
+  [ ! -s "$unit_mutation_calls" ] || fail "unit source probe mutated a unit for $SOURCE_PROBE_MODE"
+done
+
+reset_runtime
+ensure_dirs
+SOURCE_PROBE_MODE=not-found
+systemctl() { unit_source_probe_systemctl "$@"; }
+preflight_managed_units_ownership || fail 'explicit not-found units were rejected'
+
+reset_runtime
+ensure_dirs
+mkdir -p -- "$SYSTEMD_DIR"
+for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  printf '%s\n' '# Managed by oc-master' > "$(unit_path "$unit")"
+done
+SOURCE_PROBE_MODE=owned
+systemctl() { unit_source_probe_systemctl "$@"; }
+preflight_managed_units_ownership || fail 'owned loaded unit fragments were rejected'
 
 # Global health binds plan generation and both data-plane directions: ordinary
 # traffic uses ocm0 and each saved source address retains its planned egress.
@@ -207,6 +329,8 @@ ensure_dirs
 write_profile proxy 0 nc 1080
 printf '%s\n' 'DEFAULT4=default via 192.0.2.1 dev eth0' 'DEFAULT6=' > "$ROUTE_OWNER_FILE"
 legacy_cleanup_calls="${TEST_ROOT}/legacy-cleanup.calls"
+SOURCE_PROBE_MODE=not-found
+systemctl() { unit_source_probe_systemctl "$@"; }
 stop_and_disable_managed_units() { printf '%s\n' stop >> "$legacy_cleanup_calls"; }
 cleanup_legacy_return_routes() { printf '%s\n' cleanup >> "$legacy_cleanup_calls"; rm -f -- "$ROUTE_OWNER_FILE"; }
 recover_legacy_installation || fail 'clean legacy installation was not recovered'
