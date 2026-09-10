@@ -211,13 +211,105 @@ find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q
 rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
 printf 'rollback-failure preservation test passed\n'
 
+# Program-only managed-copy rollback must run even where Git for Windows cannot
+# create symlinks.  The shortcut staging boundary is isolated in this subshell.
+mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
+cp -- "$OCM_INSTALL_PATH" "$TEST_ROOT/original-managed-program"
+if ! (
+  stage_shortcut() { return 0; }
+  MOCK_MANAGED_PROGRAM_MOVES=0
+  mv() {
+    local destination="${!#}"
+    if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
+      MOCK_MANAGED_PROGRAM_MOVES=$((MOCK_MANAGED_PROGRAM_MOVES + 1))
+      [ "$MOCK_MANAGED_PROGRAM_MOVES" -eq 1 ] && return 1
+    fi
+    command mv "$@"
+  }
+  install_managed_copy
+); then
+  :
+else
+  fail 'managed-copy program rename failure unexpectedly succeeded'
+fi
+cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail 'managed-copy program rollback did not restore old program'
+assert_no_transaction_leftovers
+rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
+
+# A backup deletion failure is a transaction failure, so it must restore the
+# old program instead of leaving a new program with an ambiguous error result.
+mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
+cp -- "$OCM_INSTALL_PATH" "$TEST_ROOT/original-managed-program"
+if ! (
+  stage_shortcut() { return 0; }
+  MOCK_BACKUP_DELETE_FAIL=1
+  rm() {
+    local target="${!#}"
+    if [ "${MOCK_BACKUP_DELETE_FAIL:-0}" = 1 ] && [[ "$target" == *.backup ]]; then
+      MOCK_BACKUP_DELETE_FAIL=0
+      return 1
+    fi
+    command rm "$@"
+  }
+  install_managed_copy
+); then
+  :
+else
+  fail 'managed-copy backup cleanup failure unexpectedly succeeded'
+fi
+cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail 'managed-copy backup cleanup failure did not restore old program'
+assert_no_transaction_leftovers
+rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
+
+# If restoring the old program also fails, the backup must remain available and
+# the replacement target must not be reported as successfully installed.
+mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
+MOCK_MANAGED_PROGRAM_MOVES=0
+mv() {
+  local destination="${!#}"
+  if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
+    MOCK_MANAGED_PROGRAM_MOVES=$((MOCK_MANAGED_PROGRAM_MOVES + 1))
+    [ "$MOCK_MANAGED_PROGRAM_MOVES" -le 2 ] && return 1
+  fi
+  command mv "$@"
+}
+if install_managed_copy >"$TEST_ROOT/managed-restore-failure.out" 2>&1; then
+  fail 'install_managed_copy succeeded although its restoration failed'
+fi
+unset -f mv
+find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q . \
+  || fail 'install_managed_copy deleted backup after restoration failure'
+[ ! -e "$OCM_INSTALL_PATH" ] || fail 'install_managed_copy left replacement after restoration failure'
+rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf 'managed-copy program transaction tests passed\n'
+
+# A unit staging write failure whose local temporary cannot be deleted must
+# leave the evidence and emit a cleanup-specific diagnostic.
+mkdir -p -- "$OCM_SYSTEMD_DIR"
+if ! (
+  write_unit_file() { return 1; }
+  rm() { return 1; }
+  stage_unit_file "$SERVICE_NAME"
+) >"$TEST_ROOT/unit-stage-cleanup.out" 2>&1; then
+  :
+else
+  fail 'unit staging unexpectedly succeeded when writing and cleanup failed'
+fi
+grep -F '安装暂存清理失败' "$TEST_ROOT/unit-stage-cleanup.out" >/dev/null \
+  || fail 'unit staging cleanup failure lacked a diagnostic'
+find "$OCM_SYSTEMD_DIR" -name ".${SERVICE_NAME}.${TAG}.*" -print -quit | grep -q . \
+  || fail 'unit staging cleanup failure did not preserve evidence'
+rm -rf -- "$OCM_SYSTEMD_DIR"
+
 # The public `ocm install` path has the same transactional obligation as the
-# unit installer.  Exercise both of its commit renames against a real staged
-# program and symlink when the filesystem supports symlinks.
+# unit installer.  Only shortcut commit coverage needs a real POSIX symlink.
 if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
   && ln -s -- probe "${OCM_SHORTCUT_PATH}.probe" 2>/dev/null; then
   rm -f -- "${OCM_SHORTCUT_PATH}.probe"
-  for failure in managed-program managed-shortcut; do
+  failure=managed-shortcut
     mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
     printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
     cp -- "$OCM_INSTALL_PATH" "$TEST_ROOT/original-managed-program"
@@ -239,26 +331,6 @@ if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
     [ ! -e "$OCM_SHORTCUT_PATH" ] && [ ! -L "$OCM_SHORTCUT_PATH" ] || fail "install_managed_copy left shortcut after $failure failure"
     assert_no_transaction_leftovers
     rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
-  done
-  mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
-  printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
-  MOCK_MANAGED_PROGRAM_MOVES=0
-  mv() {
-    local destination="${!#}"
-    if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
-      MOCK_MANAGED_PROGRAM_MOVES=$((MOCK_MANAGED_PROGRAM_MOVES + 1))
-      [ "$MOCK_MANAGED_PROGRAM_MOVES" -le 2 ] && return 1
-    fi
-    command mv "$@"
-  }
-  if install_managed_copy >"$TEST_ROOT/managed-restore-failure.out" 2>&1; then
-    fail 'install_managed_copy succeeded although its restoration failed'
-  fi
-  unset -f mv
-  find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q . \
-    || fail 'install_managed_copy deleted backup after restoration failure'
-  [ ! -e "$OCM_INSTALL_PATH" ] || fail 'install_managed_copy left replacement after restoration failure'
-  rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
 else
   printf 'managed-copy shortcut rollback checks skipped: filesystem does not expose POSIX symlinks\n'
 fi
