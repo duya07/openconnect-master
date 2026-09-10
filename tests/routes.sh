@@ -19,6 +19,10 @@ BOOT_ID='123e4567-e89b-42d3-a456-426614174053'
 ACCOUNT='Route test|alice|route-secret|vpn.example.test||nc'
 MOCK_BIN="${TEST_ROOT}/mock-bin"
 export MOCK_IP_LOG="${TEST_ROOT}/ip.calls"
+export MOCK_IP_ARGV_LOG="${TEST_ROOT}/ip.argv"
+export MOCK_RM_LOG="${TEST_ROOT}/rm.calls"
+export MOCK_OPENCONNECT_ARGS="${TEST_ROOT}/openconnect.argv"
+export MOCK_OPENCONNECT_PASSWORD="${TEST_ROOT}/openconnect.password"
 export MOCK_DEFAULT4="${TEST_ROOT}/default4"
 export MOCK_DEFAULT6="${TEST_ROOT}/default6"
 export MOCK_ADDR4="${TEST_ROOT}/addr4"
@@ -33,6 +37,7 @@ export MOCK_IPV6_TABLE_MISSING=0
 export MOCK_EXPECT_APPLY_ORDER=0
 export MOCK_ROUTE_GET4_DEV='eth0'
 export MOCK_ROUTE_GET6_DEV='eth0'
+export MOCK_RM_FAIL_TARGET=''
 mkdir -p -- "$MOCK_BIN" "$OCM_CONFIG_DIR" "$OCM_RUNTIME_DIR" \
   "$(dirname -- "$OCM_STATE_LOCK_FILE")" "$(dirname -- "$OCM_BOOT_ID_FILE")"
 printf '%s\n' "$BOOT_ID" > "$OCM_BOOT_ID_FILE"
@@ -43,6 +48,10 @@ cat > "${MOCK_BIN}/ip" <<'MOCK_IP'
 set -u
 
 printf '%s\n' "$*" >> "$MOCK_IP_LOG"
+{
+  for argument in "$@"; do printf '<%s>' "$argument"; done
+  printf '\n'
+} >> "$MOCK_IP_ARGV_LOG"
 
 delete_rule_for_source() {
   local source_file="$1" source="$2" temporary_file
@@ -74,34 +83,32 @@ case "$*" in
   '-4 route replace table 51888 '*)
     [ -f "$OCM_ROUTE_OWNER_FILE" ] || exit 97
     [ "$MOCK_IP_FAIL_STAGE" != 'apply-table4' ] || exit 91
-    printf '%s\n' "${*#-4 route replace table 51888 }" > "$MOCK_TABLE4"
+    shift 5
+    printf '%s\n' "$*" > "$MOCK_TABLE4"
     ;;
   '-6 route replace table 51889 '*)
     [ -f "$OCM_ROUTE_OWNER_FILE" ] || exit 97
     [ "$MOCK_IP_FAIL_STAGE" != 'apply-table6' ] || exit 91
-    printf '%s\n' "${*#-6 route replace table 51889 }" > "$MOCK_TABLE6"
+    shift 5
+    printf '%s\n' "$*" > "$MOCK_TABLE6"
     ;;
   '-4 rule add priority 10000 from '*'/32 lookup 51888')
     [ -s "$MOCK_TABLE4" ] || exit 98
     [ "$MOCK_IP_FAIL_STAGE" != 'apply-rule4' ] || exit 91
-    set -- $*
     printf '10000: from %s lookup 51888\n' "$7" >> "$MOCK_RULE4"
     ;;
   '-6 rule add priority 10001 from '*'/128 lookup 51889')
     [ -s "$MOCK_TABLE6" ] || exit 98
     [ "$MOCK_IP_FAIL_STAGE" != 'apply-rule6' ] || exit 91
-    set -- $*
     printf '10001: from %s lookup 51889\n' "$7" >> "$MOCK_RULE6"
     ;;
   '-4 rule del priority 10000 from '*'/32 lookup 51888')
     [ "$MOCK_IP_FAIL_STAGE" != 'cleanup-rule4' ] || exit 91
-    set -- $*
     [ "$MOCK_IP_FAIL_STAGE" = 'cleanup-rule4-noeffect' ] \
       || delete_rule_for_source "$MOCK_RULE4" "${7%/32}"
     ;;
   '-6 rule del priority 10001 from '*'/128 lookup 51889')
     [ "$MOCK_IP_FAIL_STAGE" != 'cleanup-rule6' ] || exit 91
-    set -- $*
     [ "$MOCK_IP_FAIL_STAGE" = 'cleanup-rule6-noeffect' ] \
       || delete_rule_for_source "$MOCK_RULE6" "${7%/128}"
     ;;
@@ -131,7 +138,6 @@ case "$*" in
     fi
     ;;
   '-4 route replace default '*)
-    set -- $*
     shift 3
     if [ "$MOCK_IP_FAIL_STAGE" = 'restore-default4-after-apply' ]; then
       printf '%s\n' "$*" > "$MOCK_DEFAULT4"
@@ -142,7 +148,6 @@ case "$*" in
       || printf '%s\n' "$*" > "$MOCK_DEFAULT4"
     ;;
   '-6 route replace default '*)
-    set -- $*
     shift 3
     [ "$MOCK_IP_FAIL_STAGE" != 'restore-default6' ] || exit 91
     [ "$MOCK_IP_FAIL_STAGE" = 'restore-default6-noeffect' ] \
@@ -150,7 +155,6 @@ case "$*" in
     ;;
   '-4 route get '*' from '*)
     [ "$MOCK_IP_FAIL_STAGE" != 'route-get4' ] || exit 91
-    set -- $*
     if [ "$MOCK_EXPECT_APPLY_ORDER" = 1 ]; then
       grep -F " from $6/32 " "$MOCK_RULE4" >/dev/null || exit 99
     fi
@@ -158,7 +162,6 @@ case "$*" in
     ;;
   '-6 route get '*' from '*)
     [ "$MOCK_IP_FAIL_STAGE" != 'route-get6' ] || exit 91
-    set -- $*
     if [ "$MOCK_EXPECT_APPLY_ORDER" = 1 ]; then
       grep -F " from $6/128 " "$MOCK_RULE6" >/dev/null || exit 99
     fi
@@ -171,6 +174,41 @@ case "$*" in
 esac
 MOCK_IP
 chmod 0700 "${MOCK_BIN}/ip"
+
+cat > "${MOCK_BIN}/rm" <<'MOCK_RM'
+#!/usr/bin/env bash
+set -u
+
+printf '%s\n' "$*" >> "$MOCK_RM_LOG"
+if [ -z "${MOCK_RM_FAIL_TARGET:-}" ]; then
+  exec /usr/bin/rm "$@"
+fi
+
+for argument in "$@"; do
+  case "$argument" in
+    -*) continue ;;
+  esac
+  if [ "$argument" = "$MOCK_RM_FAIL_TARGET" ]; then exit 91; fi
+  /usr/bin/rm -f -- "$argument" || exit 1
+done
+MOCK_RM
+chmod 0700 "${MOCK_BIN}/rm"
+
+cat > "${MOCK_BIN}/openconnect" <<'MOCK_OPENCONNECT'
+#!/usr/bin/env bash
+set -u
+
+if [ "${1:-}" = '--help' ]; then
+  printf '%s\n' '  --tcp-keepalive=INT'
+  exit 0
+fi
+{
+  for argument in "$@"; do printf '<%s>' "$argument"; done
+  printf '\n'
+} >> "$MOCK_OPENCONNECT_ARGS"
+cat > "$MOCK_OPENCONNECT_PASSWORD"
+MOCK_OPENCONNECT
+chmod 0700 "${MOCK_BIN}/openconnect"
 PATH="${MOCK_BIN}:/usr/bin:/bin:${PATH}"
 export PATH
 
@@ -190,6 +228,7 @@ reset_network() {
   export MOCK_EXPECT_APPLY_ORDER=0
   export MOCK_ROUTE_GET4_DEV='eth0'
   export MOCK_ROUTE_GET6_DEV='eth0'
+  export MOCK_RM_FAIL_TARGET=''
   printf '%s\n' 'default via 192.0.2.1 dev eth0 metric 100' > "$MOCK_DEFAULT4"
   : > "$MOCK_DEFAULT6"
   printf '%s\n' '2: eth0 inet 192.0.2.10/24 scope global eth0' > "$MOCK_ADDR4"
@@ -205,6 +244,10 @@ reset_network() {
   : > "$MOCK_TABLE6"
   printf '%s\n' '2: eth0: <BROADCAST,MULTICAST,UP> mtu 1500' > "$MOCK_LINKS"
   : > "$MOCK_IP_LOG"
+  : > "$MOCK_IP_ARGV_LOG"
+  : > "$MOCK_RM_LOG"
+  : > "$MOCK_OPENCONNECT_ARGS"
+  : > "$MOCK_OPENCONNECT_PASSWORD"
   rm -f -- "$ROUTE_PLAN_FILE" "$ROUTE_OWNER_FILE"
 }
 
@@ -327,6 +370,16 @@ printf '%s\n' '12000: from 192.0.2.10 lookup 51888' > "$MOCK_RULE4"
 assert_build_rejected 'reserved IPv4 route table lookup was accepted'
 
 reset_network
+printf '%s\n' '100: from 192.0.2.10 lookup 100' >> "$MOCK_RULE4"
+assert_build_rejected 'foreign source-specific IPv4 rule was accepted'
+
+reset_network
+printf '\n\n' >> "$MOCK_RULE4"
+write_global_runtime "$RUN_A"
+build_route_plan "$RUN_A" || fail 'blank policy-rule output lines were rejected'
+assert_no_network_writes 'blank policy-rule output lines modified network state'
+
+reset_network
 printf '%s\n' 'default via 192.0.2.1 dev eth0' > "$MOCK_TABLE4"
 assert_build_rejected 'occupied IPv4 route table was accepted'
 
@@ -359,6 +412,23 @@ printf '%s\n' 'DEV4=eth0' >> "$ROUTE_PLAN_FILE"
 if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted a duplicate scalar'; fi
 grep -v '^DEV4=' "${ROUTE_PLAN_FILE}.valid" > "$ROUTE_PLAN_FILE"
 if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted a missing scalar'; fi
+sed 's/^RETURN4_ADDRESS=.*/RETURN4_ADDRESS=999.0.0.1/' "${ROUTE_PLAN_FILE}.valid" > "$ROUTE_PLAN_FILE"
+if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted an invalid IPv4 address'; fi
+cp -- "${ROUTE_PLAN_FILE}.valid" "$ROUTE_PLAN_FILE"
+printf '%s\n' 'RETURN6_ADDRESS=not::ipv6' >> "$ROUTE_PLAN_FILE"
+if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted an invalid IPv6 address'; fi
+sed -e 's/^DEFAULT4=.*/DEFAULT4=default via 192.0.2.1 dev eth0 nexthop via 198.51.100.1/' \
+  "${ROUTE_PLAN_FILE}.valid" > "$ROUTE_PLAN_FILE"
+if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted a malformed IPv4 default'; fi
+sed -e 's/^DEFAULT4=.*/DEFAULT4=default via 192.0.2.1 dev bad\/dev/' \
+  -e 's/^DEV4=.*/DEV4=bad\/dev/' "${ROUTE_PLAN_FILE}.valid" > "$ROUTE_PLAN_FILE"
+if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted an invalid device token'; fi
+sed 's/$/\r/' "${ROUTE_PLAN_FILE}.valid" > "$ROUTE_PLAN_FILE"
+if load_route_plan "$RUN_A" >/dev/null 2>&1; then fail 'route plan accepted CR-terminated fields'; fi
+cp -- "${ROUTE_PLAN_FILE}.valid" "$ROUTE_PLAN_FILE"
+printf '%s\n' 'RETURN4_ADDRESS=192.0.2.10' >> "$ROUTE_PLAN_FILE"
+load_route_plan "$RUN_A" || fail 'route plan rejected duplicate address canonicalization'
+assert_eq '1' "${#ROUTE_PLAN_RETURN4_ADDRESSES[@]}" 'route plan duplicate IPv4 address was not deduplicated'
 
 # route-get verification compares the device as an exact token, not as a regular expression.
 reset_network
@@ -405,6 +475,10 @@ prepare_dual_plan
 export MOCK_EXPECT_APPLY_ORDER=1
 apply_route_plan "$RUN_A" || fail 'valid dual-stack route plan could not be applied'
 assert_recovery_evidence_retained 'successful apply'
+grep -Fx '<-4><rule><add><priority><10000><from><192.0.2.10/32><lookup><51888>' "$MOCK_IP_ARGV_LOG" >/dev/null \
+  || fail 'IPv4 policy-rule argv was not preserved exactly'
+grep -Fx '<-4><route><replace><table><51888><default><via><192.0.2.1><dev><eth0><metric><100>' "$MOCK_IP_ARGV_LOG" >/dev/null \
+  || fail 'IPv4 policy-table argv was not preserved exactly'
 assert_file_mode "$ROUTE_OWNER_FILE" 600
 grep -Fx 'DEFAULT4=default via 192.0.2.1 dev eth0 metric 100' "$ROUTE_OWNER_FILE" >/dev/null \
   || fail 'owner marker did not preserve the IPv4 default'
@@ -484,6 +558,76 @@ cleanup_route_plan "$RUN_A" || fail 'verified cleanup rejected a valid applied p
   || fail 'cleanup did not delete the exact IPv4 source rule once'
 [ "$(grep -Fc -- '-6 rule del priority 10001 from 2001:db8::10/128 lookup 51889' "$MOCK_IP_LOG")" -eq 1 ] \
   || fail 'cleanup did not delete the exact IPv6 source rule once'
+
+# An active-generation ExecStopPost cleans network state but keeps its immutable
+# plan so Restart=always can establish owner evidence and reapply it.
+prepare_applied_dual_plan
+printf '%s\n' "$RUN_A" > "$SERVICE_RUN_ID_FILE"
+cleanup_run_generation "$RUN_A" || fail 'unexpected-exit cleanup failed'
+return_route_state_is_clean || fail 'unexpected-exit cleanup left route resources behind'
+[ ! -e "$ROUTE_OWNER_FILE" ] || fail 'unexpected-exit cleanup retained owner evidence'
+[ -f "$ROUTE_PLAN_FILE" ] || fail 'unexpected-exit cleanup deleted the restart route plan'
+[ ! -e "$SERVICE_RUN_ID_FILE" ] || fail 'unexpected-exit cleanup retained service generation marker'
+: > "$MOCK_IP_ARGV_LOG"
+(
+  check_root() { :; }
+  service_run
+) || fail 'Restart=always worker did not reapply the retained route plan'
+[ -f "$ROUTE_OWNER_FILE" ] || fail 'Restart=always worker did not recreate owner evidence'
+grep -F '<--interface=ocm0>' "$MOCK_OPENCONNECT_ARGS" >/dev/null \
+  || fail 'Restart=always worker lost the global OpenConnect interface argument'
+grep -F '<--protocol=nc>' "$MOCK_OPENCONNECT_ARGS" >/dev/null \
+  || fail 'Restart=always worker lost the OpenConnect protocol argument'
+assert_eq 'route-secret' "$(cat "$MOCK_OPENCONNECT_PASSWORD")" \
+  'Restart=always worker lost the OpenConnect password stdin input'
+
+# An explicit inactive stop consumes both new-format artifacts after cleanup.
+prepare_applied_dual_plan
+write_run_state "$RUN_A" STOPPING 0 0
+printf '%s\n' "$RUN_A" > "$SERVICE_RUN_ID_FILE"
+cleanup_run_generation "$RUN_A" || fail 'inactive stop cleanup failed'
+[ ! -e "$ROUTE_OWNER_FILE" ] || fail 'inactive stop cleanup retained owner evidence'
+[ ! -e "$ROUTE_PLAN_FILE" ] || fail 'inactive stop cleanup retained route plan'
+load_run_state || fail 'inactive stop removed its run state'
+assert_eq CLEANED "$PHASE" 'inactive stop did not record CLEANED'
+
+# New-format evidence is removed owner-first.  A failed owner unlink retains
+# the plan, so retry cannot take the broad legacy cleanup path.
+prepare_applied_dual_plan
+: > "$MOCK_RM_LOG"
+export MOCK_RM_FAIL_TARGET="$ROUTE_OWNER_FILE"
+if cleanup_route_plan "$RUN_A" >/dev/null 2>&1; then
+  fail 'owner unlink failure returned success'
+fi
+assert_eq "-f -- $ROUTE_OWNER_FILE" "$(sed -n '1p' "$MOCK_RM_LOG")" \
+  'cleanup did not attempt owner evidence removal first'
+[ -f "$ROUTE_OWNER_FILE" ] || fail 'owner unlink failure removed owner evidence'
+[ -f "$ROUTE_PLAN_FILE" ] || fail 'owner unlink failure removed route plan evidence'
+export MOCK_RM_FAIL_TARGET=''
+: > "$MOCK_IP_LOG"
+cleanup_route_plan "$RUN_A" || fail 'owner unlink failure retry did not finish'
+if grep -Eq -- '-[46] rule del priority (10000|10001) lookup 5188[89]' "$MOCK_IP_LOG"; then
+  fail 'owner unlink failure retry downgraded to legacy rule cleanup'
+fi
+
+# A failed plan unlink happens only after owner deletion.  The remaining plan
+# is read-only evidence on retry and must never trigger legacy network writes.
+prepare_applied_dual_plan
+: > "$MOCK_RM_LOG"
+export MOCK_RM_FAIL_TARGET="$ROUTE_PLAN_FILE"
+if cleanup_route_plan "$RUN_A" >/dev/null 2>&1; then
+  fail 'plan unlink failure returned success'
+fi
+assert_eq "-f -- $ROUTE_OWNER_FILE" "$(sed -n '1p' "$MOCK_RM_LOG")" \
+  'cleanup did not delete owner evidence before the route plan'
+assert_eq "-f -- $ROUTE_PLAN_FILE" "$(sed -n '2p' "$MOCK_RM_LOG")" \
+  'cleanup did not attempt route-plan deletion after owner evidence'
+[ ! -e "$ROUTE_OWNER_FILE" ] || fail 'plan unlink failure retained owner evidence'
+[ -f "$ROUTE_PLAN_FILE" ] || fail 'plan unlink failure removed route plan evidence'
+export MOCK_RM_FAIL_TARGET=''
+: > "$MOCK_IP_LOG"
+cleanup_route_plan "$RUN_A" || fail 'plan unlink failure retry did not finish'
+assert_no_network_writes 'plan-only cleanup retry performed network writes'
 
 # A legacy owner without a new plan retains the bounded compatibility cleanup.
 reset_network
