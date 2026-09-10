@@ -857,7 +857,9 @@ new_runtime_artifact_exists() {
   [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
     || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ] \
     || [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ] \
-    || [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ]
+    || [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ] \
+    || [ -e "$HEALTH_FAILURE_FILE" ] || [ -L "$HEALTH_FAILURE_FILE" ] \
+    || [ -e "$HEALTH_RESTART_FILE" ] || [ -L "$HEALTH_RESTART_FILE" ]
 }
 
 legacy_installation_exists() {
@@ -878,6 +880,7 @@ recover_legacy_installation() {
   new_runtime_artifact_exists && return 1
   legacy_installation_exists || return 0
 
+  preflight_managed_units_ownership || return 1
   stop_and_disable_managed_units || return 1
   if [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ]; then
     cleanup_legacy_return_routes || return 1
@@ -917,6 +920,18 @@ unit_is_ours() {
       ;;
     *) return 1 ;;
   esac
+}
+
+preflight_managed_units_ownership() {
+  local unit path
+
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    path="$(unit_path "$unit")" || return 1
+    if { [ -e "$path" ] || [ -L "$path" ]; } && ! unit_is_ours "$path" "$unit"; then
+      die "检测到不属于 oc-master 的同名单元 $unit；为避免停止或禁用 foreign unit，拒绝继续。"
+      return 1
+    fi
+  done
 }
 
 preflight_managed_shortcut() {
@@ -2350,6 +2365,8 @@ cancel_rollback() {
 stop_and_disable_managed_units() {
   # stop 必须独立执行：即使单元未启用或不可 disable，也必须先终止隧道。
   local managed_pid timer_state="" health_state="" state=""
+
+  preflight_managed_units_ownership || return 1
   managed_pid="$(service_main_pid)"
 
   systemctl stop "$HEALTH_TIMER_NAME" >/dev/null 2>&1 || true
