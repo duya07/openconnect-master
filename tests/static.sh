@@ -6,10 +6,10 @@ export PATH
 
 cd -- "${BASH_SOURCE[0]%/*}/.."
 
-"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/install.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh
+"${BASH}" -n oc_master.sh oc_master_en.sh tests/static.sh tests/install.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh tests/health-uninstall.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/install.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh
+  shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/static.sh tests/install.sh tests/functions.sh tests/testlib.sh tests/compat.sh tests/state.sh tests/snapshot.sh tests/lifecycle.sh tests/routes.sh tests/health-uninstall.sh
 fi
 
 "${BASH}" tests/install.sh
@@ -19,6 +19,7 @@ fi
 "${BASH}" tests/snapshot.sh
 "${BASH}" tests/lifecycle.sh
 "${BASH}" tests/routes.sh
+"${BASH}" tests/health-uninstall.sh
 
 if command -v jq >/dev/null 2>&1; then
   jq -e . examples/sing-box-selected-inbound.json examples/sing-box-all-tcp.json >/dev/null
