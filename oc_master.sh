@@ -922,6 +922,9 @@ install_managed_copy() {
   fi
   if [ -n "$program_backup" ] && { [ -e "$program_backup" ] || [ -L "$program_backup" ]; } && ! rm -f -- "$program_backup"; then
     log_err "安装备份清理失败，保留旧程序备份：$program_backup"
+    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
+      log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+    fi
     return 1
   fi
 }
@@ -1034,7 +1037,9 @@ stage_unit_file() {
   install -d -m 0755 -- "$SYSTEMD_DIR" || return 1
   temporary="$(mktemp "${SYSTEMD_DIR}/.${unit}.${TAG}.XXXXXX")" || return 1
   if ! write_unit_file "$unit" "$temporary"; then
-    rm -f -- "$temporary"
+    if ! rm -f -- "$temporary"; then
+      log_err "安装暂存清理失败，保留文件：$temporary"
+    fi
     return 1
   fi
   printf '%s\n' "$temporary"
