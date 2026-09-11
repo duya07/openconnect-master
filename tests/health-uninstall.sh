@@ -103,6 +103,14 @@ mkdir -p -- "$OCM_PROC_ROOT/200"
 printf '%s\n' '0::/system.slice/oc-master.service/ocproxy.scope' > "$OCM_PROC_ROOT/200/cgroup"
 ss() { printf '%s\n' 'LISTEN 0 4096 127.0.0.1:1080 0.0.0.0:* users:(("ocproxy",pid=200,fd=3))'; }
 health_once || fail 'managed listener was not accepted'
+for colliding_group in \
+  '/system.slice/oc-master.service.evil' \
+  '/system.slice/oc-master.service.evil/ocproxy.scope'; do
+  printf '%s\n' "0::${colliding_group}" > "$OCM_PROC_ROOT/200/cgroup"
+  if health_once; then fail "service-name prefix collision was accepted: $colliding_group"; fi
+done
+printf '%s\n' '0::/system.slice/oc-master.service/ocproxy.scope' > "$OCM_PROC_ROOT/200/cgroup"
+health_once || fail 'real service cgroup subpath was rejected after prefix-collision checks'
 ss() { printf '%s\n' 'LISTEN 0 4096 127.0.0.1:1080 0.0.0.0:* users:(("foreign",pid=301,fd=3))'; }
 if health_once; then fail 'foreign listener was accepted'; fi
 ss() { printf '%s\n' 'LISTEN 0 4096 127.0.0.1:1080 0.0.0.0:*'; }
@@ -378,6 +386,135 @@ make_owned_install() {
 }
 
 owned_shortcut_supported=0
+
+# Deleting managed units is an uninstall commit boundary.  A failure at any
+# position must stop immediately, report failure, and leave that unit plus all
+# later units available for a safe retry.
+managed_unit_paths=(
+  "$(unit_path "$SERVICE_NAME")"
+  "$(unit_path "$HEALTH_SERVICE_NAME")"
+  "$(unit_path "$HEALTH_TIMER_NAME")"
+)
+for unit_remove_case in first middle last; do
+  case "$unit_remove_case" in
+    first) unit_remove_failure_index=1 ;;
+    middle) unit_remove_failure_index=2 ;;
+    last) unit_remove_failure_index=3 ;;
+  esac
+  reset_runtime
+  ensure_dirs
+  mkdir -p -- "$SYSTEMD_DIR"
+  for unit_path_fixture in "${managed_unit_paths[@]}"; do
+    printf '%s\n' '# Managed by oc-master' > "$unit_path_fixture"
+  done
+  unit_remove_output="${TEST_ROOT}/unit-remove-${unit_remove_case}.out"
+  unit_remove_result=0
+  if (
+    unit_remove_count=0
+    rm() {
+      local target="${!#}" candidate
+      for candidate in "${managed_unit_paths[@]}"; do
+        if [ "$target" = "$candidate" ]; then
+          unit_remove_count=$((unit_remove_count + 1))
+          [ "$unit_remove_count" -ne "$unit_remove_failure_index" ] || return 1
+          break
+        fi
+      done
+      command rm "$@"
+    }
+    remove_managed_units
+  ) > "$unit_remove_output" 2>&1; then
+    unit_remove_result=0
+  else
+    unit_remove_result=$?
+  fi
+  [ "$unit_remove_result" -ne 0 ] || fail "managed unit removal masked $unit_remove_case deletion failure"
+  grep -F '删除 systemd 单元失败' "$unit_remove_output" >/dev/null \
+    || fail "$unit_remove_case unit deletion failure lacked a diagnostic"
+  for ((unit_path_index = 0; unit_path_index < ${#managed_unit_paths[@]}; unit_path_index++)); do
+    if [ "$unit_path_index" -lt $((unit_remove_failure_index - 1)) ]; then
+      [ ! -e "${managed_unit_paths[unit_path_index]}" ] && [ ! -L "${managed_unit_paths[unit_path_index]}" ] \
+        || fail "$unit_remove_case unit deletion did not remove an earlier committed target"
+    else
+      [ -f "${managed_unit_paths[unit_path_index]}" ] \
+        || fail "$unit_remove_case unit deletion continued after its first failure"
+    fi
+  done
+done
+
+# A successful rm result is insufficient when the unit path still exists.
+reset_runtime
+ensure_dirs
+mkdir -p -- "$SYSTEMD_DIR"
+for unit_path_fixture in "${managed_unit_paths[@]}"; do
+  printf '%s\n' '# Managed by oc-master' > "$unit_path_fixture"
+done
+unit_remove_postcondition_output="${TEST_ROOT}/unit-remove-postcondition.out"
+unit_remove_postcondition_result=0
+if (
+  skipped_unit_delete=0
+  rm() {
+    local target="${!#}"
+    if [ "$skipped_unit_delete" -eq 0 ] && [ "$target" = "${managed_unit_paths[0]}" ]; then
+      skipped_unit_delete=1
+      return 0
+    fi
+    command rm "$@"
+  }
+  remove_managed_units
+) > "$unit_remove_postcondition_output" 2>&1; then
+  unit_remove_postcondition_result=0
+else
+  unit_remove_postcondition_result=$?
+fi
+[ "$unit_remove_postcondition_result" -ne 0 ] \
+  || fail 'managed unit removal trusted rm success although the path still existed'
+for unit_path_fixture in "${managed_unit_paths[@]}"; do
+  [ -f "$unit_path_fixture" ] || fail 'managed unit removal continued after a failed deletion postcondition'
+done
+grep -F '删除 systemd 单元失败' "$unit_remove_postcondition_output" >/dev/null \
+  || fail 'unit deletion postcondition failure lacked a diagnostic'
+
+# The full uninstaller must not cross the unit-removal boundary after a middle
+# failure: daemon-reload, program/shortcut removal, and recovery evidence all
+# remain untouched.
+reset_runtime
+ensure_dirs
+make_owned_install
+write_active_run "$RUN_PROXY" "$BOOT_ID" proxy 0 nc 1080 "$ACCOUNT"
+write_run_state "$RUN_PROXY" CLEANED 0 0
+uninstall_daemon_calls="${TEST_ROOT}/uninstall-unit-failure.daemon"
+uninstall_unit_failure_output="${TEST_ROOT}/uninstall-unit-failure.out"
+had_shortcut_before_failure=0
+if [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; then had_shortcut_before_failure=1; fi
+uninstall_unit_failure_result=0
+if printf 'REMOVE\n' | (
+  stop_vpn() { :; }
+  systemctl() {
+    [ "$*" != 'daemon-reload' ] || printf '%s\n' daemon-reload >> "$uninstall_daemon_calls"
+    return 0
+  }
+  rm() {
+    local target="${!#}"
+    [ "$target" != "${managed_unit_paths[1]}" ] || return 1
+    command rm "$@"
+  }
+  uninstall_manager
+) > "$uninstall_unit_failure_output" 2>&1; then
+  uninstall_unit_failure_result=0
+else
+  uninstall_unit_failure_result=$?
+fi
+[ "$uninstall_unit_failure_result" -ne 0 ] || fail 'uninstall masked a managed unit deletion failure'
+[ ! -e "$uninstall_daemon_calls" ] || fail 'uninstall daemon-reloaded after managed unit deletion failure'
+for preserved in "$INSTALL_PATH" "$PROFILE_FILE" "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE"; do
+  [ -e "$preserved" ] || fail "unit deletion failure let uninstall remove $preserved"
+done
+[ "$had_shortcut_before_failure" -eq 0 ] || { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } \
+  || fail 'unit deletion failure let uninstall remove the shortcut'
+[ -f "${managed_unit_paths[1]}" ] && [ -f "${managed_unit_paths[2]}" ] \
+  || fail 'uninstall continued deleting units after the middle failure'
+printf 'managed unit removal failure tests passed\n'
 
 # Uninstall removes only confirmed-owned objects after a committed CLEANED
 # state; accounts and foreign files are retained.

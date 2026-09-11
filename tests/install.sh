@@ -286,6 +286,36 @@ find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q
 rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
 printf 'managed-copy program transaction tests passed\n'
 
+# When no shortcut staging is needed, cleanup after a failed program-backup
+# rename must skip the empty placeholder rather than invoking rm with "".
+mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
+empty_cleanup_marker="${TEST_ROOT}/managed-copy-empty-cleanup.called"
+if (
+  stage_shortcut() { return 0; }
+  mv() {
+    local destination="${!#}"
+    [[ "$destination" != *.backup ]] || return 1
+    command mv "$@"
+  }
+  rm() {
+    local target="${!#}"
+    if [ -z "$target" ]; then
+      : > "$empty_cleanup_marker"
+      return 0
+    fi
+    command rm "$@"
+  }
+  install_managed_copy
+); then
+  fail 'managed-copy backup rename failure unexpectedly succeeded'
+fi
+[ ! -e "$empty_cleanup_marker" ] || fail 'managed-copy cleanup called rm with an empty temporary path'
+grep -F 'old-managed-program' "$OCM_INSTALL_PATH" >/dev/null \
+  || fail 'managed-copy backup rename failure changed the old program'
+rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf 'managed-copy empty cleanup test passed\n'
+
 # A unit staging write failure whose local temporary cannot be deleted must
 # leave the evidence and emit a cleanup-specific diagnostic.
 mkdir -p -- "$OCM_SYSTEMD_DIR"
@@ -303,6 +333,22 @@ grep -F '安装暂存清理失败' "$TEST_ROOT/unit-stage-cleanup.out" >/dev/nul
 find "$OCM_SYSTEMD_DIR" -name ".${SERVICE_NAME}.${TAG}.*" -print -quit | grep -q . \
   || fail 'unit staging cleanup failure did not preserve evidence'
 rm -rf -- "$OCM_SYSTEMD_DIR"
+
+# A failed heredoc writer must be the result of write_unit_file itself.  The
+# chmod/readability tail must never turn any of the three failed writes into a
+# successful staged unit.
+for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  chmod_marker="${TEST_ROOT}/${unit}.chmod-after-write-failure"
+  if (
+    cat() { return 41; }
+    chmod() { : > "$chmod_marker"; return 0; }
+    write_unit_file "$unit" "${TEST_ROOT}/${unit}.failed-write"
+  ); then
+    fail "write_unit_file masked a failed heredoc write for $unit"
+  fi
+  [ ! -e "$chmod_marker" ] || fail "write_unit_file ran chmod after a failed heredoc write for $unit"
+done
+printf 'unit writer failure propagation tests passed\n'
 
 # The public `ocm install` path has the same transactional obligation as the
 # unit installer.  Only shortcut commit coverage needs a real POSIX symlink.
@@ -418,6 +464,93 @@ for failure in program main-unit health-unit timer-unit shortcut daemon-reload s
   printf 'recovered failure: %s\n' "$failure"
   rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
 done
+
+# Unit/program replacement is committed once daemon-reload and the property
+# verification succeed.  A later backup deletion failure must be reported for
+# every position without attempting an impossible partial rollback.
+for backup_failure_case in first middle last; do
+  case "$backup_failure_case" in
+    first) backup_failure_index=1 ;;
+    middle) backup_failure_index=2 ;;
+    last) backup_failure_index=4 ;;
+  esac
+  seed_legacy_units
+  MOCK_DAEMON_RELOAD_FAIL=0
+  MOCK_SHOW_FAIL=0
+  failed_backup_record="${TEST_ROOT}/backup-cleanup-${backup_failure_case}.path"
+  backup_cleanup_output="${TEST_ROOT}/backup-cleanup-${backup_failure_case}.out"
+  backup_cleanup_result=0
+  if (
+    shortcut_is_ours() { return 0; }
+    backup_delete_count=0
+    rm() {
+      local target="${!#}"
+      if [[ "$target" == *.backup ]]; then
+        backup_delete_count=$((backup_delete_count + 1))
+        if [ "$backup_delete_count" -eq "$backup_failure_index" ]; then
+          printf '%s\n' "$target" > "$failed_backup_record"
+          return 1
+        fi
+      fi
+      command rm "$@"
+    }
+    install_self_and_units
+  ) > "$backup_cleanup_output" 2>&1; then
+    backup_cleanup_result=0
+  else
+    backup_cleanup_result=$?
+  fi
+  [ "$backup_cleanup_result" -ne 0 ] \
+    || fail "committed install masked $backup_failure_case backup cleanup failure"
+  [ -s "$failed_backup_record" ] || fail "$backup_failure_case backup cleanup failure was not injected"
+  failed_backup_path="$(<"$failed_backup_record")"
+  [ -f "$failed_backup_path" ] || fail "$backup_failure_case failed backup was not retained"
+  [ "$(find "$TEST_ROOT" -name '*.backup' -type f | wc -l | tr -d ' ')" = 1 ] \
+    || fail "$backup_failure_case backup cleanup retained more than the failed backup"
+  cmp -s -- "$SCRIPT_PATH" "$OCM_INSTALL_PATH" \
+    || fail "$backup_failure_case backup cleanup failure rolled back the committed program"
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    head -n 1 -- "$(unit_path "$unit")" | grep -Fx '# Managed by oc-master' >/dev/null \
+      || fail "$backup_failure_case backup cleanup failure rolled back $unit"
+  done
+  grep -F '安装已提交并验证，但备份清理未完成' "$backup_cleanup_output" >/dev/null \
+    || fail "$backup_failure_case backup cleanup failure lacked committed-state diagnostic"
+  rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+done
+printf 'committed backup cleanup failure tests passed\n'
+
+# Do not trust rm's exit status alone: a wrapper or filesystem race that leaves
+# the backup path in place is still an incomplete committed cleanup.
+seed_legacy_units
+MOCK_DAEMON_RELOAD_FAIL=0
+MOCK_SHOW_FAIL=0
+backup_postcondition_output="${TEST_ROOT}/backup-cleanup-postcondition.out"
+backup_postcondition_result=0
+if (
+  shortcut_is_ours() { return 0; }
+  skipped_backup_delete=0
+  rm() {
+    local target="${!#}"
+    if [ "$skipped_backup_delete" -eq 0 ] && [[ "$target" == *.backup ]]; then
+      skipped_backup_delete=1
+      return 0
+    fi
+    command rm "$@"
+  }
+  install_self_and_units
+) > "$backup_postcondition_output" 2>&1; then
+  backup_postcondition_result=0
+else
+  backup_postcondition_result=$?
+fi
+[ "$backup_postcondition_result" -ne 0 ] \
+  || fail 'committed install trusted rm success although a backup still existed'
+[ "$(find "$TEST_ROOT" -name '*.backup' -type f | wc -l | tr -d ' ')" = 1 ] \
+  || fail 'backup postcondition failure did not retain exactly the undeleted backup'
+grep -F '安装已提交并验证，但备份清理未完成' "$backup_postcondition_output" >/dev/null \
+  || fail 'backup postcondition failure lacked committed-state diagnostic'
+rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+printf 'committed backup cleanup postcondition test passed\n'
 
 # Successful deployment writes the documented modes and leaves no staging
 # files, while systemctl properties confirm the generated lifecycle contract.
