@@ -683,7 +683,9 @@ assert_eq $'stop oc-master-rollback.timer\nstop oc-master-rollback.service\nrese
   "$(cat "$ROLLBACK_MUTATIONS")" 'owned rollback cancellation mutation set changed'
 [ ! -e "$ROLLBACK_LOCK_VIOLATION" ] || fail 'rollback ownership query ran while state lock was held'
 
-# Partial creation is recoverable, but only the proven-owned half may be touched.
+# A service carries its UUID in ExecStart and can therefore be cancelled on its
+# own.  A timer carries no UUID evidence: without the matching service, its
+# fixed name and trigger are insufficient to prove generation ownership.
 for owned_half in timer service; do
   write_runtime_fixture "$RUN_A" "$BOOT_A" global CONFIRMED 1 0
   reset_rollback_unit_mock
@@ -692,11 +694,15 @@ for owned_half in timer service; do
   ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-partial-${owned_half}.lock-violation"
   : > "$ROLLBACK_MUTATIONS"
   systemctl() { mock_rollback_systemctl "$@"; }
-  cancel_rollback "$RUN_A" >/dev/null 2>&1 || fail "owned partial rollback $owned_half was rejected"
   if [ "$owned_half" = timer ]; then
-    assert_eq 'stop oc-master-rollback.timer' "$(cat "$ROLLBACK_MUTATIONS")" \
-      'partial timer cancellation touched another unit'
+    if cancel_rollback "$RUN_A" >/dev/null 2>&1; then
+      fail 'timer-only rollback cancellation accepted a unit without RUN_ID evidence'
+    fi
+    [ ! -s "$ROLLBACK_MUTATIONS" ] \
+      || fail 'timer-only rollback cancellation mutated systemd without RUN_ID evidence'
   else
+    cancel_rollback "$RUN_A" >/dev/null 2>&1 \
+      || fail 'UUID-bound service-only rollback cancellation was rejected'
     assert_eq $'stop oc-master-rollback.service\nreset-failed oc-master-rollback.service' \
       "$(cat "$ROLLBACK_MUTATIONS")" 'partial service cancellation touched another unit'
   fi
@@ -732,28 +738,51 @@ for post_state in active empty query-fail; do
 done
 
 # systemd-run success alone is insufficient: arming succeeds only after the
-# exact UUID-bound transient service/timer pair can be read back.
-for arm_shape in complete service-only wrong-uuid; do
+# exact UUID-bound transient pair is read back as an active timer and an
+# inactive waiting service.  Empty, unexpected, and unreadable states fail
+# without printing the armed-success warning.
+for arm_shape in complete service-only wrong-uuid timer-inactive timer-empty \
+  timer-query-fail service-active service-empty service-query-fail; do
   write_runtime_fixture "$RUN_A" "$BOOT_A" global STARTING 1 0
   reset_rollback_unit_mock
   ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-arm-${arm_shape}.mutations"
+  ROLLBACK_ARM_OUTPUT="${TEST_ROOT}/rollback-arm-${arm_shape}.output"
   ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-arm-${arm_shape}.lock-violation"
   : > "$ROLLBACK_MUTATIONS"
+  : > "$ROLLBACK_ARM_OUTPUT"
   systemctl() { mock_rollback_systemctl "$@"; }
   systemd-run() {
     printf 'systemd-run\n' >> "$ROLLBACK_MUTATIONS"
     reset_rollback_unit_mock
     seed_owned_rollback_service "$RUN_A"
+    ROLLBACK_SERVICE_ACTIVE=inactive
     case "$arm_shape" in
       complete) seed_owned_rollback_timer ;;
       service-only) ;;
       wrong-uuid) seed_owned_rollback_service "$RUN_B"; seed_owned_rollback_timer ;;
+      timer-inactive) seed_owned_rollback_timer; ROLLBACK_TIMER_ACTIVE=inactive ;;
+      timer-empty) seed_owned_rollback_timer; ROLLBACK_TIMER_ACTIVE='' ;;
+      timer-query-fail)
+        seed_owned_rollback_timer
+        ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=ActiveState"
+        ;;
+      service-active) seed_owned_rollback_timer; ROLLBACK_SERVICE_ACTIVE=active ;;
+      service-empty) seed_owned_rollback_timer; ROLLBACK_SERVICE_ACTIVE='' ;;
+      service-query-fail)
+        seed_owned_rollback_timer
+        ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=ActiveState"
+        ;;
     esac
   }
   if [ "$arm_shape" = complete ]; then
-    arm_rollback "$RUN_A" >/dev/null 2>&1 || fail 'complete owned rollback pair failed post-arm proof'
-  elif arm_rollback "$RUN_A" >/dev/null 2>&1; then
+    arm_rollback "$RUN_A" >"$ROLLBACK_ARM_OUTPUT" 2>&1 \
+      || fail 'active timer with inactive waiting service failed post-arm proof'
+    grep -F '已武装独立回滚' "$ROLLBACK_ARM_OUTPUT" >/dev/null \
+      || fail 'proven armed rollback did not print its success warning'
+  elif arm_rollback "$RUN_A" >"$ROLLBACK_ARM_OUTPUT" 2>&1; then
     fail "rollback arm accepted incomplete/unprovable pair: $arm_shape"
+  elif grep -F '已武装独立回滚' "$ROLLBACK_ARM_OUTPUT" >/dev/null; then
+    fail "rollback arm printed success before proving unit states: $arm_shape"
   fi
   unset -f systemctl systemd-run
 done
@@ -818,6 +847,7 @@ GLOBAL_RESULT="${TEST_ROOT}/global.result"
   systemd-run() {
     reset_rollback_unit_mock
     seed_owned_rollback_service "$RUN_A"
+    ROLLBACK_SERVICE_ACTIVE=inactive
     seed_owned_rollback_timer
   }
   read() {
