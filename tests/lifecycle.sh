@@ -68,11 +68,22 @@ seed_lifecycle_managed_units() {
   local unit
   mkdir -p -- "$SYSTEMD_DIR"
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
-    printf '%s\n' '# Managed by oc-master' > "$(unit_path "$unit")"
+    write_unit_file "$unit" "$(unit_path "$unit")" || fail "could not seed current unit: $unit"
   done
 }
 
 mock_lifecycle_unit_query() {
+  if [ "$#" -eq 4 ] && [ "$1" = show ] && [ "$3" = --all ] && [ "$4" = --property=DropInPaths ]; then
+    if [ "$2" = "${LIFECYCLE_DROPIN_UNIT:-}" ]; then
+      case "${LIFECYCLE_DROPIN_MODE:-present}" in
+        query-fail) return 1 ;;
+        missing) return 0 ;;
+        present) printf 'DropInPaths=/etc/systemd/system/%s.d/override.conf\n' "$2"; return 0 ;;
+      esac
+    fi
+    printf 'DropInPaths=\n'
+    return 0
+  fi
   [ "$#" -eq 4 ] && [ "$1" = show ] && [ "$4" = --value ] || return 1
   local unit="$2" property="$3"
 
@@ -115,6 +126,19 @@ mock_lifecycle_unit_query() {
     --property=Triggers)
       [ "$unit" = "$HEALTH_TIMER_NAME" ] || return 1
       printf '%s\n' "${LIFECYCLE_TIMER_TRIGGERS:-$HEALTH_SERVICE_NAME}"
+      ;;
+    --property=NeedDaemonReload)
+      if [ "$unit" = "${LIFECYCLE_NEED_RELOAD_UNIT:-}" ]; then
+        case "${LIFECYCLE_NEED_RELOAD_MODE:-yes}" in
+          query-fail) return 1 ;;
+          empty) printf '\n' ;;
+          yes) printf 'yes\n' ;;
+          no) printf 'no\n' ;;
+          *) return 1 ;;
+        esac
+      else
+        printf 'no\n'
+      fi
       ;;
     *) return 1 ;;
   esac
@@ -392,6 +416,77 @@ if (
   fail 'start accepted a foreign timer trigger'
 fi
 [ ! -s "$START_SYSTEMCTL_MUTATIONS" ] || fail 'start mutated systemd before rejecting timer contract drift'
+
+# A current marker is not the current contract.  Any byte drift, any drop-in,
+# or an unprovable/pending daemon reload must abort before the first mutation.
+for rejected_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  rejected_path="$(unit_path "$rejected_unit")"
+  cp -- "$rejected_path" "${rejected_path}.exact"
+  printf '%s\n' '# stale current-unit bytes' >> "$rejected_path"
+  : > "$START_SYSTEMCTL_MUTATIONS"
+  if (
+    systemctl() {
+      if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+      printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+    }
+    start_managed_units >/dev/null 2>&1
+  ); then
+    fail "start accepted byte drift in $rejected_unit"
+  fi
+  [ ! -s "$START_SYSTEMCTL_MUTATIONS" ] \
+    || fail "start mutated systemd before rejecting byte drift in $rejected_unit"
+  mv -f -- "${rejected_path}.exact" "$rejected_path"
+done
+
+for dropin_mode in query-fail missing present; do
+  : > "$START_SYSTEMCTL_MUTATIONS"
+  if (
+    LIFECYCLE_DROPIN_UNIT="$HEALTH_SERVICE_NAME"
+    LIFECYCLE_DROPIN_MODE="$dropin_mode"
+    systemctl() {
+      if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+      printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+    }
+    start_managed_units >/dev/null 2>&1
+  ); then
+    fail "start accepted DropInPaths=$dropin_mode evidence"
+  fi
+  [ ! -s "$START_SYSTEMCTL_MUTATIONS" ] \
+    || fail "start mutated systemd before rejecting DropInPaths=$dropin_mode evidence"
+done
+
+for reload_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  : > "$START_SYSTEMCTL_MUTATIONS"
+  if (
+    LIFECYCLE_NEED_RELOAD_UNIT="$reload_unit"
+    LIFECYCLE_NEED_RELOAD_MODE=yes
+    systemctl() {
+      if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+      printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+    }
+    start_managed_units >/dev/null 2>&1
+  ); then
+    fail "start accepted NeedDaemonReload=yes for $reload_unit"
+  fi
+  [ ! -s "$START_SYSTEMCTL_MUTATIONS" ] \
+    || fail "start mutated systemd before rejecting NeedDaemonReload=yes for $reload_unit"
+done
+for reload_mode in query-fail empty; do
+  : > "$START_SYSTEMCTL_MUTATIONS"
+  if (
+    LIFECYCLE_NEED_RELOAD_UNIT="$SERVICE_NAME"
+    LIFECYCLE_NEED_RELOAD_MODE="$reload_mode"
+    systemctl() {
+      if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+      printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+    }
+    start_managed_units >/dev/null 2>&1
+  ); then
+    fail "start accepted NeedDaemonReload=$reload_mode"
+  fi
+  [ ! -s "$START_SYSTEMCTL_MUTATIONS" ] \
+    || fail "start mutated systemd before rejecting NeedDaemonReload=$reload_mode"
+done
 
 : > "$START_SYSTEMCTL_MUTATIONS"
 if ! (
@@ -975,14 +1070,56 @@ fi
 assert_eq "${RUN_B}=3" "$(cat "$HEALTH_FAILURE_FILE")" 'health foreign-source guard lost the failure count'
 printf 'health restart ownership test passed\n'
 
+# Health-triggered restart is a mutation too: a stale template, active drop-in,
+# or pending reload must preserve the failure counter without claiming cooldown
+# or restarting the same-named service.
+for health_guard_case in byte-drift dropin-present reload-needed; do
+  seed_lifecycle_managed_units
+  write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
+  printf '%s\n' "${RUN_B}=2" > "$HEALTH_FAILURE_FILE"
+  rm -f -- "$HEALTH_RESTART_FILE"
+  HEALTH_GUARD_CALLS="${TEST_ROOT}/health-${health_guard_case}.calls"
+  rm -f -- "$HEALTH_GUARD_CALLS"
+  if ! (
+    case "$health_guard_case" in
+      byte-drift) printf '%s\n' '# stale main unit' >> "$(unit_path "$SERVICE_NAME")" ;;
+      dropin-present)
+        LIFECYCLE_DROPIN_UNIT="$SERVICE_NAME"
+        LIFECYCLE_DROPIN_MODE=present
+        ;;
+      reload-needed)
+        LIFECYCLE_NEED_RELOAD_UNIT="$SERVICE_NAME"
+        LIFECYCLE_NEED_RELOAD_MODE=yes
+        ;;
+    esac
+    systemctl() {
+      if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+      case "$*" in
+        "is-active --quiet $SERVICE_NAME") return 0 ;;
+        "restart $SERVICE_NAME") printf '%s\n' restart >> "$HEALTH_GUARD_CALLS"; return 0 ;;
+        *) return 0 ;;
+      esac
+    }
+    health_once() { return 1; }
+    date() { printf '3000\n'; }
+    service_health >/dev/null 2>&1
+  ); then
+    fail "health $health_guard_case guard returned an operational error"
+  fi
+  [ ! -e "$HEALTH_GUARD_CALLS" ] || fail "health restarted after $health_guard_case"
+  [ ! -e "$HEALTH_RESTART_FILE" ] || fail "health claimed cooldown before rejecting $health_guard_case"
+  assert_eq "${RUN_B}=3" "$(cat "$HEALTH_FAILURE_FILE")" "health $health_guard_case guard lost the failure count"
+done
+seed_lifecycle_managed_units
+
 # Old-generation failure/cooldown values are ignored rather than inherited.
 write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
 printf '%s\n' "${RUN_A}=2" > "$HEALTH_FAILURE_FILE"
 printf '%s\n' "${RUN_A}=1999" > "$HEALTH_RESTART_FILE"
 HEALTH_CALLS="${TEST_ROOT}/health.calls"
 systemctl() {
+  if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
   case "$*" in
-    "show $SERVICE_NAME --property="*" --value") mock_lifecycle_unit_query "$@" ;;
     "is-active --quiet $SERVICE_NAME") return 0 ;;
     "restart $SERVICE_NAME") printf '%s\n' restart >> "$HEALTH_CALLS"; return 0 ;;
     *) return 0 ;;

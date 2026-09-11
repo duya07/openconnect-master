@@ -164,6 +164,7 @@ systemctl() {
   case "$*" in
     "show $SERVICE_NAME --property=LoadState --value") printf '%s\n' loaded ;;
     "show $SERVICE_NAME --property=FragmentPath --value") unit_path "$SERVICE_NAME" ;;
+    "show $SERVICE_NAME --all --property=DropInPaths") printf 'DropInPaths=\n' ;;
     *) record_systemctl_call "$@" ;;
   esac
 }
@@ -251,11 +252,20 @@ unit_source_probe_systemctl() {
     record_systemctl_call "$@"
     return 0
   fi
-  [ "${4:-}" = --value ] || return 1
   case "$unit" in
     "$SERVICE_NAME"|"$HEALTH_SERVICE_NAME"|"$HEALTH_TIMER_NAME") ;;
     *) return 1 ;;
   esac
+  if [ "${3:-}" = --all ] && [ "${4:-}" = --property=DropInPaths ] && [ "$#" -eq 4 ]; then
+    case "$SOURCE_PROBE_MODE" in
+      dropin-query-failure) return 1 ;;
+      dropin-missing) return 0 ;;
+      dropin-present) printf 'DropInPaths=/etc/systemd/system/%s.d/override.conf\n' "$unit" ;;
+      *) printf 'DropInPaths=\n' ;;
+    esac
+    return 0
+  fi
+  [ "${4:-}" = --value ] || return 1
   case "$property" in
     --property=LoadState)
       [ "$SOURCE_PROBE_MODE" != load-query-failure ] || return 1
@@ -277,7 +287,8 @@ unit_source_probe_systemctl() {
   esac
 }
 
-for SOURCE_PROBE_MODE in load-query-failure unexpected-load fragment-query-failure empty-fragment transient-fragment missing-owned-fragment; do
+for SOURCE_PROBE_MODE in load-query-failure unexpected-load fragment-query-failure empty-fragment \
+  transient-fragment missing-owned-fragment dropin-query-failure dropin-missing dropin-present; do
   reset_runtime
   ensure_dirs
   : > "$unit_mutation_calls"
