@@ -20,6 +20,7 @@ readonly FAILURE_RUN_ID='123e4567-e89b-42d3-a456-426614174012'
 readonly SNAPSHOT_BOOT_ID='123e4567-e89b-42d3-a456-426614174013'
 readonly ACCOUNT_A='Account A|alice|alpha-secret|vpn-a.example.test|group-a|nc'
 readonly ACCOUNT_B='Account B|bob|beta-secret|vpn-b.example.test|group-b|nc'
+readonly LEGACY_ACCOUNT='Legacy account|carol|legacy-secret|vpn-legacy.example.test|legacy-group'
 
 printf '%s\n' "$SNAPSHOT_RUN_ID" > "$OCM_UUID_FILE"
 printf '%s\n' "$SNAPSHOT_BOOT_ID" > "$OCM_BOOT_ID_FILE"
@@ -100,6 +101,331 @@ write_mismatched_run_state() {
     "ROLLBACK_DEADLINE=$rollback_deadline" \
     | atomic_replace_from_stdin "$RUN_STATE_FILE" 0600
 }
+
+# Break caught: rejecting the historical five-field account format prevents a
+# selected protocol from being committed into an otherwise valid run snapshot.
+LEGACY_STDOUT="${TEST_ROOT}/legacy-snapshot.stdout"
+LEGACY_STDERR="${TEST_ROOT}/legacy-snapshot.stderr"
+if ! create_run_snapshot proxy 0 pulse 1081 "$LEGACY_ACCOUNT" \
+  >"$LEGACY_STDOUT" 2>"$LEGACY_STDERR"; then
+  fail 'legacy five-field account could not create a run snapshot'
+fi
+load_runtime_configuration 2>>"$LEGACY_STDERR" \
+  || fail 'legacy five-field account snapshot could not be loaded'
+assert_eq "$LEGACY_ACCOUNT" "$ACCOUNT_RECORD" 'legacy account record was not preserved byte-for-byte'
+assert_eq pulse "$PROFILE_PROTOCOL" 'selected protocol was not preserved for a legacy account'
+if grep -F 'legacy-secret' "$LEGACY_STDOUT" "$LEGACY_STDERR" >/dev/null 2>&1; then
+  fail 'legacy account password was exposed in snapshot diagnostics'
+fi
+rm -f -- "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE" "$PROFILE_FILE"
+
+valid_account_record 'Old|user|secret|vpn.example.test|group' \
+  || fail 'valid five-field account was rejected'
+valid_account_record 'Old no group|user|secret|vpn.example.test|' \
+  || fail 'valid five-field account with an empty auth group was rejected'
+valid_account_record 'New|user|secret|vpn.example.test|group|nc' \
+  || fail 'valid six-field account was rejected'
+for invalid_account in \
+  'Too few|user|secret|vpn.example.test' \
+  'Too many|user|secret|vpn.example.test|group|nc|extra' \
+  '|user|secret|vpn.example.test|group' \
+  'Missing user||secret|vpn.example.test|group' \
+  'Missing password|user||vpn.example.test|group' \
+  'Missing host|user|secret||group' \
+  'Option host|user|secret|-unsafe.example.test|group' \
+  'Bad protocol|user|secret|vpn.example.test|group|invalid' \
+  $'Embedded newline|user|secret|vpn.example.test|group\nsecond-line'; do
+  if valid_account_record "$invalid_account"; then
+    fail 'invalid account record was accepted'
+  fi
+done
+
+reset_uncommitted_state_fixture() {
+  rm -rf -- "$CONFIG_DIR" "$RUNTIME_DIR"
+  mkdir -p -- "$CONFIG_DIR" "$RUNTIME_DIR"
+  printf '%s\n' "$LEGACY_ACCOUNT" > "$ACCOUNTS_FILE"
+  write_profile proxy 0 pulse 1081
+  write_run_state "$FAILURE_RUN_ID" PREPARING 1 0
+  RECOVERY_ACTIVE_UNIT=""
+  RECOVERY_FAILED_UNIT="$HEALTH_SERVICE_NAME"
+  RECOVERY_UNKNOWN_UNIT=""
+  RECOVERY_MUTATIONS="${TEST_ROOT}/recovery.mutations"
+  : > "$RECOVERY_MUTATIONS"
+}
+
+install_recovery_doubles() {
+  RECOVERY_SERVICE_LOCK_HELD=0
+  RECOVERY_STATE_LOCK_HELD=0
+  check_root() { :; }
+  acquire_service_operation_lock() {
+    [ "$#" -eq 1 ] || return 1
+    RECOVERY_SERVICE_LOCK_HELD=1
+    # shellcheck disable=SC2034 # production lock guard consumes this sourced variable.
+    SERVICE_OPERATION_LOCK_FD=901
+  }
+  release_service_operation_lock() {
+    RECOVERY_SERVICE_LOCK_HELD=0
+    unset SERVICE_OPERATION_LOCK_FD
+  }
+  acquire_state_lock() {
+    [ "$RECOVERY_SERVICE_LOCK_HELD" -eq 1 ] \
+      || fail 'state-only recovery acquired the state lock outside the service-operation lock'
+    [ "$RECOVERY_STATE_LOCK_HELD" -eq 0 ] || return 1
+    RECOVERY_STATE_LOCK_HELD=1
+  }
+  release_state_lock() {
+    RECOVERY_STATE_LOCK_HELD=0
+    unset STATE_LOCK_FD
+  }
+  systemctl() {
+    [ "$RECOVERY_STATE_LOCK_HELD" -eq 0 ] \
+      || fail 'state-only recovery queried systemd while holding the state lock'
+    if [ "${1:-}" = is-active ]; then
+      if [ "${2:-}" = "$RECOVERY_ACTIVE_UNIT" ]; then
+        printf '%s\n' active
+        return 0
+      fi
+      if [ "${2:-}" = "$RECOVERY_UNKNOWN_UNIT" ]; then return 1; fi
+      if [ "${2:-}" = "$RECOVERY_FAILED_UNIT" ]; then
+        printf '%s\n' failed
+        return 3
+      fi
+      printf '%s\n' inactive
+      return 3
+    fi
+    printf 'systemctl %s\n' "$*" >> "$RECOVERY_MUTATIONS"
+  }
+  ip() { printf 'ip %s\n' "$*" >> "$RECOVERY_MUTATIONS"; return 1; }
+}
+
+prepare_with_service_lock() {
+  local rc=0
+  acquire_service_operation_lock wait || return 1
+  prepare_runtime_configuration_for_start || rc=$?
+  release_service_operation_lock
+  return "$rc"
+}
+
+assert_prepare_recovery_rejected() {
+  local label="$1" output="${TEST_ROOT}/recovery-rejected.out"
+  local account_sum profile_sum
+  account_sum="$(cksum < "$ACCOUNTS_FILE")"
+  profile_sum="$(cksum < "$PROFILE_FILE")"
+  : > "$output"
+  if prepare_with_service_lock >"$output" 2>&1; then
+    fail "$label was accepted for state-only recovery"
+  fi
+  { [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; } \
+    || fail "$label rejection removed run-state evidence"
+  assert_eq "$account_sum" "$(cksum < "$ACCOUNTS_FILE")" "$label rejection changed the account file"
+  assert_eq "$profile_sum" "$(cksum < "$PROFILE_FILE")" "$label rejection changed the profile"
+  [ ! -s "$RECOVERY_MUTATIONS" ] || fail "$label rejection mutated systemd or networking"
+  if grep -F 'legacy-secret' "$output" >/dev/null 2>&1; then
+    fail "$label rejection exposed the account password"
+  fi
+}
+
+assert_stop_recovery_rejected() {
+  local label="$1" output="${TEST_ROOT}/stop-recovery-rejected.out"
+  : > "$output"
+  if stop_vpn >"$output" 2>&1; then fail "$label was accepted by manual stop recovery"; fi
+  { [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; } \
+    || fail "$label stop rejection removed run-state evidence"
+  [ -f "$PROFILE_FILE" ] || fail "$label stop rejection removed the profile"
+  grep -Fx "$LEGACY_ACCOUNT" "$ACCOUNTS_FILE" >/dev/null \
+    || fail "$label stop rejection changed the account file"
+  [ ! -s "$RECOVERY_MUTATIONS" ] || fail "$label stop rejection mutated systemd or networking"
+  if grep -F 'legacy-secret' "$output" >/dev/null 2>&1; then
+    fail "$label stop rejection exposed the account password"
+  fi
+}
+
+# Break caught: an active-run rename failure leaves a safe PREPARING state-only
+# transaction that the next manager start must discard while holding both locks.
+(
+  reset_uncommitted_state_fixture
+  install_recovery_doubles
+  RECOVERY_STDERR="${TEST_ROOT}/recovery-success.stderr"
+  prepare_with_service_lock >/dev/null 2>"$RECOVERY_STDERR" \
+    || fail 'safe PREPARING state-only transaction was not recovered for the next start'
+  [ ! -s "$RECOVERY_STDERR" ] \
+    || fail 'successful state-only recovery emitted a misleading load failure'
+  [ ! -e "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] \
+    || fail 'recovered PREPARING state-only evidence was not removed'
+  [ -f "$PROFILE_FILE" ] || fail 'state-only recovery removed the compatibility profile'
+  grep -Fx "$LEGACY_ACCOUNT" "$ACCOUNTS_FILE" >/dev/null \
+    || fail 'state-only recovery changed the account file'
+  [ ! -s "$RECOVERY_MUTATIONS" ] || fail 'safe state-only recovery mutated systemd or networking'
+)
+
+# Network evidence means the transaction is no longer provably pre-network.
+(
+  reset_uncommitted_state_fixture
+  install_recovery_doubles
+  printf '%s\n' evidence > "$ROUTE_PLAN_FILE"
+  if prepare_with_service_lock >/dev/null 2>&1; then
+    fail 'state-only recovery accepted route-plan evidence'
+  fi
+  [ -f "$RUN_STATE_FILE" ] && [ -f "$ROUTE_PLAN_FILE" ] \
+    || fail 'rejected route-evidence recovery removed evidence'
+  [ ! -s "$RECOVERY_MUTATIONS" ] || fail 'route-evidence rejection mutated systemd or networking'
+)
+
+# Every route/worker/health artifact makes state-only deletion unsafe, even if
+# all persistent units currently look quiescent.
+for recovery_evidence in \
+  "$ROUTE_OWNER_FILE" "$SERVICE_RUN_ID_FILE" "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"; do
+  (
+    reset_uncommitted_state_fixture
+    install_recovery_doubles
+    printf '%s\n' evidence > "$recovery_evidence"
+    if prepare_with_service_lock >/dev/null 2>&1; then
+      fail "state-only recovery accepted ${recovery_evidence##*/} evidence"
+    fi
+    [ -f "$RUN_STATE_FILE" ] && [ -f "$recovery_evidence" ] \
+      || fail "rejected ${recovery_evidence##*/} recovery removed evidence"
+    [ ! -s "$RECOVERY_MUTATIONS" ] \
+      || fail "${recovery_evidence##*/} rejection mutated systemd or networking"
+  )
+done
+
+# Strict state parsing and the immutable half of a committed snapshot must not
+# be relaxed merely because the active snapshot cannot be loaded as a pair.
+for rejected_state in corrupt directory starting desired-inactive deadline mismatch; do
+  (
+    reset_uncommitted_state_fixture
+    install_recovery_doubles
+    case "$rejected_state" in
+      corrupt) printf '%s\n' 'FORMAT_VERSION=1' 'BROKEN=1' > "$RUN_STATE_FILE" ;;
+      directory) rm -f -- "$RUN_STATE_FILE"; mkdir -- "$RUN_STATE_FILE" ;;
+      starting) write_run_state "$FAILURE_RUN_ID" STARTING 1 0 ;;
+      desired-inactive) write_run_state "$FAILURE_RUN_ID" PREPARING 0 0 ;;
+      deadline) write_run_state "$FAILURE_RUN_ID" PREPARING 1 1 ;;
+      mismatch)
+        write_active_run "$MIGRATION_RUN_ID" "$SNAPSHOT_BOOT_ID" proxy 0 pulse 1081 "$LEGACY_ACCOUNT"
+        ;;
+    esac
+    assert_prepare_recovery_rejected "$rejected_state state"
+    if [ "$rejected_state" = mismatch ]; then
+      [ -f "$ACTIVE_RUN_FILE" ] || fail 'mismatched active snapshot was removed'
+    fi
+  )
+done
+
+# The unit probes happen between two state-lock acquisitions. A competing
+# writer that changes the candidate generation or adds evidence must be caught
+# by the second complete validation, without deleting either generation.
+for between_lock_change in run-id route-owner; do
+  (
+    reset_uncommitted_state_fixture
+    install_recovery_doubles
+    RECOVERY_INJECTED=0
+    systemctl() {
+      [ "$RECOVERY_STATE_LOCK_HELD" -eq 0 ] \
+        || fail 'between-lock probe queried systemd while holding the state lock'
+      if [ "$RECOVERY_INJECTED" -eq 0 ]; then
+        RECOVERY_INJECTED=1
+        case "$between_lock_change" in
+          run-id) write_run_state "$MIGRATION_RUN_ID" PREPARING 1 0 ;;
+          route-owner) printf '%s\n' evidence > "$ROUTE_OWNER_FILE" ;;
+        esac
+      fi
+      printf '%s\n' inactive
+      return 3
+    }
+    assert_prepare_recovery_rejected "between-lock ${between_lock_change} change"
+    if [ "$between_lock_change" = run-id ]; then
+      load_run_state || fail 'between-lock generation replacement became unreadable'
+      assert_eq "$MIGRATION_RUN_ID" "$RUN_ID" 'between-lock generation replacement was deleted or overwritten'
+    else
+      [ -f "$ROUTE_OWNER_FILE" ] || fail 'between-lock route evidence was deleted'
+    fi
+  )
+done
+
+# Each persistent unit is part of the quiescence proof; unknown is not treated
+# as inactive. These probes are read-only and rejection must not call stop.
+for non_quiescent_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME" unknown; do
+  (
+    reset_uncommitted_state_fixture
+    install_recovery_doubles
+    if [ "$non_quiescent_unit" = unknown ]; then
+      RECOVERY_UNKNOWN_UNIT="$SERVICE_NAME"
+    else
+      RECOVERY_ACTIVE_UNIT="$non_quiescent_unit"
+    fi
+    assert_prepare_recovery_rejected "non-quiescent ${non_quiescent_unit}"
+  )
+done
+
+# A persistent unit that is not inactive/failed may already own side effects.
+(
+  reset_uncommitted_state_fixture
+  install_recovery_doubles
+  RECOVERY_ACTIVE_UNIT="$SERVICE_NAME"
+  if prepare_with_service_lock >/dev/null 2>&1; then
+    fail 'state-only recovery accepted an active managed service'
+  fi
+  [ -f "$RUN_STATE_FILE" ] || fail 'active-unit rejection removed PREPARING evidence'
+  [ ! -s "$RECOVERY_MUTATIONS" ] || fail 'active-unit rejection mutated systemd or networking'
+)
+
+# Manual stop (and therefore uninstall) must be able to finish the same exact
+# pre-network half-transaction without stopping units or touching routes.
+(
+  reset_uncommitted_state_fixture
+  install_recovery_doubles
+  stop_vpn >/dev/null 2>&1 \
+    || fail 'manual stop did not recover a safe PREPARING state-only transaction'
+  [ ! -e "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] \
+    || fail 'manual stop left recovered PREPARING evidence behind'
+  [ -f "$PROFILE_FILE" ] || fail 'manual state-only recovery removed the compatibility profile'
+  grep -Fx "$LEGACY_ACCOUNT" "$ACCOUNTS_FILE" >/dev/null \
+    || fail 'manual state-only recovery changed the account file'
+  [ ! -s "$RECOVERY_MUTATIONS" ] || fail 'manual state-only recovery mutated systemd or networking'
+)
+
+# The stop entry point shares the same fail-closed gate for unsafe partial state.
+for unsafe_stop in route-owner active-unit; do
+  (
+    reset_uncommitted_state_fixture
+    install_recovery_doubles
+    case "$unsafe_stop" in
+      route-owner) printf '%s\n' evidence > "$ROUTE_OWNER_FILE" ;;
+      active-unit) RECOVERY_ACTIVE_UNIT="$HEALTH_TIMER_NAME" ;;
+    esac
+    assert_stop_recovery_rejected "$unsafe_stop"
+  )
+done
+
+# Dangling and ordinary symlinks are distinct from absence. Exercise them on
+# hosts that provide real POSIX symlinks (the mandatory Linux gate does).
+SYMLINK_TARGET="${TEST_ROOT}/recovery-symlink-target"
+rm -f -- "$SYMLINK_TARGET"
+printf '%s\n' target > "$SYMLINK_TARGET"
+SYMLINK_PROBE="${TEST_ROOT}/recovery-symlink-probe"
+rm -f -- "$SYMLINK_PROBE"
+if command ln -s -- "$SYMLINK_TARGET" "$SYMLINK_PROBE" 2>/dev/null && [ -L "$SYMLINK_PROBE" ]; then
+  rm -f -- "$SYMLINK_PROBE"
+  for symlink_case in run-state active-run route-owner; do
+    (
+      reset_uncommitted_state_fixture
+      install_recovery_doubles
+      case "$symlink_case" in
+        run-state)
+          mv -- "$RUN_STATE_FILE" "$SYMLINK_TARGET"
+          ln -s -- "$SYMLINK_TARGET" "$RUN_STATE_FILE"
+          ;;
+        active-run) ln -s -- "$SYMLINK_TARGET" "$ACTIVE_RUN_FILE" ;;
+        route-owner) ln -s -- "$SYMLINK_TARGET" "$ROUTE_OWNER_FILE" ;;
+      esac
+      assert_prepare_recovery_rejected "$symlink_case symlink"
+    )
+  done
+else
+  rm -f -- "$SYMLINK_PROBE"
+  printf 'SKIP: snapshot symlink recovery assertions (real symlinks unavailable)\n'
+fi
 
 # Regression proof: the old implementation follows ACCOUNT_INDEX after a reorder.
 # Once snapshots exist, the same scenario must load the immutable B record instead.

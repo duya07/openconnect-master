@@ -184,7 +184,7 @@ valid_account_record() {
 
   case "$record" in *$'\n'*|*$'\r'*) return 1 ;; esac
   pipes="${record//[^|]/}"
-  [ "${#pipes}" -eq 5 ] || return 1
+  case "${#pipes}" in 4|5) ;; *) return 1 ;; esac
   IFS='|' read -r desc user password host group protocol <<< "$record"
   [ -n "$desc" ] && [ -n "$user" ] && [ -n "$password" ] && [ -n "$host" ] || return 1
   [[ "$host" != -* ]] || return 1
@@ -840,10 +840,67 @@ migrate_legacy_profile() {
   create_run_snapshot "$PROFILE_MODE" "$PROFILE_ACCOUNT_INDEX" "$PROFILE_PROTOCOL" "$PROFILE_SOCKS_PORT" "$account_line"
 }
 
+managed_persistent_units_are_quiescent() {
+  local unit state
+
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    case "$state" in inactive|failed) ;; *) return 1 ;; esac
+  done
+}
+
+load_uncommitted_preparing_state() {
+  local expected_run_id="${1:-}"
+
+  if [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
+    || [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ] \
+    || [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ] \
+    || [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ] \
+    || [ -e "$HEALTH_FAILURE_FILE" ] || [ -L "$HEALTH_FAILURE_FILE" ] \
+    || [ -e "$HEALTH_RESTART_FILE" ] || [ -L "$HEALTH_RESTART_FILE" ]; then
+    return 1
+  fi
+  if ! load_run_state \
+    || [ "$PHASE" != PREPARING ] \
+    || [ "$DESIRED_ACTIVE" != 1 ] \
+    || [ "$ROLLBACK_DEADLINE" != 0 ]; then
+    return 1
+  fi
+  [ -z "$expected_run_id" ] || [ "$RUN_ID" = "$expected_run_id" ]
+}
+
+recover_uncommitted_preparing_state() {
+  [ -n "${SERVICE_OPERATION_LOCK_FD:-}" ] || return 1
+  local candidate_run_id=""
+
+  acquire_state_lock || return 1
+  if ! load_uncommitted_preparing_state; then
+    release_state_lock
+    return 1
+  fi
+  candidate_run_id="$RUN_ID"
+  release_state_lock
+
+  managed_persistent_units_are_quiescent || return 1
+
+  acquire_state_lock || return 1
+  if ! load_uncommitted_preparing_state "$candidate_run_id"; then
+    release_state_lock
+    return 1
+  fi
+  if ! rm -f -- "$RUN_STATE_FILE" \
+    || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; then
+    release_state_lock
+    return 1
+  fi
+  release_state_lock
+}
+
 prepare_runtime_configuration_for_start() {
   if [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
     || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; then
-    load_runtime_configuration >/dev/null \
+    if load_runtime_configuration >/dev/null 2>&1; then return 0; fi
+    recover_uncommitted_preparing_state \
       || { die "检测到不完整或非法的新运行状态，拒绝按旧账户索引回退。"; return 1; }
     return 0
   fi
@@ -2855,6 +2912,17 @@ stop_vpn() {
   if load_runtime_state >/dev/null 2>&1; then stop_run_id="$RUN_ID"; fi
   release_state_lock
   if [ -z "$stop_run_id" ]; then
+    if { [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ]; } \
+      && recover_uncommitted_preparing_state; then
+      release_service_operation_lock
+      log "VPN 已停止，oc-master 的策略路由已清理。"
+      return 0
+    fi
+    if new_runtime_artifact_exists; then
+      die "检测到不完整或非法的新运行状态；为避免破坏恢复证据，拒绝停止或清理。"
+      release_service_operation_lock
+      return 1
+    fi
     if legacy_installation_exists; then
       if ! recover_legacy_installation; then release_service_operation_lock; return 1; fi
       release_service_operation_lock
