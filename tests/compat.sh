@@ -362,7 +362,6 @@ unit_name="" command_path="" command_action="" command_run_id=""
   for argument in "$@"; do printf '<%s>' "$argument"; done
   printf '\n'
 } >> "$MOCK_SYSTEMD_RUN_LOG"
-printf '%s\n' 'arm-global-rollback' >> "$MOCK_SYSTEMD_RUN_EFFECTS"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --unit=*) unit_name="${1#--unit=}"; shift ;;
@@ -395,8 +394,10 @@ else
     > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.exec-start"
 fi
 printf '%s\n' "$service_unit" > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.triggers"
-: > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.active"
-: > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.active"
+if [ ! -e "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.active" ]; then
+  printf 'start<%s>\n' "$timer_unit" >> "$MOCK_SYSTEMD_RUN_EFFECTS"
+  : > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.active"
+fi
 MOCK_SYSTEMD_RUN
   cat > "${mock_bin}/date" <<'MOCK_DATE'
 #!/usr/bin/env bash
@@ -600,6 +601,10 @@ lifecycle_files_match() {
   local current_script_path="${5:-$CURRENT_SCRIPT}"
   local baseline_normalized="${TEST_ROOT}/compare-baseline" current_normalized="${TEST_ROOT}/compare-current"
 
+  case "${baseline_file}:${current_file}" in
+    *.effects:*.effects) cmp -s -- "$baseline_file" "$current_file"; return ;;
+  esac
+
   normalize_lifecycle_file "$baseline_file" "$baseline_normalized" "$baseline_root" "$BASELINE_SCRIPT"
   normalize_lifecycle_file "$current_file" "$current_normalized" "$current_root" "$current_script_path"
   cmp -s -- "$baseline_normalized" "$current_normalized"
@@ -644,6 +649,20 @@ self_test_lifecycle_comparator() {
     fail 'lifecycle comparator accepted a changed OpenConnect argument'
   fi
   printf 'lifecycle comparator mutation self-test passed\n'
+}
+
+self_test_effect_comparator() {
+  local baseline_effect="${TEST_ROOT}/effect-baseline.effects"
+  local current_effect="${TEST_ROOT}/effect-current.effects"
+  local baseline_root="${TEST_ROOT}/effect-baseline-root"
+  local current_root="${TEST_ROOT}/effect-current-root"
+
+  printf 'touch<%s>\n' "$baseline_root" > "$baseline_effect"
+  printf 'touch<%s>\n' "$current_root" > "$current_effect"
+  if lifecycle_files_match "$baseline_effect" "$current_effect" "$baseline_root" "$current_root"; then
+    fail 'effect comparator normalized away a real state-change difference'
+  fi
+  printf 'effect comparator mutation self-test passed\n'
 }
 
 run_global_lifecycle() {
@@ -721,6 +740,20 @@ assert_rollback_transcript_contract() {
     || fail 'current rollback argv differs beyond its required generation UUID'
 }
 
+assert_rollback_effect_contract() {
+  local root effect
+
+  for root in "${TEST_ROOT}/global-41" "${TEST_ROOT}/global-42"; do
+    assert_eq 'start<oc-master-rollback.timer>' "$(cat "$root/systemd-run.effects")" \
+      "systemd-run effect did not describe the timer state transition for ${root##*/}"
+    if grep -Fx 'stop<oc-master-rollback.service>' "$root/systemctl.effects" >/dev/null; then
+      fail "waiting rollback service was falsely modelled active for ${root##*/}"
+    fi
+    effect="$(grep -Fxc 'stop<oc-master-rollback.timer>' "$root/systemctl.effects" || true)"
+    assert_eq 1 "$effect" "active rollback timer was not cancelled exactly once for ${root##*/}"
+  done
+}
+
 assert_secret_boundary() {
   local root="$1" candidate
 
@@ -745,11 +778,13 @@ run_proxy_lifecycle "$BASELINE_SCRIPT" 31
 run_proxy_lifecycle "$CURRENT_SCRIPT" 32
 compare_proxy_lifecycle
 self_test_lifecycle_comparator
+self_test_effect_comparator
 
 run_global_lifecycle "$BASELINE_SCRIPT" 41
 run_global_lifecycle "$CURRENT_SCRIPT" 42
 compare_global_lifecycle
 assert_rollback_transcript_contract
+assert_rollback_effect_contract
 assert_secret_boundary "${TEST_ROOT}/proxy-31"
 assert_secret_boundary "${TEST_ROOT}/proxy-32"
 assert_secret_boundary "${TEST_ROOT}/global-41"

@@ -2628,6 +2628,18 @@ rollback_pair_is_owned() {
   [ "$timer_status" -eq 0 ] && [ "$service_status" -eq 0 ]
 }
 
+rollback_pair_is_armed() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" timer_active service_active
+
+  rollback_pair_is_owned "$expected_run_id" || return 1
+  timer_active="$(systemctl show "${ROLLBACK_UNIT}.timer" --property=ActiveState --value 2>/dev/null)" \
+    || return 1
+  service_active="$(systemctl show "${ROLLBACK_UNIT}.service" --property=ActiveState --value 2>/dev/null)" \
+    || return 1
+  [ "$timer_active" = active ] && [ "$service_active" = inactive ]
+}
+
 cancel_rollback() {
   [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
   local expected_run_id="$1" timer_status service_status
@@ -2645,6 +2657,9 @@ cancel_rollback() {
   fi
   case "$timer_status" in 0|3) ;; *) return 1 ;; esac
   case "$service_status" in 0|3) ;; *) return 1 ;; esac
+  # timer 自身不携带 RUN_ID；只有同名 service 的精确 ExecStart 才能把它
+  # 绑定到当前代际。service 可凭 ExecStart 单独证明，timer 则不能。
+  [ "$timer_status" -ne 0 ] || [ "$service_status" -eq 0 ] || return 1
 
   if [ "$timer_status" -eq 0 ]; then
     systemctl stop "${ROLLBACK_UNIT}.timer" >/dev/null 2>&1 || true
@@ -2817,7 +2832,7 @@ arm_rollback() {
   cancel_rollback "$expected_run_id" || return 1
   systemd-run --quiet --unit="$ROLLBACK_UNIT" --on-active=3m -- \
     "$INSTALL_PATH" _rollback "$expected_run_id" || return 1
-  rollback_pair_is_owned "$expected_run_id" || return 1
+  rollback_pair_is_armed "$expected_run_id" || return 1
   log_warn "已武装独立回滚：3 分钟内未确认，将停止并禁用全局 VPN。"
 }
 
