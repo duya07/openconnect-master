@@ -147,9 +147,26 @@ case "$command_name" in
       *ControlGroup*) printf '/system.slice/oc-master.service\n' ;;
       *LoadState*)
         unit="${1:-}"
-        [ -f "${OCM_SYSTEMD_DIR}/${unit}" ] && printf 'loaded\n' || printf 'not-found\n'
+        if [ -f "${MOCK_SYSTEMCTL_STATE}/${unit}.load" ]; then
+          cat "${MOCK_SYSTEMCTL_STATE}/${unit}.load"
+        elif [ -f "${OCM_SYSTEMD_DIR}/${unit}" ]; then
+          printf 'loaded\n'
+        else
+          printf 'not-found\n'
+        fi
         ;;
-      *FragmentPath*) printf '%s/%s\n' "$OCM_SYSTEMD_DIR" "${1:-}" ;;
+      *Transient*) cat "${MOCK_SYSTEMCTL_STATE}/${1:-}.transient" ;;
+      *FragmentPath*)
+        if [ -f "${MOCK_SYSTEMCTL_STATE}/${1:-}.fragment" ]; then
+          cat "${MOCK_SYSTEMCTL_STATE}/${1:-}.fragment"
+        else
+          printf '%s/%s\n' "$OCM_SYSTEMD_DIR" "${1:-}"
+        fi
+        ;;
+      *ActiveState*)
+        [ -e "${MOCK_SYSTEMCTL_STATE}/${1:-}.active" ] \
+          && printf 'active\n' || printf 'inactive\n'
+        ;;
       *ExecStopPost*)
         printf 'path=%s ; argv[]=%s _service_cleanup ; ignore_errors=yes\n' \
           "$OCM_INSTALL_PATH" "$OCM_INSTALL_PATH"
@@ -166,27 +183,45 @@ case "$command_name" in
             printf 'path=%s ; argv[]=%s _service_health ; ignore_errors=no\n' \
               "$OCM_INSTALL_PATH" "$OCM_INSTALL_PATH"
             ;;
+          oc-master-rollback.service)
+            cat "${MOCK_SYSTEMCTL_STATE}/oc-master-rollback.service.exec-start"
+            ;;
           *) exit 96 ;;
         esac
         ;;
-      *Triggers*) printf 'oc-master-health.service\n' ;;
+      *Triggers*)
+        case "${1:-}" in
+          oc-master-rollback.timer)
+            cat "${MOCK_SYSTEMCTL_STATE}/oc-master-rollback.timer.triggers"
+            ;;
+          *) printf 'oc-master-health.service\n' ;;
+        esac
+        ;;
       *) printf '\n' ;;
     esac
     ;;
   start|stop)
-    printf '%s' "$command_name" >> "$MOCK_SYSTEMCTL_EFFECTS"
     for argument in "$@"; do
       [[ "$argument" == -* ]] && continue
-      printf '<%s>' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"
       if [ "$command_name" = start ]; then
+        [ -e "${MOCK_SYSTEMCTL_STATE}/${argument}.active" ] && continue
+        printf 'start<%s>\n' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"
         : > "${MOCK_SYSTEMCTL_STATE}/${argument}.active"
       else
+        [ -e "${MOCK_SYSTEMCTL_STATE}/${argument}.active" ] || continue
+        printf 'stop<%s>\n' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"
         rm -f -- "${MOCK_SYSTEMCTL_STATE}/${argument}.active"
       fi
     done
-    printf '\n' >> "$MOCK_SYSTEMCTL_EFFECTS"
     ;;
-  enable|disable|reset-failed|daemon-reload)
+  reset-failed)
+    for argument in "$@"; do
+      [ -e "${MOCK_SYSTEMCTL_STATE}/${argument}.failed" ] || continue
+      printf 'reset-failed<%s>\n' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"
+      rm -f -- "${MOCK_SYSTEMCTL_STATE}/${argument}.failed"
+    done
+    ;;
+  enable|disable|daemon-reload)
     printf '%s' "$command_name" >> "$MOCK_SYSTEMCTL_EFFECTS"
     for argument in "$@"; do printf '<%s>' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"; done
     printf '\n' >> "$MOCK_SYSTEMCTL_EFFECTS"
@@ -320,11 +355,46 @@ MOCK_FLOCK
   cat > "${mock_bin}/systemd-run" <<'MOCK_SYSTEMD_RUN'
 #!/usr/bin/env bash
 set -u
+unit_name="" command_path="" command_action="" command_run_id=""
 {
   for argument in "$@"; do printf '<%s>' "$argument"; done
   printf '\n'
 } >> "$MOCK_SYSTEMD_RUN_LOG"
 printf '%s\n' 'arm-global-rollback' >> "$MOCK_SYSTEMD_RUN_EFFECTS"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --unit=*) unit_name="${1#--unit=}"; shift ;;
+    --)
+      shift
+      command_path="${1:-}"
+      command_action="${2:-}"
+      command_run_id="${3:-}"
+      break
+      ;;
+    *) shift ;;
+  esac
+done
+[ -n "$unit_name" ] && [ -n "$command_path" ] && [ "$command_action" = _rollback ] || exit 96
+service_unit="${unit_name}.service"
+timer_unit="${unit_name}.timer"
+printf 'loaded\n' > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.load"
+printf 'loaded\n' > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.load"
+printf 'yes\n' > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.transient"
+printf 'yes\n' > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.transient"
+printf '/run/systemd/transient/%s\n' "$service_unit" > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.fragment"
+printf '/run/systemd/transient/%s\n' "$timer_unit" > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.fragment"
+if [ -n "$command_run_id" ]; then
+  printf 'path=%s ; argv[]=%s %s %s ; ignore_errors=no\n' \
+    "$command_path" "$command_path" "$command_action" "$command_run_id" \
+    > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.exec-start"
+else
+  printf 'path=%s ; argv[]=%s %s ; ignore_errors=no\n' \
+    "$command_path" "$command_path" "$command_action" \
+    > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.exec-start"
+fi
+printf '%s\n' "$service_unit" > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.triggers"
+: > "${MOCK_SYSTEMCTL_STATE}/${service_unit}.active"
+: > "${MOCK_SYSTEMCTL_STATE}/${timer_unit}.active"
 MOCK_SYSTEMD_RUN
   cat > "${mock_bin}/date" <<'MOCK_DATE'
 #!/usr/bin/env bash

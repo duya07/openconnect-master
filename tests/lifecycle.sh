@@ -407,6 +407,263 @@ assert_eq $'reset-failed oc-master.service\nenable oc-master.service oc-master-h
   "$(cat "$START_SYSTEMCTL_MUTATIONS")" 'systemd start mutation order changed'
 printf 'persistent unit start ownership tests passed\n'
 
+reset_rollback_unit_mock() {
+  ROLLBACK_TIMER_LOAD=not-found
+  ROLLBACK_TIMER_TRANSIENT=''
+  ROLLBACK_TIMER_FRAGMENT=''
+  ROLLBACK_TIMER_TRIGGERS=''
+  ROLLBACK_TIMER_ACTIVE=inactive
+  ROLLBACK_SERVICE_LOAD=not-found
+  ROLLBACK_SERVICE_TRANSIENT=''
+  ROLLBACK_SERVICE_FRAGMENT=''
+  ROLLBACK_SERVICE_EXEC_START=''
+  ROLLBACK_SERVICE_ACTIVE=inactive
+  ROLLBACK_QUERY_FAIL=''
+  ROLLBACK_STOP_STICKS=''
+  ROLLBACK_STOP_EMPTIES=''
+}
+
+seed_owned_rollback_timer() {
+  ROLLBACK_TIMER_LOAD=loaded
+  ROLLBACK_TIMER_TRANSIENT=yes
+  ROLLBACK_TIMER_FRAGMENT="/run/systemd/transient/${ROLLBACK_UNIT}.timer"
+  ROLLBACK_TIMER_TRIGGERS="${ROLLBACK_UNIT}.service"
+  ROLLBACK_TIMER_ACTIVE=active
+}
+
+seed_owned_rollback_service() {
+  local run_id="${1:-$RUN_A}"
+  ROLLBACK_SERVICE_LOAD=loaded
+  ROLLBACK_SERVICE_TRANSIENT=yes
+  ROLLBACK_SERVICE_FRAGMENT="/run/systemd/transient/${ROLLBACK_UNIT}.service"
+  ROLLBACK_SERVICE_EXEC_START="path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _rollback ${run_id} ; ignore_errors=no"
+  ROLLBACK_SERVICE_ACTIVE=active
+}
+
+mock_rollback_systemctl() {
+  [ -z "${TEST_STATE_LOCK_HELD:-}" ] || : > "$ROLLBACK_LOCK_VIOLATION"
+  local command_name="${1:-}" unit="" property="" value="" argument
+  shift || true
+  case "$command_name" in
+    show)
+      unit="${1:-}"
+      property="${2:-}"
+      [ "$3" = --value ] || return 96
+      [ "$ROLLBACK_QUERY_FAIL" != "${unit}:${property}" ] || return 1
+      case "${unit}:${property}" in
+        "${ROLLBACK_UNIT}.timer:--property=LoadState") value="$ROLLBACK_TIMER_LOAD" ;;
+        "${ROLLBACK_UNIT}.timer:--property=Transient") value="$ROLLBACK_TIMER_TRANSIENT" ;;
+        "${ROLLBACK_UNIT}.timer:--property=FragmentPath") value="$ROLLBACK_TIMER_FRAGMENT" ;;
+        "${ROLLBACK_UNIT}.timer:--property=Triggers") value="$ROLLBACK_TIMER_TRIGGERS" ;;
+        "${ROLLBACK_UNIT}.timer:--property=ActiveState") value="$ROLLBACK_TIMER_ACTIVE" ;;
+        "${ROLLBACK_UNIT}.service:--property=LoadState") value="$ROLLBACK_SERVICE_LOAD" ;;
+        "${ROLLBACK_UNIT}.service:--property=Transient") value="$ROLLBACK_SERVICE_TRANSIENT" ;;
+        "${ROLLBACK_UNIT}.service:--property=FragmentPath") value="$ROLLBACK_SERVICE_FRAGMENT" ;;
+        "${ROLLBACK_UNIT}.service:--property=ExecStart") value="$ROLLBACK_SERVICE_EXEC_START" ;;
+        "${ROLLBACK_UNIT}.service:--property=ActiveState") value="$ROLLBACK_SERVICE_ACTIVE" ;;
+        *) return 96 ;;
+      esac
+      printf '%s\n' "$value"
+      ;;
+    stop)
+      for argument in "$@"; do
+        [[ "$argument" == -* ]] && continue
+        printf 'stop %s\n' "$argument" >> "$ROLLBACK_MUTATIONS"
+        if [ "$argument" = "${ROLLBACK_UNIT}.timer" ]; then
+          if [ "$ROLLBACK_STOP_STICKS" = timer ]; then
+            ROLLBACK_TIMER_ACTIVE=active
+          elif [ "$ROLLBACK_STOP_EMPTIES" = timer ]; then
+            ROLLBACK_TIMER_ACTIVE=''
+          else
+            ROLLBACK_TIMER_ACTIVE=inactive
+          fi
+        elif [ "$argument" = "${ROLLBACK_UNIT}.service" ]; then
+          if [ "$ROLLBACK_STOP_STICKS" = service ]; then
+            ROLLBACK_SERVICE_ACTIVE=active
+          elif [ "$ROLLBACK_STOP_EMPTIES" = service ]; then
+            ROLLBACK_SERVICE_ACTIVE=''
+          else
+            ROLLBACK_SERVICE_ACTIVE=inactive
+          fi
+        else
+          return 96
+        fi
+      done
+      ;;
+    reset-failed)
+      [ "$#" -eq 1 ] && [ "$1" = "${ROLLBACK_UNIT}.service" ] || return 96
+      printf 'reset-failed %s\n' "$1" >> "$ROLLBACK_MUTATIONS"
+      ;;
+    *) return 96 ;;
+  esac
+}
+
+run_rejected_rollback_cancel_case() (
+  local case_name="$1"
+  write_runtime_fixture "$RUN_A" "$BOOT_A" global CONFIRMED 1 0
+  reset_rollback_unit_mock
+  seed_owned_rollback_timer
+  seed_owned_rollback_service "$RUN_A"
+  ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-${case_name}.mutations"
+  ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-${case_name}.lock-violation"
+  : > "$ROLLBACK_MUTATIONS"
+  case "$case_name" in
+    query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=LoadState" ;;
+    empty-load) ROLLBACK_TIMER_LOAD='' ;;
+    masked-load) ROLLBACK_TIMER_LOAD=masked ;;
+    transient-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=Transient" ;;
+    transient-empty) ROLLBACK_SERVICE_TRANSIENT='' ;;
+    transient-no) ROLLBACK_TIMER_TRANSIENT=no ;;
+    fragment-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=FragmentPath" ;;
+    empty-fragment) ROLLBACK_TIMER_FRAGMENT='' ;;
+    external-source) ROLLBACK_SERVICE_FRAGMENT="/etc/systemd/system/${ROLLBACK_UNIT}.service" ;;
+    exec-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=ExecStart" ;;
+    wrong-uuid) seed_owned_rollback_service "$RUN_B" ;;
+    extra-argument) ROLLBACK_SERVICE_EXEC_START="path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _rollback ${RUN_A} extra ; ignore_errors=no" ;;
+    ignored-exec) ROLLBACK_SERVICE_EXEC_START="path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _rollback ${RUN_A} ; ignore_errors=yes" ;;
+    triggers-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=Triggers" ;;
+    wrong-trigger) ROLLBACK_TIMER_TRIGGERS=foreign.service ;;
+    multiple-triggers) ROLLBACK_TIMER_TRIGGERS="${ROLLBACK_UNIT}.service foreign.service" ;;
+    *) return 96 ;;
+  esac
+  systemctl() { mock_rollback_systemctl "$@"; }
+  if cancel_rollback "$RUN_A" >/dev/null 2>&1; then
+    fail "rollback cancel accepted unsafe metadata: $case_name"
+  fi
+  [ ! -s "$ROLLBACK_MUTATIONS" ] \
+    || fail "rollback cancel mutated systemd before rejecting: $case_name"
+)
+
+# The probe's three outcomes are part of the cancellation contract: exact
+# ownership, strict absence, and every unprovable state remain distinguishable.
+reset_rollback_unit_mock
+ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-probe.mutations"
+ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-probe.lock-violation"
+: > "$ROLLBACK_MUTATIONS"
+systemctl() { mock_rollback_systemctl "$@"; }
+set +e
+rollback_unit_probe "$RUN_A" "${ROLLBACK_UNIT}.service" >/dev/null 2>&1
+ROLLBACK_PROBE_RC=$?
+set -e
+assert_eq 3 "$ROLLBACK_PROBE_RC" 'strictly absent rollback unit did not return probe status 3'
+seed_owned_rollback_service "$RUN_A"
+rollback_unit_probe "$RUN_A" "${ROLLBACK_UNIT}.service" >/dev/null 2>&1 \
+  || fail 'owned rollback unit did not return probe status 0'
+ROLLBACK_SERVICE_TRANSIENT=''
+set +e
+rollback_unit_probe "$RUN_A" "${ROLLBACK_UNIT}.service" >/dev/null 2>&1
+ROLLBACK_PROBE_RC=$?
+set -e
+assert_eq 1 "$ROLLBACK_PROBE_RC" 'unprovable rollback unit did not return probe status 1'
+unset -f systemctl
+
+# Strict absence is a safe no-op.  It must not stop/reset an unrelated fixed name.
+write_runtime_fixture "$RUN_A" "$BOOT_A" global CONFIRMED 1 0
+reset_rollback_unit_mock
+ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-absent.mutations"
+ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-absent.lock-violation"
+: > "$ROLLBACK_MUTATIONS"
+systemctl() { mock_rollback_systemctl "$@"; }
+cancel_rollback "$RUN_A" >/dev/null 2>&1 || fail 'strictly absent rollback pair was rejected'
+[ ! -s "$ROLLBACK_MUTATIONS" ] || fail 'absent rollback pair caused a systemd mutation'
+unset -f systemctl
+
+# A fully owned pair is stopped only after both units are proven, and systemd
+# queries must happen after state_matches_run has released the state lock.
+write_runtime_fixture "$RUN_A" "$BOOT_A" global CONFIRMED 1 0
+reset_rollback_unit_mock
+seed_owned_rollback_timer
+seed_owned_rollback_service "$RUN_A"
+ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-owned.mutations"
+ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-owned.lock-violation"
+: > "$ROLLBACK_MUTATIONS"
+(
+  TEST_STATE_LOCK_HELD=''
+  acquire_state_lock() { [ -z "$TEST_STATE_LOCK_HELD" ] || return 1; TEST_STATE_LOCK_HELD=1; }
+  release_state_lock() { TEST_STATE_LOCK_HELD=''; }
+  systemctl() { mock_rollback_systemctl "$@"; }
+  cancel_rollback "$RUN_A" >/dev/null 2>&1
+) || fail 'owned rollback pair could not be cancelled'
+assert_eq $'stop oc-master-rollback.timer\nstop oc-master-rollback.service\nreset-failed oc-master-rollback.service' \
+  "$(cat "$ROLLBACK_MUTATIONS")" 'owned rollback cancellation mutation set changed'
+[ ! -e "$ROLLBACK_LOCK_VIOLATION" ] || fail 'rollback ownership query ran while state lock was held'
+
+# Partial creation is recoverable, but only the proven-owned half may be touched.
+for owned_half in timer service; do
+  write_runtime_fixture "$RUN_A" "$BOOT_A" global CONFIRMED 1 0
+  reset_rollback_unit_mock
+  if [ "$owned_half" = timer ]; then seed_owned_rollback_timer; else seed_owned_rollback_service "$RUN_A"; fi
+  ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-partial-${owned_half}.mutations"
+  ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-partial-${owned_half}.lock-violation"
+  : > "$ROLLBACK_MUTATIONS"
+  systemctl() { mock_rollback_systemctl "$@"; }
+  cancel_rollback "$RUN_A" >/dev/null 2>&1 || fail "owned partial rollback $owned_half was rejected"
+  if [ "$owned_half" = timer ]; then
+    assert_eq 'stop oc-master-rollback.timer' "$(cat "$ROLLBACK_MUTATIONS")" \
+      'partial timer cancellation touched another unit'
+  else
+    assert_eq $'stop oc-master-rollback.service\nreset-failed oc-master-rollback.service' \
+      "$(cat "$ROLLBACK_MUTATIONS")" 'partial service cancellation touched another unit'
+  fi
+  unset -f systemctl
+done
+
+for rollback_rejection in query-fail empty-load masked-load transient-query-fail transient-empty \
+  transient-no fragment-query-fail empty-fragment external-source exec-query-fail wrong-uuid \
+  extra-argument ignored-exec triggers-query-fail wrong-trigger multiple-triggers; do
+  run_rejected_rollback_cancel_case "$rollback_rejection"
+done
+
+# A mutation is not success until the same owned unit is proven inactive (or
+# strictly gone).  Active and unreadable post-stop states both fail closed.
+for post_state in active empty query-fail; do
+  write_runtime_fixture "$RUN_A" "$BOOT_A" global CONFIRMED 1 0
+  reset_rollback_unit_mock
+  seed_owned_rollback_timer
+  seed_owned_rollback_service "$RUN_A"
+  ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-post-${post_state}.mutations"
+  ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-post-${post_state}.lock-violation"
+  : > "$ROLLBACK_MUTATIONS"
+  case "$post_state" in
+    active) ROLLBACK_STOP_STICKS=service ;;
+    empty) ROLLBACK_STOP_EMPTIES=service ;;
+    query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=ActiveState" ;;
+  esac
+  systemctl() { mock_rollback_systemctl "$@"; }
+  if cancel_rollback "$RUN_A" >/dev/null 2>&1; then
+    fail "rollback cancellation accepted post-stop service state: $post_state"
+  fi
+  unset -f systemctl
+done
+
+# systemd-run success alone is insufficient: arming succeeds only after the
+# exact UUID-bound transient service/timer pair can be read back.
+for arm_shape in complete service-only wrong-uuid; do
+  write_runtime_fixture "$RUN_A" "$BOOT_A" global STARTING 1 0
+  reset_rollback_unit_mock
+  ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-arm-${arm_shape}.mutations"
+  ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/rollback-arm-${arm_shape}.lock-violation"
+  : > "$ROLLBACK_MUTATIONS"
+  systemctl() { mock_rollback_systemctl "$@"; }
+  systemd-run() {
+    printf 'systemd-run\n' >> "$ROLLBACK_MUTATIONS"
+    reset_rollback_unit_mock
+    seed_owned_rollback_service "$RUN_A"
+    case "$arm_shape" in
+      complete) seed_owned_rollback_timer ;;
+      service-only) ;;
+      wrong-uuid) seed_owned_rollback_service "$RUN_B"; seed_owned_rollback_timer ;;
+    esac
+  }
+  if [ "$arm_shape" = complete ]; then
+    arm_rollback "$RUN_A" >/dev/null 2>&1 || fail 'complete owned rollback pair failed post-arm proof'
+  elif arm_rollback "$RUN_A" >/dev/null 2>&1; then
+    fail "rollback arm accepted incomplete/unprovable pair: $arm_shape"
+  fi
+  unset -f systemctl systemd-run
+done
+printf 'rollback transient unit ownership tests passed\n'
+
 # A stale rollback worker must not touch the current generation.
 write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
 STALE_CALLS="${TEST_ROOT}/stale-rollback.calls"
@@ -452,13 +709,22 @@ GLOBAL_RESULT="${TEST_ROOT}/global.result"
   validate_route_plan_against_snapshot() { [ "${1:-}" = "$RUN_A" ]; }
   start_managed_units() { :; }
   wait_until_healthy() { return 0; }
+  reset_rollback_unit_mock
+  ROLLBACK_MUTATIONS="${TEST_ROOT}/global-rollback.mutations"
+  ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/global-rollback.lock-violation"
+  : > "$ROLLBACK_MUTATIONS"
   systemctl() {
     case "$1" in
       is-active) return 3 ;;
-      *) return 0 ;;
+      show|stop|reset-failed) mock_rollback_systemctl "$@" ;;
+      *) return 96 ;;
     esac
   }
-  systemd-run() { return 0; }
+  systemd-run() {
+    reset_rollback_unit_mock
+    seed_owned_rollback_service "$RUN_A"
+    seed_owned_rollback_timer
+  }
   read() {
     local target="${!#}"
     case " $* " in
@@ -500,10 +766,15 @@ KEEP_SIDE_EFFECTS="${TEST_ROOT}/keep.side-effects"
 KEEP_PID=$!
 BACKGROUND_PIDS="$BACKGROUND_PIDS $KEEP_PID"
 wait_for_file "$KEEP_WORKER_STARTED" 'KEEP-first worker start'
+reset_rollback_unit_mock
+ROLLBACK_MUTATIONS="${TEST_ROOT}/keep-rollback.mutations"
+ROLLBACK_LOCK_VIOLATION="${TEST_ROOT}/keep-rollback.lock-violation"
+: > "$ROLLBACK_MUTATIONS"
 systemctl() {
   case "$1" in
     is-active) return 3 ;;
-    *) return 0 ;;
+    show|stop|reset-failed) mock_rollback_systemctl "$@" ;;
+    *) return 96 ;;
   esac
 }
 confirm_global_run "$RUN_A" >/dev/null || fail 'KEEP could not claim an awaiting generation'
