@@ -709,12 +709,6 @@ port_is_free() {
   ! tcp_port_is_listening "$port"
 }
 
-profile_value() {
-  local key="$1"
-  [ -r "$PROFILE_FILE" ] || return 1
-  sed -n "s/^${key}=//p" "$PROFILE_FILE" | tail -n 1
-}
-
 write_profile() {
   local mode="$1" account_index="$2" protocol="$3" socks_port="${4:-}"
   [ "$mode" = "proxy" ] || [ "$mode" = "global" ] || { die "内部模式无效：$mode"; return 1; }
@@ -1079,7 +1073,10 @@ install_managed_copy() {
     program_backup="${program_tmp}.backup"
     if ! mv -f -- "$INSTALL_PATH" "$program_backup"; then
       for temporary in "$program_tmp" "$shortcut_tmp"; do
-        [ -n "$temporary" ] && { [ ! -e "$temporary" ] && [ ! -L "$temporary" ]; } || rm -f -- "$temporary" || cleanup_failed=1
+        [ -n "$temporary" ] || continue
+        if { [ -e "$temporary" ] || [ -L "$temporary" ]; } && ! rm -f -- "$temporary"; then
+          cleanup_failed=1
+        fi
       done
       [ "$cleanup_failed" -eq 0 ] || log_err "安装暂存清理失败，保留可诊断文件。"
       return 1
@@ -1157,7 +1154,8 @@ write_unit_file() {
   [ "$#" -eq 2 ] || return 1
   local unit="$1" temporary="$2"
   case "$unit" in
-    "$SERVICE_NAME") cat > "$temporary" <<EOF
+    "$SERVICE_NAME")
+      if ! cat > "$temporary" <<EOF
 # Managed by oc-master
 [Unit]
 Description=OpenConnect Master managed tunnel
@@ -1181,8 +1179,12 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+      then
+        return 1
+      fi
       ;;
-    "$HEALTH_SERVICE_NAME") cat > "$temporary" <<EOF
+    "$HEALTH_SERVICE_NAME")
+      if ! cat > "$temporary" <<EOF
 # Managed by oc-master
 [Unit]
 Description=OpenConnect Master data-plane health check
@@ -1193,8 +1195,12 @@ Type=oneshot
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${INSTALL_PATH} _service_health
 EOF
+      then
+        return 1
+      fi
       ;;
-    "$HEALTH_TIMER_NAME") cat > "$temporary" <<EOF
+    "$HEALTH_TIMER_NAME")
+      if ! cat > "$temporary" <<EOF
 # Managed by oc-master
 [Unit]
 Description=Run OpenConnect Master health checks
@@ -1208,6 +1214,9 @@ Unit=${HEALTH_SERVICE_NAME}
 [Install]
 WantedBy=timers.target
 EOF
+      then
+        return 1
+      fi
       ;;
     *) return 1 ;;
   esac
@@ -1281,6 +1290,25 @@ restore_install_transaction() {
   return "$failed"
 }
 
+cleanup_committed_install_backups() {
+  local index backup failed=0
+
+  for ((index = 0; index < ${#INSTALL_TX_BACKUPS[@]}; index++)); do
+    backup="${INSTALL_TX_BACKUPS[index]:-}"
+    [ -n "$backup" ] || continue
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+      if ! rm -f -- "$backup" || [ -e "$backup" ] || [ -L "$backup" ]; then
+        log_err "安装备份清理失败，保留文件：$backup"
+        failed=1
+      fi
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    log_err "安装已提交并验证，但备份清理未完成；不会执行不完整回滚。"
+  fi
+  return "$failed"
+}
+
 install_self_and_units() {
   local unit index target stage
   local -a INSTALL_TX_TARGETS INSTALL_TX_STAGES INSTALL_TX_BACKUPS INSTALL_TX_HAD_OLD INSTALL_TX_INSTALLED
@@ -1341,7 +1369,7 @@ install_self_and_units() {
     restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
     return 1
   fi
-  for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do rm -f -- "${INSTALL_TX_BACKUPS[index]}"; done
+  cleanup_committed_install_backups
 }
 
 remove_managed_shortcut() {
@@ -1358,7 +1386,10 @@ remove_managed_units() {
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     path="$(unit_path "$unit")" || return 1
     if unit_is_ours "$path" "$unit"; then
-      rm -f -- "$path"
+      if ! rm -f -- "$path" || [ -e "$path" ] || [ -L "$path" ]; then
+        log_err "删除 systemd 单元失败，保留其余安装和恢复证据：$path"
+        return 1
+      fi
     elif [ -e "$path" ] || [ -L "$path" ]; then
       log_warn "保留非本项目拥有的 systemd 单元：$path"
     fi
