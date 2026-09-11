@@ -65,7 +65,10 @@ case "$*" in
   '-4 route show default') cat "$MOCK_DEFAULT4" ;;
   '-6 route show default') cat "$MOCK_DEFAULT6" ;;
   '-4 -o addr show scope global') cat "$MOCK_ADDR4" ;;
-  '-6 -o addr show scope global') cat "$MOCK_ADDR6" ;;
+  '-6 -o addr show scope global')
+    [ "$MOCK_IP_FAIL_STAGE" != 'read-addr6' ] || exit 91
+    cat "$MOCK_ADDR6"
+    ;;
   '-4 rule show') cat "$MOCK_RULE4" ;;
   '-6 rule show') cat "$MOCK_RULE6" ;;
   '-4 route show table 51888') cat "$MOCK_TABLE4" ;;
@@ -335,6 +338,23 @@ build_route_plan "$RUN_A" || fail 'missing IPv6 FIB table was treated as a confl
 assert_no_network_writes 'missing IPv6 FIB handling wrote network state'
 
 # Unsupported or ambiguous topology is rejected before any network mutation.
+reset_network
+printf '%s\n' '2: eth0 inet6 2001:db8::10/64 scope global eth0' > "$MOCK_ADDR6"
+write_global_runtime "$RUN_A"
+assert_build_rejected 'global IPv6 address without an IPv6 default was accepted'
+
+reset_network
+write_global_runtime "$RUN_A"
+export MOCK_IP_FAIL_STAGE='read-addr6'
+: > "$MOCK_IP_LOG"
+IPV6_QUERY_BUILD_SUCCEEDED=0
+if build_route_plan "$RUN_A" >/dev/null 2>&1; then
+  IPV6_QUERY_BUILD_SUCCEEDED=1
+fi
+assert_no_network_writes 'failed IPv6 global-address query modified network state'
+[ "$IPV6_QUERY_BUILD_SUCCEEDED" -eq 0 ] \
+  || fail 'failed IPv6 global-address query was treated as empty IPv6 state'
+
 reset_network
 printf '%s\n' \
   'default via 192.0.2.1 dev eth0 metric 100' \
