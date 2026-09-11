@@ -116,11 +116,536 @@ compare_case() {
     "$CURRENT_SCRIPT" "$current_ipv4" "$current_ipv6"
 }
 
+write_lifecycle_mocks() {
+  local mock_bin="$1"
+
+  mkdir -p "$mock_bin"
+  cat > "${mock_bin}/systemctl" <<'MOCK_SYSTEMCTL'
+#!/usr/bin/env bash
+set -u
+printf '<%s>' "$@" >> "$MOCK_SYSTEMCTL_LOG"
+printf '\n' >> "$MOCK_SYSTEMCTL_LOG"
+command_name="${1:-}"
+shift || true
+case "$command_name" in
+  is-active)
+    quiet=0 unit=""
+    for argument in "$@"; do
+      [ "$argument" != --quiet ] || quiet=1
+      [[ "$argument" == -* ]] || unit="$argument"
+    done
+    if [ -e "${MOCK_SYSTEMCTL_STATE}/${unit}.active" ]; then
+      [ "$quiet" -eq 1 ] || printf 'active\n'
+      exit 0
+    fi
+    [ "$quiet" -eq 1 ] || printf 'inactive\n'
+    exit 3
+    ;;
+  show)
+    case " $* " in
+      *MainPID*) printf '%s\n' "$MOCK_OPENCONNECT_PID" ;;
+      *ControlGroup*) printf '/system.slice/oc-master.service\n' ;;
+      *LoadState*)
+        unit="${1:-}"
+        [ -f "${OCM_SYSTEMD_DIR}/${unit}" ] && printf 'loaded\n' || printf 'not-found\n'
+        ;;
+      *FragmentPath*) printf '%s/%s\n' "$OCM_SYSTEMD_DIR" "${1:-}" ;;
+      *ExecStopPost*)
+        printf 'path=%s ; argv[]=%s _service_cleanup ; ignore_errors=yes\n' \
+          "$OCM_INSTALL_PATH" "$OCM_INSTALL_PATH"
+        ;;
+      *RestartPreventExitStatus*) printf '78\n' ;;
+      *Restart*) printf 'always\n' ;;
+      *ExecStart*)
+        case "${1:-}" in
+          oc-master.service)
+            printf 'path=%s ; argv[]=%s _service_run ; ignore_errors=no\n' \
+              "$OCM_INSTALL_PATH" "$OCM_INSTALL_PATH"
+            ;;
+          oc-master-health.service)
+            printf 'path=%s ; argv[]=%s _service_health ; ignore_errors=no\n' \
+              "$OCM_INSTALL_PATH" "$OCM_INSTALL_PATH"
+            ;;
+          *) exit 96 ;;
+        esac
+        ;;
+      *Triggers*) printf 'oc-master-health.service\n' ;;
+      *) printf '\n' ;;
+    esac
+    ;;
+  start|stop)
+    printf '%s' "$command_name" >> "$MOCK_SYSTEMCTL_EFFECTS"
+    for argument in "$@"; do
+      [[ "$argument" == -* ]] && continue
+      printf '<%s>' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"
+      if [ "$command_name" = start ]; then
+        : > "${MOCK_SYSTEMCTL_STATE}/${argument}.active"
+      else
+        rm -f -- "${MOCK_SYSTEMCTL_STATE}/${argument}.active"
+      fi
+    done
+    printf '\n' >> "$MOCK_SYSTEMCTL_EFFECTS"
+    ;;
+  enable|disable|reset-failed|daemon-reload)
+    printf '%s' "$command_name" >> "$MOCK_SYSTEMCTL_EFFECTS"
+    for argument in "$@"; do printf '<%s>' "$argument" >> "$MOCK_SYSTEMCTL_EFFECTS"; done
+    printf '\n' >> "$MOCK_SYSTEMCTL_EFFECTS"
+    ;;
+  *)
+    printf 'unexpected mock systemctl call: %s\n' "$command_name $*" >&2
+    exit 96
+    ;;
+esac
+MOCK_SYSTEMCTL
+
+  cat > "${mock_bin}/openconnect" <<'MOCK_OPENCONNECT'
+#!/usr/bin/env bash
+set -u
+for argument in "$@"; do
+  [ "$argument" != --help ] || { printf '%s\n' '--tcp-keepalive'; exit 0; }
+done
+: > "$MOCK_OPENCONNECT_ARGV"
+for argument in "$@"; do printf '<%s>\n' "$argument" >> "$MOCK_OPENCONNECT_ARGV"; done
+cat > "$MOCK_OPENCONNECT_STDIN"
+MOCK_OPENCONNECT
+
+  cat > "${mock_bin}/ss" <<'MOCK_SS'
+#!/usr/bin/env bash
+set -u
+[ -e "${MOCK_SYSTEMCTL_STATE}/oc-master.service.active" ] || exit 0
+printf 'LISTEN 0 4096 127.0.0.1:1080 0.0.0.0:* users:(("ocproxy",pid=%s,fd=3))\n' "$MOCK_OPENCONNECT_PID"
+MOCK_SS
+
+  cat > "${mock_bin}/curl" <<'MOCK_CURL'
+#!/usr/bin/env bash
+set -u
+case " $* " in
+  *' -o /dev/null '*) exit 0 ;;
+  *' -6 '*) printf '%s' "$MOCK_PUBLIC_IPV6" ;;
+  *) printf '%s' "$MOCK_PUBLIC_IPV4" ;;
+esac
+MOCK_CURL
+
+  cat > "${mock_bin}/ps" <<'MOCK_PS'
+#!/usr/bin/env bash
+printf 'systemd\n'
+MOCK_PS
+  cat > "${mock_bin}/pgrep" <<'MOCK_PGREP'
+#!/usr/bin/env bash
+exit 1
+MOCK_PGREP
+  cat > "${mock_bin}/ip" <<'MOCK_IP'
+#!/usr/bin/env bash
+set -u
+{
+  for argument in "$@"; do printf '<%s>' "$argument"; done
+  printf '\n'
+} >> "$MOCK_IP_LOG"
+
+delete_managed_rule() {
+  local rules_file="$1" table="$2"
+  grep -Ev "lookup ${table}([[:space:]]|$)" "$rules_file" > "${rules_file}.tmp" || true
+  mv -f -- "${rules_file}.tmp" "$rules_file"
+}
+
+case "$*" in
+  '-4 route show default') cat "$MOCK_DEFAULT4" ;;
+  '-6 route show default') cat "$MOCK_DEFAULT6" ;;
+  '-4 -o addr show scope global'|'-4 -o addr show dev eth0 scope global') cat "$MOCK_ADDR4" ;;
+  '-6 -o addr show scope global'|'-6 -o addr show dev eth0 scope global') cat "$MOCK_ADDR6" ;;
+  '-4 rule show') cat "$MOCK_RULE4" ;;
+  '-6 rule show') cat "$MOCK_RULE6" ;;
+  '-4 route show table 51888') cat "$MOCK_TABLE4" ;;
+  '-6 route show table 51889') cat "$MOCK_TABLE6" ;;
+  '-o link show') cat "$MOCK_LINKS" ;;
+  'link show dev ocm0') exit 1 ;;
+  '-4 route replace table 51888 '*)
+    shift 5
+    printf '%s\n' "$*" > "$MOCK_TABLE4"
+    printf '%s\n' 'ipv4-table-install' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-6 route replace table 51889 '*)
+    shift 5
+    printf '%s\n' "$*" > "$MOCK_TABLE6"
+    printf '%s\n' 'ipv6-table-install' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-4 rule add priority 10000 from 192.0.2.10/32 lookup 51888')
+    printf '%s\n' '10000: from 192.0.2.10 lookup 51888' >> "$MOCK_RULE4"
+    printf '%s\n' 'ipv4-rule-install' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-6 rule add priority 10001 from '*)
+    printf '%s\n' '10001: from 2001:db8::10 lookup 51889' >> "$MOCK_RULE6"
+    printf '%s\n' 'ipv6-rule-install' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-4 rule del priority 10000 lookup 51888'|'-4 rule del priority 10000 from 192.0.2.10/32 lookup 51888')
+    grep -Eq 'lookup 51888([[:space:]]|$)' "$MOCK_RULE4" || exit 2
+    delete_managed_rule "$MOCK_RULE4" 51888
+    printf '%s\n' 'ipv4-rule-remove' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-6 rule del priority 10001 lookup 51889'|'-6 rule del priority 10001 from '*' lookup 51889')
+    grep -Eq 'lookup 51889([[:space:]]|$)' "$MOCK_RULE6" || exit 2
+    delete_managed_rule "$MOCK_RULE6" 51889
+    printf '%s\n' 'ipv6-rule-remove' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-4 route flush table 51888')
+    : > "$MOCK_TABLE4"
+    printf '%s\n' 'ipv4-table-flush' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-6 route flush table 51889')
+    : > "$MOCK_TABLE6"
+    printf '%s\n' 'ipv6-table-flush' >> "$MOCK_IP_EFFECTS"
+    ;;
+  '-4 route get 1.1.1.1 from 192.0.2.10')
+    printf '%s\n' '1.1.1.1 from 192.0.2.10 via 192.0.2.1 dev eth0 src 192.0.2.10'
+    ;;
+  '-6 route get 2606:4700:4700::1111 from '*)
+    printf '%s\n' '2606:4700:4700::1111 from 2001:db8::10 via 2001:db8::1 dev eth0 src 2001:db8::10'
+    ;;
+  '-4 route get 1.1.1.1')
+    printf '%s\n' '1.1.1.1 dev ocm0 src 10.0.0.2'
+    ;;
+  'link del dev ocm0')
+    printf '%s\n' 'vpn-link-remove' >> "$MOCK_IP_EFFECTS"
+    ;;
+  *)
+    printf 'unexpected mock ip call: %s\n' "$*" >&2
+    exit 96
+    ;;
+esac
+MOCK_IP
+  cat > "${mock_bin}/flock" <<'MOCK_FLOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK_FLOCK
+  cat > "${mock_bin}/systemd-run" <<'MOCK_SYSTEMD_RUN'
+#!/usr/bin/env bash
+set -u
+{
+  for argument in "$@"; do printf '<%s>' "$argument"; done
+  printf '\n'
+} >> "$MOCK_SYSTEMD_RUN_LOG"
+printf '%s\n' 'arm-global-rollback' >> "$MOCK_SYSTEMD_RUN_EFFECTS"
+MOCK_SYSTEMD_RUN
+  cat > "${mock_bin}/date" <<'MOCK_DATE'
+#!/usr/bin/env bash
+[ "${1:-}" = +%s ] && { printf '%s\n' '2000000000'; exit 0; }
+exec /usr/bin/date "$@"
+MOCK_DATE
+  for command_name in logger ocproxy journalctl; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${mock_bin}/${command_name}"
+  done
+  chmod 0700 "${mock_bin}"/*
+}
+
+run_lifecycle_action() {
+  local version_root="$1" script_path="$2" action="$3" input_text="$4"
+  local output_root="${version_root}/output" stdout_file="${version_root}/output/${action}.stdout"
+  local stderr_file="${version_root}/output/${action}.stderr" rc_file="${version_root}/output/${action}.rc"
+
+  mkdir -p "$output_root"
+  set +e
+  printf '%s' "$input_text" | env \
+    PATH="${version_root}/mock-bin:/usr/bin:/bin" \
+    OCM_INSTALL_PATH="${version_root}/sbin/oc-master" \
+    OCM_SHORTCUT_PATH="${version_root}/bin/ocm" \
+    OCM_SYSTEMD_DIR="${version_root}/systemd" \
+    OCM_CONFIG_DIR="${version_root}/config" \
+    OCM_PROFILE_FILE="${version_root}/config/profile.conf" \
+    OCM_ACCOUNTS_FILE="${version_root}/accounts.env" \
+    OCM_RUNTIME_DIR="${version_root}/run" \
+    OCM_LOCK_FILE="${version_root}/lock/manager.lock" \
+    OCM_STATE_LOCK_FILE="${version_root}/lock/state.lock" \
+    OCM_SERVICE_LOCK_FILE="${version_root}/lock/service.lock" \
+    OCM_BOOT_ID_FILE="${version_root}/proc/boot_id" \
+    OCM_UUID_FILE="${version_root}/proc/uuid" \
+    OCM_PROC_ROOT="${version_root}/proc" \
+    OCM_DDNS_SCAN_ROOT="${version_root}/scan" \
+    MOCK_SYSTEMCTL_LOG="${version_root}/systemctl.log" \
+    MOCK_SYSTEMCTL_EFFECTS="${version_root}/systemctl.effects" \
+    MOCK_SYSTEMCTL_STATE="${version_root}/systemctl-state" \
+    MOCK_OPENCONNECT_ARGV="${version_root}/openconnect.argv" \
+    MOCK_OPENCONNECT_STDIN="${version_root}/openconnect.stdin" \
+    MOCK_OPENCONNECT_PID=4242 \
+    MOCK_PUBLIC_IPV4=198.51.100.77 \
+    MOCK_PUBLIC_IPV6=2001:db8::77 \
+    MOCK_IP_LOG="${version_root}/ip.log" \
+    MOCK_IP_EFFECTS="${version_root}/ip.effects" \
+    MOCK_DEFAULT4="${version_root}/network/default4" \
+    MOCK_DEFAULT6="${version_root}/network/default6" \
+    MOCK_ADDR4="${version_root}/network/addr4" \
+    MOCK_ADDR6="${version_root}/network/addr6" \
+    MOCK_RULE4="${version_root}/network/rule4" \
+    MOCK_RULE6="${version_root}/network/rule6" \
+    MOCK_TABLE4="${version_root}/network/table4" \
+    MOCK_TABLE6="${version_root}/network/table6" \
+    MOCK_LINKS="${version_root}/network/links" \
+    MOCK_SYSTEMD_RUN_LOG="${version_root}/systemd-run.log" \
+    MOCK_SYSTEMD_RUN_EFFECTS="${version_root}/systemd-run.effects" \
+    "$BASH" -c '
+      source "$1"
+      BASH_ARGV0="$1"
+      check_root() { :; }
+      # e03f2aa 把 unit 目录和 root ownership 写死；这里给两版共用同一安全
+      # 测试根安装 seam。真实 staged install/ownership 由 tests/install.sh 覆盖。
+      ensure_dirs() { mkdir -p -- "$CONFIG_DIR" "$RUNTIME_DIR" "${LOCK_FILE%/*}"; }
+      install_self_and_units() {
+        ensure_dirs
+        install -d -m 0755 "$(dirname "$INSTALL_PATH")" "$(dirname "$SHORTCUT_PATH")" "$OCM_SYSTEMD_DIR"
+        install -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH"
+        [ "$SHORTCUT_PATH" = "$INSTALL_PATH" ] || ln -sfn -- "$INSTALL_PATH" "$SHORTCUT_PATH"
+        {
+          printf "%s\n" "Description=OpenConnect Master managed tunnel"
+          printf "ExecStart=%s _service_run\n" "$INSTALL_PATH"
+          printf "ExecStopPost=-%s _service_cleanup\n" "$INSTALL_PATH"
+        } > "$OCM_SYSTEMD_DIR/$SERVICE_NAME"
+        {
+          printf "%s\n" "Description=OpenConnect Master data-plane health check"
+          printf "ExecStart=%s _service_health\n" "$INSTALL_PATH"
+        } > "$OCM_SYSTEMD_DIR/$HEALTH_SERVICE_NAME"
+        {
+          printf "%s\n" "Description=Run OpenConnect Master health checks"
+          printf "Unit=%s\n" "$HEALTH_SERVICE_NAME"
+        } > "$OCM_SYSTEMD_DIR/$HEALTH_TIMER_NAME"
+      }
+      if ! declare -p PROC_ROOT >/dev/null 2>&1; then
+        # baseline 无 OCM_PROC_ROOT seam，等价地用受管 service active 证明进程存在。
+        openconnect_process_is_alive() { systemctl is-active --quiet "$SERVICE_NAME"; }
+      fi
+      run_main "$2"
+    ' compat-lifecycle "$script_path" "$action" > "$stdout_file" 2> "$stderr_file"
+  rc=$?
+  set -e
+  printf '%s\n' "$rc" > "$rc_file"
+}
+
+initialize_lifecycle_root() {
+  local version_root="$1"
+
+  mkdir -p "$version_root" "$version_root/systemctl-state" "$version_root/proc/4242" \
+    "$version_root/lock" "$version_root/systemd" "$version_root/network" "$version_root/scan"
+  write_lifecycle_mocks "$version_root/mock-bin"
+  printf '%s\n' 'Compat account|compat-user|compat-secret-7Z!|vpn.example.test|compat-group|nc' > "$version_root/accounts.env"
+  printf '%s\n' '123e4567-e89b-42d3-a456-426614174011' > "$version_root/proc/uuid"
+  printf '%s\n' '123e4567-e89b-42d3-a456-426614174012' > "$version_root/proc/boot_id"
+  printf 'openconnect\n' > "$version_root/proc/4242/comm"
+  printf '0::/system.slice/oc-master.service\n' > "$version_root/proc/4242/cgroup"
+  printf '%s\n' 'default via 192.0.2.1 dev eth0 metric 100' > "$version_root/network/default4"
+  : > "$version_root/network/default6"
+  printf '%s\n' '2: eth0 inet 192.0.2.10/24 scope global eth0' > "$version_root/network/addr4"
+  : > "$version_root/network/addr6"
+  printf '%s\n' \
+    '0: from all lookup local' \
+    '32766: from all lookup main' \
+    '32767: from all lookup default' > "$version_root/network/rule4"
+  printf '%s\n' \
+    '0: from all lookup local' \
+    '32766: from all lookup main' > "$version_root/network/rule6"
+  : > "$version_root/network/table4"
+  : > "$version_root/network/table6"
+  printf '%s\n' '2: eth0: <BROADCAST,MULTICAST,UP> mtu 1500' > "$version_root/network/links"
+  : > "$version_root/systemctl.log"
+  : > "$version_root/systemctl.effects"
+  : > "$version_root/systemd-run.log"
+  : > "$version_root/systemd-run.effects"
+  : > "$version_root/ip.log"
+  : > "$version_root/ip.effects"
+}
+
+run_proxy_lifecycle() {
+  local script_path="$1" suffix="$2" version_root
+  local action action_script
+
+  version_root="${TEST_ROOT}/proxy-${suffix}"
+
+  initialize_lifecycle_root "$version_root"
+
+  run_lifecycle_action "$version_root" "$script_path" start-proxy $'1\n1080\n'
+  action_script="$version_root/sbin/oc-master"
+  [ -x "$action_script" ] || fail 'proxy start did not install its worker script'
+  for action in _service_run status stop; do
+    run_lifecycle_action "$version_root" "$action_script" "$action" ''
+  done
+  for action in start-proxy _service_run status stop; do
+    if [ "$(<"$version_root/output/${action}.rc")" -ne 0 ]; then
+      printf '%s\n' "--- proxy ${action} stdout (${suffix}) ---" >&2
+      cat -- "$version_root/output/${action}.stdout" >&2
+      printf '%s\n' "--- proxy ${action} stderr (${suffix}) ---" >&2
+      cat -- "$version_root/output/${action}.stderr" >&2
+    fi
+    assert_eq 0 "$(<"$version_root/output/${action}.rc")" "proxy ${action} failed for variant ${suffix}"
+  done
+}
+
+normalize_lifecycle_file() {
+  local input_file="$1" output_file="$2" case_root="$3" script_path="$4" output
+
+  output="$(cat -- "$input_file"; printf '\001')"
+  output="${output%$'\001'}"
+  output="${output//"$script_path"/<SOURCE_SCRIPT>}"
+  output="${output//"$case_root"/<CASE_ROOT>}"
+  output="${output//"$TEST_ROOT"/<TEST_ROOT>}"
+  printf '%s' "$output" > "$output_file"
+}
+
+lifecycle_files_match() {
+  local baseline_file="$1" current_file="$2" baseline_root="$3" current_root="$4"
+  local current_script_path="${5:-$CURRENT_SCRIPT}"
+  local baseline_normalized="${TEST_ROOT}/compare-baseline" current_normalized="${TEST_ROOT}/compare-current"
+
+  normalize_lifecycle_file "$baseline_file" "$baseline_normalized" "$baseline_root" "$BASELINE_SCRIPT"
+  normalize_lifecycle_file "$current_file" "$current_normalized" "$current_root" "$current_script_path"
+  cmp -s -- "$baseline_normalized" "$current_normalized"
+}
+
+compare_proxy_lifecycle() {
+  local action artifact baseline_file current_file
+
+  for action in start-proxy _service_run status stop; do
+    for artifact in stdout stderr rc; do
+      baseline_file="${TEST_ROOT}/proxy-31/output/${action}.${artifact}"
+      current_file="${TEST_ROOT}/proxy-32/output/${action}.${artifact}"
+      if ! lifecycle_files_match "$baseline_file" "$current_file" \
+        "${TEST_ROOT}/proxy-31" "${TEST_ROOT}/proxy-32"; then
+        diff -u --label "baseline proxy ${action}.${artifact}" --label "current proxy ${action}.${artifact}" \
+          "${TEST_ROOT}/compare-baseline" "${TEST_ROOT}/compare-current" >&2 || true
+        fail "proxy ${action}.${artifact} changed"
+      fi
+    done
+  done
+  for artifact in openconnect.argv openconnect.stdin systemctl.effects systemd-run.effects ip.effects \
+    accounts.env config/profile.conf; do
+    baseline_file="${TEST_ROOT}/proxy-31/${artifact}"
+    current_file="${TEST_ROOT}/proxy-32/${artifact}"
+    if ! lifecycle_files_match "$baseline_file" "$current_file" \
+      "${TEST_ROOT}/proxy-31" "${TEST_ROOT}/proxy-32"; then
+      diff -u --label "baseline proxy ${artifact}" --label "current proxy ${artifact}" \
+        "${TEST_ROOT}/compare-baseline" "${TEST_ROOT}/compare-current" >&2 || true
+      fail "proxy ${artifact} changed"
+    fi
+  done
+}
+
+self_test_lifecycle_comparator() {
+  local original="${TEST_ROOT}/proxy-32/openconnect.argv"
+  local mutated="${TEST_ROOT}/proxy-32/openconnect.mutated.argv"
+
+  sed 's/--reconnect-timeout=86400/--reconnect-timeout=1/' "$original" > "$mutated"
+  cmp -s -- "$original" "$mutated" && fail 'lifecycle comparator mutation fixture did not change argv'
+  if lifecycle_files_match "${TEST_ROOT}/proxy-31/openconnect.argv" "$mutated" \
+    "${TEST_ROOT}/proxy-31" "${TEST_ROOT}/proxy-32"; then
+    fail 'lifecycle comparator accepted a changed OpenConnect argument'
+  fi
+  printf 'lifecycle comparator mutation self-test passed\n'
+}
+
+run_global_lifecycle() {
+  local script_path="$1" suffix="$2" version_root action action_script
+
+  version_root="${TEST_ROOT}/global-${suffix}"
+  initialize_lifecycle_root "$version_root"
+
+  run_lifecycle_action "$version_root" "$script_path" start-global $'1\nGLOBAL\nKEEP\n'
+  action_script="$version_root/sbin/oc-master"
+  [ -x "$action_script" ] || fail 'global start did not install its worker script'
+  for action in _service_run status stop; do
+    run_lifecycle_action "$version_root" "$action_script" "$action" ''
+  done
+  for action in start-global _service_run status stop; do
+    if [ "$(<"$version_root/output/${action}.rc")" -ne 0 ]; then
+      printf '%s\n' "--- global ${action} stdout (${suffix}) ---" >&2
+      cat -- "$version_root/output/${action}.stdout" >&2
+      printf '%s\n' "--- global ${action} stderr (${suffix}) ---" >&2
+      cat -- "$version_root/output/${action}.stderr" >&2
+    fi
+    assert_eq 0 "$(<"$version_root/output/${action}.rc")" "global ${action} failed for variant ${suffix}"
+  done
+}
+
+compare_global_lifecycle() {
+  local action artifact baseline_file current_file
+  local baseline_root="${TEST_ROOT}/global-41" current_root="${TEST_ROOT}/global-42"
+
+  for action in start-global _service_run status stop; do
+    for artifact in stdout stderr rc; do
+      baseline_file="${baseline_root}/output/${action}.${artifact}"
+      current_file="${current_root}/output/${action}.${artifact}"
+      if ! lifecycle_files_match "$baseline_file" "$current_file" "$baseline_root" "$current_root"; then
+        diff -u --label "baseline global ${action}.${artifact}" --label "current global ${action}.${artifact}" \
+          "${TEST_ROOT}/compare-baseline" "${TEST_ROOT}/compare-current" >&2 || true
+        fail "global ${action}.${artifact} changed"
+      fi
+    done
+  done
+  # 新控制面会增加只读的归属/CAS 证明，因此保留完整调用日志用于审计，
+  # 对真正改变服务或网络状态的 effect transcript 做严格等价比较。
+  for artifact in openconnect.argv openconnect.stdin systemctl.effects systemd-run.effects ip.effects \
+    accounts.env config/profile.conf; do
+    baseline_file="${baseline_root}/${artifact}"
+    current_file="${current_root}/${artifact}"
+    if ! lifecycle_files_match "$baseline_file" "$current_file" "$baseline_root" "$current_root"; then
+      diff -u --label "baseline global ${artifact}" --label "current global ${artifact}" \
+        "${TEST_ROOT}/compare-baseline" "${TEST_ROOT}/compare-current" >&2 || true
+      fail "global ${artifact} changed"
+    fi
+  done
+
+  [ -s "${baseline_root}/systemctl.log" ] && [ -s "${current_root}/systemctl.log" ] \
+    || fail 'global systemctl read transcript was not captured'
+  [ -s "${baseline_root}/ip.log" ] && [ -s "${current_root}/ip.log" ] \
+    || fail 'global ip read transcript was not captured'
+  [ -s "${baseline_root}/systemd-run.log" ] && [ -s "${current_root}/systemd-run.log" ] \
+    || fail 'global rollback transcript was not captured'
+}
+
+assert_rollback_transcript_contract() {
+  local baseline_root="${TEST_ROOT}/global-41" current_root="${TEST_ROOT}/global-42"
+  local baseline_expected current_expected
+
+  baseline_expected="<--quiet><--unit=oc-master-rollback><--on-active=3m><--><${baseline_root}/sbin/oc-master><_rollback>"
+  current_expected="<--quiet><--unit=oc-master-rollback><--on-active=3m><--><${current_root}/sbin/oc-master><_rollback><123e4567-e89b-42d3-a456-426614174011>"
+  assert_eq 1 "$(wc -l < "${baseline_root}/systemd-run.log" | tr -d ' ')" \
+    'baseline armed rollback more than once'
+  assert_eq 1 "$(wc -l < "${current_root}/systemd-run.log" | tr -d ' ')" \
+    'current armed rollback more than once'
+  grep -Fx -- "$baseline_expected" "${baseline_root}/systemd-run.log" >/dev/null \
+    || fail 'baseline rollback argv changed'
+  grep -Fx -- "$current_expected" "${current_root}/systemd-run.log" >/dev/null \
+    || fail 'current rollback argv differs beyond its required generation UUID'
+}
+
+assert_secret_boundary() {
+  local root="$1" candidate
+
+  assert_eq 'compat-secret-7Z!' "$(<"$root/openconnect.stdin")" \
+    "OpenConnect password stdin changed for ${root##*/}"
+  for candidate in "$root"/output/*.stdout "$root"/output/*.stderr \
+    "$root/openconnect.argv" "$root/systemctl.log" "$root/systemctl.effects" \
+    "$root/systemd-run.log" "$root/systemd-run.effects" "$root/ip.log" "$root/ip.effects"; do
+    if grep -F 'compat-secret-7Z!' "$candidate" >/dev/null; then
+      fail "password leaked outside OpenConnect stdin: $candidate"
+    fi
+  done
+}
+
 compare_case 'unknown-command' 'unknown-command' ''
 compare_case 'status-without-profile' 'status' ''
 compare_case 'main-menu-exit' '' $'0\n'
 compare_case 'start-proxy-without-account' 'start-proxy' ''
 compare_case 'accounts-menu-exit-without-account' 'accounts' $'0\n'
+
+run_proxy_lifecycle "$BASELINE_SCRIPT" 31
+run_proxy_lifecycle "$CURRENT_SCRIPT" 32
+compare_proxy_lifecycle
+self_test_lifecycle_comparator
+
+run_global_lifecycle "$BASELINE_SCRIPT" 41
+run_global_lifecycle "$CURRENT_SCRIPT" 42
+compare_global_lifecycle
+assert_rollback_transcript_contract
+assert_secret_boundary "${TEST_ROOT}/proxy-31"
+assert_secret_boundary "${TEST_ROOT}/proxy-32"
+assert_secret_boundary "${TEST_ROOT}/global-41"
+assert_secret_boundary "${TEST_ROOT}/global-42"
 
 grep -F 'start-proxy|start-global|stop|accounts|deps|install|uninstall|status|check|logs' "$CURRENT_SCRIPT" >/dev/null \
   || fail 'public command set changed'

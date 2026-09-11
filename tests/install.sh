@@ -23,7 +23,7 @@ ensure_dirs() {
 }
 
 systemctl() {
-  local action="${1:-}" unit=""
+  local action="${1:-}" unit="" property="" source_case="${MOCK_SOURCE_CASE:-owned}"
   shift || true
   case "$action" in
     is-active)
@@ -37,25 +37,59 @@ systemctl() {
       return 3
       ;;
     daemon-reload)
+      printf '%s\n' daemon-reload >> "${MOCK_SYSTEMCTL_MUTATIONS:-/dev/null}"
       [ "${MOCK_DAEMON_RELOAD_FAIL:-0}" != 1 ]
       ;;
     show)
       unit="${1:-}"
       shift || true
-      if [[ " $* " == *LoadState* ]]; then
-        printf '%s\n' "${MOCK_LOAD_STATE:-loaded}"
+      if [[ " $* " != *' --value '* ]] && [[ " $* " == *' --property=ExecStart '* ]]; then
+        [ "${MOCK_SHOW_FAIL:-0}" != 1 ] || return 1
+        case "$unit" in
+          "$SERVICE_NAME")
+            printf '%s\n' \
+              "ExecStart={ path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} ${MOCK_MAIN_START_ACTION:-_service_run} ; }" \
+              "ExecStopPost={ path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} ${MOCK_MAIN_STOP_ACTION:-_service_cleanup} ; }" \
+              "Restart=${MOCK_MAIN_RESTART:-always}" \
+              "RestartPreventExitStatus=${MOCK_MAIN_RESTART_PREVENT:-78}"
+            ;;
+          "$HEALTH_SERVICE_NAME") printf 'ExecStart={ path=%s ; argv[]=%s %s ; }\n' "$INSTALL_PATH" "$INSTALL_PATH" "${MOCK_HEALTH_ACTION:-_service_health}" ;;
+          *) return 1 ;;
+        esac
         return 0
       fi
+      case " $* " in
+        *' --property=LoadState --value '*) property=LoadState ;;
+        *' --property=FragmentPath --value '*) property=FragmentPath ;;
+        *' --property=ExecStart --value '*) property=ExecStart ;;
+        *' --property=ExecStopPost --value '*) property=ExecStopPost ;;
+        *' --property=Restart --value '*) property=Restart ;;
+        *' --property=RestartPreventExitStatus --value '*) property=RestartPreventExitStatus ;;
+        *' --property=Triggers --value '*) property=Triggers ;;
+      esac
+      if [ "$unit" = "${MOCK_SOURCE_UNIT:-}" ]; then
+        case "$source_case:$property" in
+          query-fail:LoadState|fragment-query-fail:FragmentPath) return 1 ;;
+          not-found:LoadState) printf '%s\n' not-found; return 0 ;;
+          masked:LoadState) printf '%s\n' masked; return 0 ;;
+          empty-load:LoadState) printf '\n'; return 0 ;;
+          external:FragmentPath) printf '/etc/systemd/system/%s\n' "$unit"; return 0 ;;
+          empty-fragment:FragmentPath) printf '\n'; return 0 ;;
+        esac
+      fi
+      case "$property" in
+        LoadState) printf '%s\n' "${MOCK_LOAD_STATE:-loaded}"; return 0 ;;
+        FragmentPath) unit_path "$unit"; return 0 ;;
+      esac
       [ "${MOCK_SHOW_FAIL:-0}" != 1 ] || return 1
-      case "$unit" in
-        "$SERVICE_NAME")
-          printf '%s\n' \
-            "ExecStart={ path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _service_run ; }" \
-            "ExecStopPost={ path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _service_cleanup ; }" \
-            'Restart=always' \
-            'RestartPreventExitStatus=78'
-          ;;
-        "$HEALTH_SERVICE_NAME") printf 'ExecStart={ path=%s ; argv[]=%s _service_health ; }\n' "$INSTALL_PATH" "$INSTALL_PATH" ;;
+      case "$unit:$property" in
+        "$SERVICE_NAME:ExecStart") printf 'path=%s ; argv[]=%s %s ; ignore_errors=no\n' "$INSTALL_PATH" "$INSTALL_PATH" "${MOCK_MAIN_START_ACTION:-_service_run}" ;;
+        "$SERVICE_NAME:ExecStopPost") printf 'path=%s ; argv[]=%s %s ; ignore_errors=yes\n' "$INSTALL_PATH" "$INSTALL_PATH" "${MOCK_MAIN_STOP_ACTION:-_service_cleanup}" ;;
+        "$SERVICE_NAME:Restart") printf '%s\n' "${MOCK_MAIN_RESTART:-always}" ;;
+        "$SERVICE_NAME:RestartPreventExitStatus") printf '%s\n' "${MOCK_MAIN_RESTART_PREVENT:-78}" ;;
+        "$HEALTH_SERVICE_NAME:ExecStart") printf 'path=%s ; argv[]=%s %s ; ignore_errors=no\n' "$INSTALL_PATH" "$INSTALL_PATH" "${MOCK_HEALTH_ACTION:-_service_health}" ;;
+        "$HEALTH_TIMER_NAME:Triggers") printf '%s\n' "${MOCK_TIMER_TRIGGERS:-$HEALTH_SERVICE_NAME}" ;;
+        *) return 1 ;;
       esac
       ;;
     *) return 0 ;;
@@ -142,6 +176,67 @@ done
 MOCK_MAIN_STATE=unknown
 MOCK_LOAD_STATE=not-found
 service_state_allows_install || fail 'install rejected an absent main unit'
+MOCK_LOAD_STATE=loaded
+
+# Install preflight must validate systemd's currently loaded source, not only
+# the bytes found at /etc/systemd/system.  Every rejection happens before even
+# the first staging function is entered; strict not-found remains installable.
+seed_legacy_units
+for source_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  for source_case in external query-fail fragment-query-fail empty-fragment masked empty-load; do
+    preflight_stage_marker="${TEST_ROOT}/preflight-${source_unit}-${source_case}.stage"
+    if (
+      MOCK_SOURCE_UNIT="$source_unit"
+      MOCK_SOURCE_CASE="$source_case"
+      stage_managed_program() { : > "$preflight_stage_marker"; return 1; }
+      install_self_and_units >/dev/null 2>&1
+    ); then
+      fail "install accepted $source_case source evidence for $source_unit"
+    fi
+    [ ! -e "$preflight_stage_marker" ] \
+      || fail "install staged files before rejecting $source_case source evidence for $source_unit"
+  done
+  if ! (
+    MOCK_SOURCE_UNIT="$source_unit"
+    MOCK_SOURCE_CASE=not-found
+    preflight_install_targets >/dev/null 2>&1
+  ); then
+    fail "install preflight rejected strict not-found for $source_unit"
+  fi
+done
+unset MOCK_SOURCE_UNIT MOCK_SOURCE_CASE
+rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")"
+printf 'install source preflight tests passed\n'
+
+# Post-reload verification must bind all three loaded units to the exact
+# managed path and validate the full service/timer execution contract.
+seed_legacy_units
+for source_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  for source_case in external query-fail fragment-query-fail empty-fragment not-found; do
+    if (
+      MOCK_SOURCE_UNIT="$source_unit"
+      MOCK_SOURCE_CASE="$source_case"
+      verify_installed_units >/dev/null 2>&1
+    ); then
+      fail "post-reload verification accepted $source_case source evidence for $source_unit"
+    fi
+  done
+done
+if (MOCK_MAIN_START_ACTION='_service_run --foreign'; verify_installed_units >/dev/null 2>&1); then
+  fail 'post-reload verification accepted extra main ExecStart arguments'
+fi
+if (MOCK_MAIN_STOP_ACTION='_service_cleanup --foreign'; verify_installed_units >/dev/null 2>&1); then
+  fail 'post-reload verification accepted extra main ExecStopPost arguments'
+fi
+if (MOCK_HEALTH_ACTION='_service_health --foreign'; verify_installed_units >/dev/null 2>&1); then
+  fail 'post-reload verification accepted extra health ExecStart arguments'
+fi
+if (MOCK_TIMER_TRIGGERS='foreign-health.service'; verify_installed_units >/dev/null 2>&1); then
+  fail 'post-reload verification accepted a foreign timer trigger'
+fi
+verify_installed_units || fail 'post-reload verification rejected the exact managed contract'
+rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")"
+printf 'installed unit source and contract tests passed\n'
 
 # A foreign shortcut must abort before the installer changes the program or
 # creates any unit file.

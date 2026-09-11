@@ -183,17 +183,6 @@ fi
 [ ! -e "$MOCK_MARKERLESS_CLEANUP_CALLS" ] \
   || fail "markerless service cleanup touched return routes"
 
-MOCK_SYSTEMCTL_CALLS="${TEST_ROOT}/systemctl.calls"
-systemctl() {
-  printf '%s\n' "$*" >> "$MOCK_SYSTEMCTL_CALLS"
-  [ "$*" != "start $SERVICE_NAME" ]
-}
-if start_managed_units; then
-  fail "systemd start-chain failure was not propagated"
-fi
-[ "$(wc -l < "$MOCK_SYSTEMCTL_CALLS" | tr -d ' ')" = '3' ] || fail "systemd chain continued after a failed service start"
-unset -f systemctl
-
 mkdir -p -- "$SYSTEMD_DIR"
 for owned_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
   printf '%s\n' '# Managed by oc-master' > "$(unit_path "$owned_unit")"
@@ -207,9 +196,35 @@ mock_owned_unit_source_query() {
   case "$3" in
     --property=LoadState) printf '%s\n' loaded ;;
     --property=FragmentPath) unit_path "$2" ;;
+    --property=ExecStart)
+      case "$2" in
+        "$SERVICE_NAME") printf 'path=%s ; argv[]=%s _service_run ; ignore_errors=no\n' "$INSTALL_PATH" "$INSTALL_PATH" ;;
+        "$HEALTH_SERVICE_NAME") printf 'path=%s ; argv[]=%s _service_health ; ignore_errors=no\n' "$INSTALL_PATH" "$INSTALL_PATH" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    --property=ExecStopPost)
+      [ "$2" = "$SERVICE_NAME" ] || return 1
+      printf 'path=%s ; argv[]=%s _service_cleanup ; ignore_errors=yes\n' "$INSTALL_PATH" "$INSTALL_PATH"
+      ;;
+    --property=Restart) [ "$2" = "$SERVICE_NAME" ] && printf '%s\n' always ;;
+    --property=RestartPreventExitStatus) [ "$2" = "$SERVICE_NAME" ] && printf '%s\n' 78 ;;
+    --property=Triggers) [ "$2" = "$HEALTH_TIMER_NAME" ] && printf '%s\n' "$HEALTH_SERVICE_NAME" ;;
     *) return 1 ;;
   esac
 }
+
+MOCK_SYSTEMCTL_CALLS="${TEST_ROOT}/systemctl.calls"
+systemctl() {
+  if [ "$1" = show ]; then mock_owned_unit_source_query "$@"; return; fi
+  printf '%s\n' "$*" >> "$MOCK_SYSTEMCTL_CALLS"
+  [ "$*" != "start $SERVICE_NAME" ]
+}
+if start_managed_units; then
+  fail "systemd start-chain failure was not propagated"
+fi
+[ "$(wc -l < "$MOCK_SYSTEMCTL_CALLS" | tr -d ' ')" = '3' ] || fail "systemd chain continued after a failed service start"
+unset -f systemctl
 
 if ! (
   MOCK_PREPARE_MAIN_STATE='activating'
