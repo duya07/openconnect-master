@@ -2521,20 +2521,108 @@ service_health() {
   return "$restart_claim_rc"
 }
 
+rollback_unit_probe() {
+  [ "$#" -eq 2 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" unit="$2"
+  local load_state transient fragment_path contract_value
+
+  case "$unit" in
+    "${ROLLBACK_UNIT}.timer"|"${ROLLBACK_UNIT}.service") ;;
+    *) return 1 ;;
+  esac
+  if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)"; then
+    return 1
+  fi
+  case "$load_state" in
+    not-found) return 3 ;;
+    loaded) ;;
+    *) return 1 ;;
+  esac
+  if ! transient="$(systemctl show "$unit" --property=Transient --value 2>/dev/null)" \
+    || [ "$transient" != yes ]; then
+    return 1
+  fi
+  if ! fragment_path="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null)" \
+    || [ "$fragment_path" != "/run/systemd/transient/${unit}" ]; then
+    return 1
+  fi
+
+  case "$unit" in
+    "${ROLLBACK_UNIT}.service")
+      contract_value="$(systemctl show "$unit" --property=ExecStart --value 2>/dev/null)" \
+        || return 1
+      systemd_exec_value_matches "$contract_value" "$INSTALL_PATH" \
+        "${INSTALL_PATH} _rollback ${expected_run_id}" no
+      ;;
+    "${ROLLBACK_UNIT}.timer")
+      contract_value="$(systemctl show "$unit" --property=Triggers --value 2>/dev/null)" \
+        || return 1
+      [ "$contract_value" = "${ROLLBACK_UNIT}.service" ]
+      ;;
+  esac
+}
+
+rollback_unit_is_inactive_or_absent() {
+  [ "$#" -eq 2 ] || return 1
+  local expected_run_id="$1" unit="$2" probe_status active_state
+
+  if rollback_unit_probe "$expected_run_id" "$unit"; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+  [ "$probe_status" -ne 3 ] || return 0
+  [ "$probe_status" -eq 0 ] || return 1
+  active_state="$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null)" \
+    || return 1
+  [ "$active_state" = inactive ]
+}
+
+rollback_pair_is_owned() {
+  [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
+  local expected_run_id="$1" timer_status service_status
+
+  if rollback_unit_probe "$expected_run_id" "${ROLLBACK_UNIT}.timer"; then
+    timer_status=0
+  else
+    timer_status=$?
+  fi
+  if rollback_unit_probe "$expected_run_id" "${ROLLBACK_UNIT}.service"; then
+    service_status=0
+  else
+    service_status=$?
+  fi
+  [ "$timer_status" -eq 0 ] && [ "$service_status" -eq 0 ]
+}
+
 cancel_rollback() {
   [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
-  local expected_run_id="$1" unit state failed=0
+  local expected_run_id="$1" timer_status service_status
 
   state_matches_run "$expected_run_id" || return 1
-  systemctl stop "${ROLLBACK_UNIT}.timer" "${ROLLBACK_UNIT}.service" 2>/dev/null || true
-  systemctl reset-failed "${ROLLBACK_UNIT}.service" 2>/dev/null || true
-  for unit in "${ROLLBACK_UNIT}.timer" "${ROLLBACK_UNIT}.service"; do
-    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
-    case "$state" in
-      active|activating|reloading|deactivating|failed) failed=1 ;;
-    esac
-  done
-  return "$failed"
+  if rollback_unit_probe "$expected_run_id" "${ROLLBACK_UNIT}.timer"; then
+    timer_status=0
+  else
+    timer_status=$?
+  fi
+  if rollback_unit_probe "$expected_run_id" "${ROLLBACK_UNIT}.service"; then
+    service_status=0
+  else
+    service_status=$?
+  fi
+  case "$timer_status" in 0|3) ;; *) return 1 ;; esac
+  case "$service_status" in 0|3) ;; *) return 1 ;; esac
+
+  if [ "$timer_status" -eq 0 ]; then
+    systemctl stop "${ROLLBACK_UNIT}.timer" >/dev/null 2>&1 || true
+  fi
+  if [ "$service_status" -eq 0 ]; then
+    systemctl stop "${ROLLBACK_UNIT}.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "${ROLLBACK_UNIT}.service" >/dev/null 2>&1 || true
+  fi
+
+  rollback_unit_is_inactive_or_absent "$expected_run_id" "${ROLLBACK_UNIT}.timer" \
+    && rollback_unit_is_inactive_or_absent "$expected_run_id" "${ROLLBACK_UNIT}.service"
 }
 
 stop_and_disable_managed_units() {
@@ -2696,6 +2784,7 @@ arm_rollback() {
   cancel_rollback "$expected_run_id" || return 1
   systemd-run --quiet --unit="$ROLLBACK_UNIT" --on-active=3m -- \
     "$INSTALL_PATH" _rollback "$expected_run_id" || return 1
+  rollback_pair_is_owned "$expected_run_id" || return 1
   log_warn "已武装独立回滚：3 分钟内未确认，将停止并禁用全局 VPN。"
 }
 
