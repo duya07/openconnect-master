@@ -27,6 +27,27 @@ fail() {
   exit 1
 }
 
+# systemd 252 renders Exec* values as a braced record with runtime PID/result
+# fields.  The parser must accept one exact command record while rejecting any
+# argument or record multiplicity that could change the executed command.
+SYSTEMD252_MAIN_EXEC="{ path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _service_run ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+systemd_exec_value_matches "$SYSTEMD252_MAIN_EXEC" "$INSTALL_PATH" \
+  "${INSTALL_PATH} _service_run" no \
+  || fail 'systemd 252 ExecStart fixture was rejected'
+
+for rejected_exec in \
+  "{ path=${INSTALL_PATH} ; argv[]=${INSTALL_PATH} _service_run --foreign ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }" \
+  "${SYSTEMD252_MAIN_EXEC} ${SYSTEMD252_MAIN_EXEC}" \
+  "${SYSTEMD252_MAIN_EXEC} path=${INSTALL_PATH}" \
+  "${SYSTEMD252_MAIN_EXEC} argv[]=${INSTALL_PATH} _service_run" \
+  "${SYSTEMD252_MAIN_EXEC} ignore_errors=no"; do
+  if systemd_exec_value_matches "$rejected_exec" "$INSTALL_PATH" \
+    "${INSTALL_PATH} _service_run" no; then
+    fail 'systemd Exec parser accepted extra argv, multiple records, or repeated fields'
+  fi
+done
+printf 'systemd 252 Exec fixture checks passed\n'
+
 parse_account_line 'valid|user|password|https://vpn.example.test||nc' || fail "valid account was rejected"
 if parse_account_line 'invalid|user|password|--help||nc' >/dev/null 2>&1; then
   fail "option-like VPN host was accepted"
@@ -185,9 +206,14 @@ fi
 
 mkdir -p -- "$SYSTEMD_DIR"
 for owned_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
-  printf '%s\n' '# Managed by oc-master' > "$(unit_path "$owned_unit")"
+  write_unit_file "$owned_unit" "$(unit_path "$owned_unit")" \
+    || fail "could not seed current unit: $owned_unit"
 done
 mock_owned_unit_source_query() {
+  if [ "$#" -eq 4 ] && [ "$1" = show ] && [ "$3" = --all ] && [ "$4" = --property=DropInPaths ]; then
+    printf 'DropInPaths=\n'
+    return 0
+  fi
   [ "$#" -eq 4 ] && [ "$1" = show ] && [ "$4" = --value ] || return 1
   case "$2" in
     "$SERVICE_NAME"|"$HEALTH_SERVICE_NAME"|"$HEALTH_TIMER_NAME") ;;
@@ -210,6 +236,7 @@ mock_owned_unit_source_query() {
     --property=Restart) [ "$2" = "$SERVICE_NAME" ] && printf '%s\n' always ;;
     --property=RestartPreventExitStatus) [ "$2" = "$SERVICE_NAME" ] && printf '%s\n' 78 ;;
     --property=Triggers) [ "$2" = "$HEALTH_TIMER_NAME" ] && printf '%s\n' "$HEALTH_SERVICE_NAME" ;;
+    --property=NeedDaemonReload) printf '%s\n' no ;;
     *) return 1 ;;
   esac
 }

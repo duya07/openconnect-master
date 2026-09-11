@@ -953,6 +953,8 @@ unit_is_ours() {
   [ "$#" -eq 2 ] || return 1
   local file="$1" kind="$2"
 
+  # 这里仅判定可迁移/可清理的历史所有权；启动和健康重启必须另行
+  # 通过 current 模板及 systemd 已加载契约的完整校验。
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   head -n 1 -- "$file" 2>/dev/null | grep -Fx '# Managed by oc-master' >/dev/null && return 0
   case "$kind" in
@@ -973,9 +975,9 @@ unit_is_ours() {
   esac
 }
 
-managed_unit_has_exact_source() {
+managed_unit_has_owned_source() {
   [ "$#" -eq 1 ] || return 1
-  local unit="$1" path load_state fragment_path
+  local unit="$1" path load_state fragment_path dropin_paths
 
   path="$(unit_path "$unit")" || return 1
   if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
@@ -986,7 +988,20 @@ managed_unit_has_exact_source() {
     || [ "$fragment_path" != "$path" ]; then
     return 1
   fi
+  if ! dropin_paths="$(systemctl show "$unit" --all --property=DropInPaths 2>/dev/null)" \
+    || [ "$dropin_paths" != 'DropInPaths=' ]; then
+    return 1
+  fi
   unit_is_ours "$path" "$unit"
+}
+
+managed_unit_file_is_current() {
+  [ "$#" -eq 1 ] || return 1
+  local unit="$1" path
+
+  path="$(unit_path "$unit")" || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  render_unit_file "$unit" | cmp -s -- "$path" -
 }
 
 systemd_exec_value_matches() {
@@ -1044,18 +1059,32 @@ managed_health_timer_contract_is_exact() {
   [ "$triggers" = "$HEALTH_SERVICE_NAME" ]
 }
 
+managed_unit_is_current() {
+  [ "$#" -eq 1 ] || return 1
+  local unit="$1" needs_reload
+
+  managed_unit_has_owned_source "$unit" \
+    && managed_unit_file_is_current "$unit" \
+    || return 1
+  needs_reload="$(systemctl show "$unit" --property=NeedDaemonReload --value 2>/dev/null)" \
+    || return 1
+  [ "$needs_reload" = no ] || return 1
+  case "$unit" in
+    "$SERVICE_NAME") managed_main_unit_contract_is_exact ;;
+    "$HEALTH_SERVICE_NAME") managed_health_unit_contract_is_exact ;;
+    "$HEALTH_TIMER_NAME") managed_health_timer_contract_is_exact ;;
+    *) return 1 ;;
+  esac
+}
+
 managed_main_unit_is_exact() {
-  managed_unit_has_exact_source "$SERVICE_NAME" \
-    && managed_main_unit_contract_is_exact
+  managed_unit_is_current "$SERVICE_NAME"
 }
 
 verify_installed_units() {
-  managed_unit_has_exact_source "$SERVICE_NAME" \
-    && managed_unit_has_exact_source "$HEALTH_SERVICE_NAME" \
-    && managed_unit_has_exact_source "$HEALTH_TIMER_NAME" \
-    && managed_main_unit_contract_is_exact \
-    && managed_health_unit_contract_is_exact \
-    && managed_health_timer_contract_is_exact
+  managed_unit_is_current "$SERVICE_NAME" \
+    && managed_unit_is_current "$HEALTH_SERVICE_NAME" \
+    && managed_unit_is_current "$HEALTH_TIMER_NAME"
 }
 
 preflight_managed_units_ownership() {
@@ -1074,7 +1103,7 @@ preflight_managed_units_ownership() {
     case "$load_state" in
       not-found) continue ;;
       loaded)
-        if ! managed_unit_has_exact_source "$unit"; then
+        if ! managed_unit_has_owned_source "$unit"; then
           die "systemd 单元 $unit 的实际来源不属于 oc-master；拒绝停止或禁用。"
           return 1
         fi
@@ -1223,12 +1252,12 @@ service_state_allows_install() {
   return 1
 }
 
-write_unit_file() {
-  [ "$#" -eq 2 ] || return 1
-  local unit="$1" temporary="$2"
+render_unit_file() {
+  [ "$#" -eq 1 ] || return 1
+  local unit="$1"
   case "$unit" in
     "$SERVICE_NAME")
-      if ! cat > "$temporary" <<EOF
+      cat <<EOF
 # Managed by oc-master
 [Unit]
 Description=OpenConnect Master managed tunnel
@@ -1252,12 +1281,9 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-      then
-        return 1
-      fi
       ;;
     "$HEALTH_SERVICE_NAME")
-      if ! cat > "$temporary" <<EOF
+      cat <<EOF
 # Managed by oc-master
 [Unit]
 Description=OpenConnect Master data-plane health check
@@ -1268,12 +1294,9 @@ Type=oneshot
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${INSTALL_PATH} _service_health
 EOF
-      then
-        return 1
-      fi
       ;;
     "$HEALTH_TIMER_NAME")
-      if ! cat > "$temporary" <<EOF
+      cat <<EOF
 # Managed by oc-master
 [Unit]
 Description=Run OpenConnect Master health checks
@@ -1287,12 +1310,18 @@ Unit=${HEALTH_SERVICE_NAME}
 [Install]
 WantedBy=timers.target
 EOF
-      then
-        return 1
-      fi
       ;;
     *) return 1 ;;
   esac
+}
+
+write_unit_file() {
+  [ "$#" -eq 2 ] || return 1
+  local unit="$1" temporary="$2"
+
+  if ! render_unit_file "$unit" > "$temporary"; then
+    return 1
+  fi
   chmod 0644 -- "$temporary" && [ -r "$temporary" ]
 }
 
@@ -1308,6 +1337,20 @@ stage_unit_file() {
     return 1
   fi
   printf '%s\n' "$temporary"
+}
+
+cleanup_install_stages() {
+  local temporary failed=0
+
+  for temporary in "$@"; do
+    [ -n "$temporary" ] || continue
+    if { [ -e "$temporary" ] || [ -L "$temporary" ]; } && ! rm -f -- "$temporary"; then
+      log_err "安装暂存清理失败，保留文件：$temporary"
+      failed=1
+    fi
+  done
+  [ "$failed" -eq 0 ] || log_err "安装事务暂存失败；已保留可诊断文件。"
+  return "$failed"
 }
 
 restore_install_transaction() {
@@ -1382,14 +1425,7 @@ install_self_and_units() {
   INSTALL_TX_STAGES+=( "$stage" )
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     if ! stage="$(stage_unit_file "$unit")"; then
-      local cleanup_failed=0
-      for target in "${INSTALL_TX_STAGES[@]}"; do
-        if { [ -e "$target" ] || [ -L "$target" ]; } && ! rm -f -- "$target"; then
-          log_err "安装暂存清理失败，保留文件：$target"
-          cleanup_failed=1
-        fi
-      done
-      [ "$cleanup_failed" -eq 0 ] || log_err "安装事务暂存失败；已保留可诊断文件。"
+      cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
       return 1
     fi
     INSTALL_TX_STAGES+=( "$stage" )
@@ -1397,17 +1433,14 @@ install_self_and_units() {
   if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && ! shortcut_is_ours; then
     INSTALL_TX_TARGETS+=( "$SHORTCUT_PATH" )
     if ! stage="$(stage_shortcut)"; then
-      local shortcut_cleanup_failed=0
-      for target in "${INSTALL_TX_STAGES[@]}"; do
-        if { [ -e "$target" ] || [ -L "$target" ]; } && ! rm -f -- "$target"; then
-          log_err "安装暂存清理失败，保留文件：$target"
-          shortcut_cleanup_failed=1
-        fi
-      done
-      [ "$shortcut_cleanup_failed" -eq 0 ] || log_err "安装事务暂存失败；已保留可诊断文件。"
+      cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
       return 1
     fi
     INSTALL_TX_STAGES+=( "$stage" )
+  fi
+  if ! preflight_install_targets; then
+    cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
+    return 1
   fi
   for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
     INSTALL_TX_BACKUPS[index]="${INSTALL_TX_STAGES[index]}.backup"

@@ -143,6 +143,7 @@ case "$command_name" in
     ;;
   show)
     case " $* " in
+      *DropInPaths*) printf 'DropInPaths=\n' ;;
       *MainPID*) printf '%s\n' "$MOCK_OPENCONNECT_PID" ;;
       *ControlGroup*) printf '/system.slice/oc-master.service\n' ;;
       *LoadState*)
@@ -173,6 +174,7 @@ case "$command_name" in
         ;;
       *RestartPreventExitStatus*) printf '78\n' ;;
       *Restart*) printf 'always\n' ;;
+      *NeedDaemonReload*) printf 'no\n' ;;
       *ExecStart*)
         case "${1:-}" in
           oc-master.service)
@@ -463,19 +465,55 @@ run_lifecycle_action() {
         install -d -m 0755 "$(dirname "$INSTALL_PATH")" "$(dirname "$SHORTCUT_PATH")" "$OCM_SYSTEMD_DIR"
         install -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH"
         [ "$SHORTCUT_PATH" = "$INSTALL_PATH" ] || ln -sfn -- "$INSTALL_PATH" "$SHORTCUT_PATH"
-        {
-          printf "%s\n" "Description=OpenConnect Master managed tunnel"
-          printf "ExecStart=%s _service_run\n" "$INSTALL_PATH"
-          printf "ExecStopPost=-%s _service_cleanup\n" "$INSTALL_PATH"
-        } > "$OCM_SYSTEMD_DIR/$SERVICE_NAME"
-        {
-          printf "%s\n" "Description=OpenConnect Master data-plane health check"
-          printf "ExecStart=%s _service_health\n" "$INSTALL_PATH"
-        } > "$OCM_SYSTEMD_DIR/$HEALTH_SERVICE_NAME"
-        {
-          printf "%s\n" "Description=Run OpenConnect Master health checks"
-          printf "Unit=%s\n" "$HEALTH_SERVICE_NAME"
-        } > "$OCM_SYSTEMD_DIR/$HEALTH_TIMER_NAME"
+        cat > "$OCM_SYSTEMD_DIR/$SERVICE_NAME" <<EOF
+# Managed by oc-master
+[Unit]
+Description=OpenConnect Master managed tunnel
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${INSTALL_PATH} _service_run
+ExecStopPost=-${INSTALL_PATH} _service_cleanup
+Restart=always
+RestartPreventExitStatus=78
+RestartSec=15s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        cat > "$OCM_SYSTEMD_DIR/$HEALTH_SERVICE_NAME" <<EOF
+# Managed by oc-master
+[Unit]
+Description=OpenConnect Master data-plane health check
+After=${SERVICE_NAME}
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${INSTALL_PATH} _service_health
+EOF
+        cat > "$OCM_SYSTEMD_DIR/$HEALTH_TIMER_NAME" <<EOF
+# Managed by oc-master
+[Unit]
+Description=Run OpenConnect Master health checks
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=${HEALTH_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+EOF
       }
       if ! declare -p PROC_ROOT >/dev/null 2>&1; then
         # baseline 无 OCM_PROC_ROOT seam，等价地用受管 service active 证明进程存在。

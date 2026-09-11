@@ -43,6 +43,17 @@ systemctl() {
     show)
       unit="${1:-}"
       shift || true
+      if [ "$#" -eq 2 ] && [ "$1" = --all ] && [ "$2" = --property=DropInPaths ]; then
+        if [ "$unit" = "${MOCK_SOURCE_UNIT:-}" ]; then
+          case "$source_case" in
+            dropin-query-fail) return 1 ;;
+            dropin-missing) return 0 ;;
+            dropin-present) printf 'DropInPaths=/etc/systemd/system/%s.d/override.conf\n' "$unit"; return 0 ;;
+          esac
+        fi
+        printf 'DropInPaths=\n'
+        return 0
+      fi
       if [[ " $* " != *' --value '* ]] && [[ " $* " == *' --property=ExecStart '* ]]; then
         [ "${MOCK_SHOW_FAIL:-0}" != 1 ] || return 1
         case "$unit" in
@@ -66,6 +77,7 @@ systemctl() {
         *' --property=Restart --value '*) property=Restart ;;
         *' --property=RestartPreventExitStatus --value '*) property=RestartPreventExitStatus ;;
         *' --property=Triggers --value '*) property=Triggers ;;
+        *' --property=NeedDaemonReload --value '*) property=NeedDaemonReload ;;
       esac
       if [ "$unit" = "${MOCK_SOURCE_UNIT:-}" ]; then
         case "$source_case:$property" in
@@ -89,6 +101,16 @@ systemctl() {
         "$SERVICE_NAME:RestartPreventExitStatus") printf '%s\n' "${MOCK_MAIN_RESTART_PREVENT:-78}" ;;
         "$HEALTH_SERVICE_NAME:ExecStart") printf 'path=%s ; argv[]=%s %s ; ignore_errors=no\n' "$INSTALL_PATH" "$INSTALL_PATH" "${MOCK_HEALTH_ACTION:-_service_health}" ;;
         "$HEALTH_TIMER_NAME:Triggers") printf '%s\n' "${MOCK_TIMER_TRIGGERS:-$HEALTH_SERVICE_NAME}" ;;
+        "${MOCK_NEED_RELOAD_UNIT:-__none__}:NeedDaemonReload")
+          case "${MOCK_NEED_RELOAD_CASE:-no}" in
+            query-fail) return 1 ;;
+            empty) printf '\n' ;;
+            yes) printf 'yes\n' ;;
+            no) printf 'no\n' ;;
+            *) return 1 ;;
+          esac
+          ;;
+        *:NeedDaemonReload) printf 'no\n' ;;
         *) return 1 ;;
       esac
       ;;
@@ -119,6 +141,16 @@ Description=Run OpenConnect Master health checks
 [Timer]
 Unit=${HEALTH_SERVICE_NAME}
 EOF
+}
+
+seed_current_units() {
+  local unit
+  mkdir -p -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")"
+  printf '#!/usr/bin/env bash\nprintf old-program\\n\n' > "$OCM_INSTALL_PATH"
+  chmod 0755 -- "$OCM_INSTALL_PATH"
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    write_unit_file "$unit" "$(unit_path "$unit")" || fail "could not seed current unit: $unit"
+  done
 }
 
 assert_no_transaction_leftovers() {
@@ -183,7 +215,8 @@ MOCK_LOAD_STATE=loaded
 # the first staging function is entered; strict not-found remains installable.
 seed_legacy_units
 for source_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
-  for source_case in external query-fail fragment-query-fail empty-fragment masked empty-load; do
+  for source_case in external query-fail fragment-query-fail empty-fragment masked empty-load \
+    dropin-query-fail dropin-missing dropin-present; do
     preflight_stage_marker="${TEST_ROOT}/preflight-${source_unit}-${source_case}.stage"
     if (
       MOCK_SOURCE_UNIT="$source_unit"
@@ -210,9 +243,10 @@ printf 'install source preflight tests passed\n'
 
 # Post-reload verification must bind all three loaded units to the exact
 # managed path and validate the full service/timer execution contract.
-seed_legacy_units
+seed_current_units
 for source_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
-  for source_case in external query-fail fragment-query-fail empty-fragment not-found; do
+  for source_case in external query-fail fragment-query-fail empty-fragment not-found \
+    dropin-query-fail dropin-missing dropin-present; do
     if (
       MOCK_SOURCE_UNIT="$source_unit"
       MOCK_SOURCE_CASE="$source_case"
@@ -235,6 +269,47 @@ if (MOCK_TIMER_TRIGGERS='foreign-health.service'; verify_installed_units >/dev/n
   fail 'post-reload verification accepted a foreign timer trigger'
 fi
 verify_installed_units || fail 'post-reload verification rejected the exact managed contract'
+
+# Current-runtime validation is stricter than legacy ownership: every unit file
+# must match the complete generated template, and systemd must prove it has no
+# pending daemon-reload for any of the three units.
+for drift_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  drift_path="$(unit_path "$drift_unit")"
+  cp -- "$drift_path" "${drift_path}.exact"
+  printf '%s\n' '# unexpected current-unit drift' >> "$drift_path"
+  if verify_installed_units >/dev/null 2>&1; then
+    fail "post-reload verification accepted byte drift in $drift_unit"
+  fi
+  mv -f -- "${drift_path}.exact" "$drift_path"
+done
+
+timer_path="$(unit_path "$HEALTH_TIMER_NAME")"
+while IFS='|' read -r timer_from timer_to timer_label; do
+  cp -- "$timer_path" "${timer_path}.exact"
+  sed -i "s/^${timer_from}$/${timer_to}/" "$timer_path"
+  if verify_installed_units >/dev/null 2>&1; then
+    fail "post-reload verification accepted timer contract drift: $timer_label"
+  fi
+  mv -f -- "${timer_path}.exact" "$timer_path"
+done <<EOF
+OnBootSec=45s|OnBootSec=46s|OnBootSec
+OnUnitInactiveSec=30s|OnUnitInactiveSec=31s|OnUnitInactiveSec
+AccuracySec=5s|AccuracySec=6s|AccuracySec
+Unit=${HEALTH_SERVICE_NAME}|Unit=foreign-health.service|Unit
+WantedBy=timers.target|WantedBy=multi-user.target|WantedBy
+EOF
+
+for reload_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  for reload_case in query-fail empty yes; do
+    if (
+      MOCK_NEED_RELOAD_UNIT="$reload_unit"
+      MOCK_NEED_RELOAD_CASE="$reload_case"
+      verify_installed_units >/dev/null 2>&1
+    ); then
+      fail "post-reload verification accepted NeedDaemonReload=$reload_case for $reload_unit"
+    fi
+  done
+done
 rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")"
 printf 'installed unit source and contract tests passed\n'
 
@@ -260,6 +335,80 @@ fi
 grep -Fx 'foreign unit' "${OCM_SYSTEMD_DIR}/${SERVICE_NAME}" >/dev/null || fail 'foreign unit changed'
 grep -F 'old-program' "$OCM_INSTALL_PATH" >/dev/null || fail 'foreign unit conflict changed program'
 rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")"
+
+# A second complete preflight is required after every stage exists.  Races in
+# this bounded staging window must preserve the new foreign object byte-for-byte
+# and remove only our stages, without backups or daemon-reload.
+for staging_race in unit-create unit-replace shortcut-create shortcut-replace; do
+  seed_legacy_units
+  save_legacy_originals
+  MOCK_SOURCE_UNIT=''
+  MOCK_SOURCE_CASE=owned
+  race_systemctl_mutations="${TEST_ROOT}/${staging_race}.systemctl"
+  : > "$race_systemctl_mutations"
+  MOCK_SYSTEMCTL_MUTATIONS="$race_systemctl_mutations"
+  case "$staging_race" in
+    unit-create)
+      race_target="$(unit_path "$SERVICE_NAME")"
+      rm -f -- "$race_target"
+      MOCK_SOURCE_UNIT="$SERVICE_NAME"
+      MOCK_SOURCE_CASE=not-found
+      ;;
+    unit-replace) race_target="$(unit_path "$SERVICE_NAME")" ;;
+    shortcut-create) race_target="$OCM_SHORTCUT_PATH" ;;
+    shortcut-replace)
+      race_target="$OCM_SHORTCUT_PATH"
+      mkdir -p -- "$(dirname -- "$race_target")"
+      printf '%s\n' 'owned staging shortcut' > "$race_target"
+      ;;
+  esac
+  race_bytes="foreign staging-window ${staging_race}"
+  if (
+    stage_unit_file() {
+      local unit="$1" temporary
+      temporary="$(mktemp "${SYSTEMD_DIR}/.${unit}.${TAG}.race.XXXXXX")" || return 1
+      write_unit_file "$unit" "$temporary" || return 1
+      if [ "$unit" = "$HEALTH_TIMER_NAME" ]; then
+        case "$staging_race" in
+          unit-create|unit-replace|shortcut-replace) printf '%s\n' "$race_bytes" > "$race_target" ;;
+        esac
+      fi
+      printf '%s\n' "$temporary"
+    }
+    stage_shortcut() {
+      local temporary
+      mkdir -p -- "$(dirname -- "$SHORTCUT_PATH")"
+      temporary="$(mktemp "$(dirname -- "$SHORTCUT_PATH")/.${TAG}.shortcut.race.XXXXXX")" || return 1
+      printf '%s\n' staged-shortcut > "$temporary"
+      if [ "$staging_race" = shortcut-create ]; then
+        printf '%s\n' "$race_bytes" > "$race_target"
+      fi
+      printf '%s\n' "$temporary"
+    }
+    if [ "$staging_race" = shortcut-replace ]; then
+      shortcut_is_ours() {
+        [ -f "$SHORTCUT_PATH" ] \
+          && grep -Fx 'owned staging shortcut' "$SHORTCUT_PATH" >/dev/null
+      }
+    fi
+    install_self_and_units >/dev/null 2>&1
+  ); then
+    fail "install accepted a foreign $staging_race race after staging"
+  fi
+  grep -Fx "$race_bytes" "$race_target" >/dev/null \
+    || fail "install changed the foreign $staging_race race target"
+  cmp -s "$TEST_ROOT/original-program" "$OCM_INSTALL_PATH" \
+    || fail "$staging_race race changed the managed program"
+  cmp -s "$TEST_ROOT/original-health" "$(unit_path "$HEALTH_SERVICE_NAME")" \
+    || fail "$staging_race race changed the health unit"
+  cmp -s "$TEST_ROOT/original-timer" "$(unit_path "$HEALTH_TIMER_NAME")" \
+    || fail "$staging_race race changed the timer unit"
+  [ ! -s "$race_systemctl_mutations" ] || fail "$staging_race race triggered daemon-reload"
+  assert_no_transaction_leftovers
+  rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+done
+unset MOCK_SYSTEMCTL_MUTATIONS MOCK_SOURCE_UNIT MOCK_SOURCE_CASE
+printf 'post-staging preflight race tests passed\n'
 
 # Headerless v8 units are recognized by their complete legacy identity and
 # migrate to the stable managed header.
