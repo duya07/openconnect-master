@@ -1576,7 +1576,7 @@ route_plan_values_are_valid() {
 build_route_plan() {
   [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
   local expected_run_id="$1" runtime_mode runtime_phase runtime_desired
-  local default_output line device="" default4="" default6="" count=0
+  local default_output ipv6_address_output line device="" default4="" default6="" count=0
   local -a return4_addresses=() return6_addresses=()
 
   acquire_state_lock || return 1
@@ -1625,11 +1625,10 @@ build_route_plan() {
   if [ "$count" -eq 1 ]; then
     collect_route_plan_addresses -6 "$ROUTE_PLAN_BUILD_DEV6" return6_addresses || return 1
   else
-    collect_route_plan_addresses -6 "" return6_addresses || {
-      # 没有 IPv6 default 时只接受没有 global IPv6 地址的主机。
-      [ -z "$(ip -6 -o addr show scope global 2>/dev/null)" ] || return 1
-      return6_addresses=()
-    }
+    # 没有 IPv6 default 时只接受已确认不存在 global IPv6 地址的主机。
+    ipv6_address_output="$(ip -6 -o addr show scope global 2>/dev/null)" || return 1
+    [ -z "$ipv6_address_output" ] || return 1
+    return6_addresses=()
   fi
 
   ROUTE_PLAN_BUILD_RUN_ID="$expected_run_id"
