@@ -973,8 +973,93 @@ unit_is_ours() {
   esac
 }
 
+managed_unit_has_exact_source() {
+  [ "$#" -eq 1 ] || return 1
+  local unit="$1" path load_state fragment_path
+
+  path="$(unit_path "$unit")" || return 1
+  if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
+    || [ "$load_state" != loaded ]; then
+    return 1
+  fi
+  if ! fragment_path="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null)" \
+    || [ "$fragment_path" != "$path" ]; then
+    return 1
+  fi
+  unit_is_ours "$path" "$unit"
+}
+
+systemd_exec_value_matches() {
+  [ "$#" -eq 4 ] || return 1
+  local value="$1" expected_path="$2" expected_argv="$3" expected_ignore="$4"
+  local path_tail argv_tail ignore_tail actual_path actual_argv actual_ignore remainder
+
+  [ -n "$value" ] && [[ "$value" != *$'\n'* ]] || return 1
+  [[ "${value#*path=}" != *'path='* ]] \
+    && [[ "${value#*argv[]=}" != *'argv[]='* ]] \
+    && [[ "${value#*ignore_errors=}" != *'ignore_errors='* ]] || return 1
+  path_tail="${value#*path=}"
+  [ "$path_tail" != "$value" ] && [[ "$path_tail" == *' ;'* ]] || return 1
+  actual_path="${path_tail%% ;*}"
+  argv_tail="${path_tail#*argv[]=}"
+  [ "$argv_tail" != "$path_tail" ] && [[ "$argv_tail" == *' ;'* ]] || return 1
+  actual_argv="${argv_tail%% ;*}"
+  ignore_tail="${argv_tail#*ignore_errors=}"
+  [ "$ignore_tail" != "$argv_tail" ] || return 1
+  actual_ignore="${ignore_tail%% *}"
+  if [[ "$ignore_tail" == *' '* ]]; then remainder="${ignore_tail#* }"; else remainder=""; fi
+
+  [ "$actual_path" = "$expected_path" ] \
+    && [ "$actual_argv" = "$expected_argv" ] \
+    && [ "$actual_ignore" = "$expected_ignore" ] \
+    && [[ "$remainder" != *'path='* ]] \
+    && [[ "$remainder" != *'argv[]='* ]]
+}
+
+managed_main_unit_contract_is_exact() {
+  local exec_start exec_stop restart restart_prevent
+
+  exec_start="$(systemctl show "$SERVICE_NAME" --property=ExecStart --value 2>/dev/null)" || return 1
+  exec_stop="$(systemctl show "$SERVICE_NAME" --property=ExecStopPost --value 2>/dev/null)" || return 1
+  restart="$(systemctl show "$SERVICE_NAME" --property=Restart --value 2>/dev/null)" || return 1
+  restart_prevent="$(systemctl show "$SERVICE_NAME" --property=RestartPreventExitStatus --value 2>/dev/null)" || return 1
+
+  systemd_exec_value_matches "$exec_start" "$INSTALL_PATH" "${INSTALL_PATH} _service_run" no \
+    && systemd_exec_value_matches "$exec_stop" "$INSTALL_PATH" "${INSTALL_PATH} _service_cleanup" yes \
+    && [ "$restart" = always ] \
+    && [ "$restart_prevent" = 78 ]
+}
+
+managed_health_unit_contract_is_exact() {
+  local exec_start
+
+  exec_start="$(systemctl show "$HEALTH_SERVICE_NAME" --property=ExecStart --value 2>/dev/null)" || return 1
+  systemd_exec_value_matches "$exec_start" "$INSTALL_PATH" "${INSTALL_PATH} _service_health" no
+}
+
+managed_health_timer_contract_is_exact() {
+  local triggers
+
+  triggers="$(systemctl show "$HEALTH_TIMER_NAME" --property=Triggers --value 2>/dev/null)" || return 1
+  [ "$triggers" = "$HEALTH_SERVICE_NAME" ]
+}
+
+managed_main_unit_is_exact() {
+  managed_unit_has_exact_source "$SERVICE_NAME" \
+    && managed_main_unit_contract_is_exact
+}
+
+verify_installed_units() {
+  managed_unit_has_exact_source "$SERVICE_NAME" \
+    && managed_unit_has_exact_source "$HEALTH_SERVICE_NAME" \
+    && managed_unit_has_exact_source "$HEALTH_TIMER_NAME" \
+    && managed_main_unit_contract_is_exact \
+    && managed_health_unit_contract_is_exact \
+    && managed_health_timer_contract_is_exact
+}
+
 preflight_managed_units_ownership() {
-  local unit path load_state fragment_path
+  local unit path load_state
 
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     path="$(unit_path "$unit")" || return 1
@@ -989,11 +1074,7 @@ preflight_managed_units_ownership() {
     case "$load_state" in
       not-found) continue ;;
       loaded)
-        if ! fragment_path="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null)"; then
-          die "无法核验 systemd 单元 $unit 的实际来源；为避免操作 foreign unit，拒绝继续。"
-          return 1
-        fi
-        if [ "$fragment_path" != "$path" ] || ! unit_is_ours "$path" "$unit"; then
+        if ! managed_unit_has_exact_source "$unit"; then
           die "systemd 单元 $unit 的实际来源不属于 oc-master；拒绝停止或禁用。"
           return 1
         fi
@@ -1014,16 +1095,8 @@ preflight_managed_shortcut() {
 }
 
 preflight_install_targets() {
-  local unit
   preflight_managed_shortcut || return 1
-  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
-    local path
-    path="$(unit_path "$unit")" || return 1
-    if { [ -e "$path" ] || [ -L "$path" ]; } && ! unit_is_ours "$path" "$unit"; then
-      die "systemd 单元路径已被其他文件占用：$path；为避免覆盖，拒绝安装。"
-      return 1
-    fi
-  done
+  preflight_managed_units_ownership
 }
 
 # shellcheck disable=SC2120 # 不接受参数，调用点与部署目标固定。
@@ -1235,17 +1308,6 @@ stage_unit_file() {
     return 1
   fi
   printf '%s\n' "$temporary"
-}
-
-verify_installed_units() {
-  local main_properties health_properties
-  main_properties="$(systemctl show "$SERVICE_NAME" --property=ExecStart --property=ExecStopPost --property=Restart --property=RestartPreventExitStatus)" || return 1
-  health_properties="$(systemctl show "$HEALTH_SERVICE_NAME" --property=ExecStart)" || return 1
-  grep -F "${INSTALL_PATH} _service_run" <<< "$main_properties" >/dev/null \
-    && grep -F "${INSTALL_PATH} _service_cleanup" <<< "$main_properties" >/dev/null \
-    && grep -Fx 'Restart=always' <<< "$main_properties" >/dev/null \
-    && grep -Fx 'RestartPreventExitStatus=78' <<< "$main_properties" >/dev/null \
-    && grep -F "${INSTALL_PATH} _service_health" <<< "$health_properties" >/dev/null
 }
 
 restore_install_transaction() {
@@ -2433,6 +2495,11 @@ service_health() {
     exit 0
   fi
 
+  if ! managed_main_unit_is_exact; then
+    system_log "health restart skipped: managed main unit source or contract could not be verified"
+    release_service_operation_lock
+    exit 0
+  fi
   now="$(date +%s)"
   if claim_health_restart "$health_run_id" "$now"; then
     restart_claim_rc=0
@@ -2614,6 +2681,7 @@ handle_interrupted_start() {
 }
 
 start_managed_units() {
+  verify_installed_units || return 1
   systemctl reset-failed "$SERVICE_NAME" &&
     systemctl enable "$SERVICE_NAME" "$HEALTH_TIMER_NAME" >/dev/null &&
     systemctl start "$SERVICE_NAME" &&

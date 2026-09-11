@@ -64,6 +64,62 @@ ensure_dirs() {
   mkdir -p -- "$CONFIG_DIR" "$RUNTIME_DIR" "${STATE_LOCK_FILE%/*}" "${SERVICE_LOCK_FILE%/*}"
 }
 
+seed_lifecycle_managed_units() {
+  local unit
+  mkdir -p -- "$SYSTEMD_DIR"
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    printf '%s\n' '# Managed by oc-master' > "$(unit_path "$unit")"
+  done
+}
+
+mock_lifecycle_unit_query() {
+  [ "$#" -eq 4 ] && [ "$1" = show ] && [ "$4" = --value ] || return 1
+  local unit="$2" property="$3"
+
+  if [ "$unit" = "${LIFECYCLE_QUERY_FAIL_UNIT:-}" ]; then return 1; fi
+  case "$property" in
+    --property=LoadState) printf '%s\n' loaded ;;
+    --property=FragmentPath)
+      if [ "$unit" = "${LIFECYCLE_FOREIGN_SOURCE_UNIT:-}" ]; then
+        printf '/etc/systemd/system/%s\n' "$unit"
+      else
+        unit_path "$unit"
+      fi
+      ;;
+    --property=ExecStart)
+      case "$unit" in
+        "$SERVICE_NAME")
+          printf 'path=%s ; argv[]=%s %s ; ignore_errors=no\n' \
+            "$INSTALL_PATH" "$INSTALL_PATH" "${LIFECYCLE_MAIN_START_ACTION:-_service_run}"
+          ;;
+        "$HEALTH_SERVICE_NAME")
+          printf 'path=%s ; argv[]=%s %s ; ignore_errors=no\n' \
+            "$INSTALL_PATH" "$INSTALL_PATH" "${LIFECYCLE_HEALTH_ACTION:-_service_health}"
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    --property=ExecStopPost)
+      [ "$unit" = "$SERVICE_NAME" ] || return 1
+      printf 'path=%s ; argv[]=%s %s ; ignore_errors=yes\n' \
+        "$INSTALL_PATH" "$INSTALL_PATH" "${LIFECYCLE_MAIN_STOP_ACTION:-_service_cleanup}"
+      ;;
+    --property=Restart)
+      [ "$unit" = "$SERVICE_NAME" ] || return 1
+      printf '%s\n' "${LIFECYCLE_MAIN_RESTART:-always}"
+      ;;
+    --property=RestartPreventExitStatus)
+      [ "$unit" = "$SERVICE_NAME" ] || return 1
+      printf '%s\n' "${LIFECYCLE_MAIN_RESTART_PREVENT:-78}"
+      ;;
+    --property=Triggers)
+      [ "$unit" = "$HEALTH_TIMER_NAME" ] || return 1
+      printf '%s\n' "${LIFECYCLE_TIMER_TRIGGERS:-$HEALTH_SERVICE_NAME}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 write_runtime_fixture() {
   local run_id="$1" boot_id="$2" mode="$3" phase="$4" desired="$5" deadline="$6"
   local socks_port=1080
@@ -290,6 +346,66 @@ set -e
 [ ! -e "$SERVICE_SIDE_EFFECTS" ] || review_failure 'fail-closed service restart touched routes or OpenConnect'
 
 [ "$REVIEW_FAILURES" -eq 0 ] || fail "$REVIEW_FAILURES review regression(s) detected"
+
+# Starting persistent units must bind every unit name to the exact managed
+# source and contract before reset-failed/enable/start can mutate systemd.
+seed_lifecycle_managed_units
+START_SYSTEMCTL_MUTATIONS="${TEST_ROOT}/start-systemctl.mutations"
+for rejected_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+  : > "$START_SYSTEMCTL_MUTATIONS"
+  if (
+    LIFECYCLE_FOREIGN_SOURCE_UNIT="$rejected_unit"
+    systemctl() {
+      if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+      printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+    }
+    start_managed_units >/dev/null 2>&1
+  ); then
+    fail "start accepted an external systemd source for $rejected_unit"
+  fi
+  [ ! -s "$START_SYSTEMCTL_MUTATIONS" ] \
+    || fail "start mutated systemd before rejecting external source for $rejected_unit"
+done
+
+: > "$START_SYSTEMCTL_MUTATIONS"
+if (
+  LIFECYCLE_QUERY_FAIL_UNIT="$HEALTH_SERVICE_NAME"
+  systemctl() {
+    if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+    printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+  }
+  start_managed_units >/dev/null 2>&1
+); then
+  fail 'start accepted an unverifiable health unit'
+fi
+[ ! -s "$START_SYSTEMCTL_MUTATIONS" ] || fail 'start mutated systemd after a unit query failed'
+
+: > "$START_SYSTEMCTL_MUTATIONS"
+if (
+  LIFECYCLE_TIMER_TRIGGERS='foreign-health.service'
+  systemctl() {
+    if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+    printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+  }
+  start_managed_units >/dev/null 2>&1
+); then
+  fail 'start accepted a foreign timer trigger'
+fi
+[ ! -s "$START_SYSTEMCTL_MUTATIONS" ] || fail 'start mutated systemd before rejecting timer contract drift'
+
+: > "$START_SYSTEMCTL_MUTATIONS"
+if ! (
+  systemctl() {
+    if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+    printf '%s\n' "$*" >> "$START_SYSTEMCTL_MUTATIONS"
+  }
+  start_managed_units >/dev/null 2>&1
+); then
+  fail 'start rejected exact managed unit sources and contracts'
+fi
+assert_eq $'reset-failed oc-master.service\nenable oc-master.service oc-master-health.timer\nstart oc-master.service\nstart oc-master-health.timer' \
+  "$(cat "$START_SYSTEMCTL_MUTATIONS")" 'systemd start mutation order changed'
+printf 'persistent unit start ownership tests passed\n'
 
 # A stale rollback worker must not touch the current generation.
 write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
@@ -551,6 +667,43 @@ assert_eq 0 "$(cat "$STOP_RESULT")" 'stop transaction failed after releasing its
 assert_state CLEANED 0 0 'stop transaction did not finish CLEANED'
 unset -f systemctl health_once
 
+# A foreign main-unit source at the restart threshold must not consume the
+# cooldown or restart a same-named service.  Source/property reads also remain
+# outside the state lock.
+write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
+printf '%s\n' "${RUN_B}=2" > "$HEALTH_FAILURE_FILE"
+rm -f -- "$HEALTH_RESTART_FILE"
+HEALTH_FOREIGN_CALLS="${TEST_ROOT}/health-foreign.calls"
+HEALTH_LOCK_VIOLATION="${TEST_ROOT}/health-state-lock-systemctl"
+if ! (
+  TEST_STATE_LOCK_HELD=''
+  acquire_state_lock() {
+    [ -z "$TEST_STATE_LOCK_HELD" ] || return 1
+    TEST_STATE_LOCK_HELD=1
+  }
+  release_state_lock() { TEST_STATE_LOCK_HELD=''; }
+  LIFECYCLE_FOREIGN_SOURCE_UNIT="$SERVICE_NAME"
+  systemctl() {
+    [ -z "$TEST_STATE_LOCK_HELD" ] || : > "$HEALTH_LOCK_VIOLATION"
+    if [ "$1" = show ]; then mock_lifecycle_unit_query "$@"; return; fi
+    case "$*" in
+      "is-active --quiet $SERVICE_NAME") return 0 ;;
+      "restart $SERVICE_NAME") printf '%s\n' restart >> "$HEALTH_FOREIGN_CALLS"; return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  health_once() { return 1; }
+  date() { printf '3000\n'; }
+  service_health >/dev/null 2>&1
+); then
+  fail 'health foreign-source guard returned an operational error'
+fi
+[ ! -e "$HEALTH_LOCK_VIOLATION" ] || fail 'health queried systemd while holding the state lock'
+[ ! -e "$HEALTH_FOREIGN_CALLS" ] || fail 'health restarted a foreign same-named main service'
+[ ! -e "$HEALTH_RESTART_FILE" ] || fail 'health consumed cooldown before rejecting a foreign main service'
+assert_eq "${RUN_B}=3" "$(cat "$HEALTH_FAILURE_FILE")" 'health foreign-source guard lost the failure count'
+printf 'health restart ownership test passed\n'
+
 # Old-generation failure/cooldown values are ignored rather than inherited.
 write_runtime_fixture "$RUN_B" "$BOOT_A" proxy RUNNING 1 0
 printf '%s\n' "${RUN_A}=2" > "$HEALTH_FAILURE_FILE"
@@ -558,6 +711,7 @@ printf '%s\n' "${RUN_A}=1999" > "$HEALTH_RESTART_FILE"
 HEALTH_CALLS="${TEST_ROOT}/health.calls"
 systemctl() {
   case "$*" in
+    "show $SERVICE_NAME --property="*" --value") mock_lifecycle_unit_query "$@" ;;
     "is-active --quiet $SERVICE_NAME") return 0 ;;
     "restart $SERVICE_NAME") printf '%s\n' restart >> "$HEALTH_CALLS"; return 0 ;;
     *) return 0 ;;
