@@ -875,8 +875,9 @@ cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail 'manage
 assert_no_transaction_leftovers
 rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
 
-# A backup deletion failure is a transaction failure, so it must restore the
-# old program instead of leaving a new program with an ambiguous error result.
+# After the public install has verified its promoted program, a backup cleanup
+# failure must retain that verified program and its evidence.  Re-entering the
+# rollback path here could turn a cleanup error into a partial restoration.
 mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
 printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
 cp -- "$OCM_INSTALL_PATH" "$TEST_ROOT/original-managed-program"
@@ -897,8 +898,11 @@ if ! (
 else
   fail 'managed-copy backup cleanup failure unexpectedly succeeded'
 fi
-cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail 'managed-copy backup cleanup failure did not restore old program'
-assert_no_transaction_leftovers
+cmp -s "$SCRIPT_PATH" "$OCM_INSTALL_PATH" || fail 'managed-copy backup cleanup failure rolled back the verified program'
+find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit | grep -q . \
+  || fail 'managed-copy backup cleanup failure discarded the old-program backup'
+find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.expected' -print -quit | grep -q . \
+  || fail 'managed-copy backup cleanup failure discarded its target snapshot'
 rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
 
 # If restoring the old program also fails, the backup must remain available and
@@ -954,6 +958,96 @@ grep -F 'old-managed-program' "$OCM_INSTALL_PATH" >/dev/null \
 rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
 printf 'managed-copy empty cleanup test passed\n'
 
+# Public `install` promotes only program/shortcut, but it must keep the same
+# no-clobber contract as the persistent-unit installer. These hooks model the
+# three observable commit windows without installing any unit.
+run_public_install_commit_guard() {
+  local window="$1" marker="foreign-public-${window}" backup install_rc=0
+
+  rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+  mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+  printf '#!/usr/bin/env bash\nprintf old-public\n' > "$OCM_INSTALL_PATH"
+  (
+    stage_shortcut() { return 0; }
+    mv() {
+      local source="${*: -2:1}" destination="${!#}"
+      if [ "$source" = "$OCM_INSTALL_PATH" ] && [[ "$destination" == *.backup ]]; then
+        command mv "$@" || return 1
+        if [ "$window" = untrusted-backup ]; then
+          printf '%s\n' "$marker" >> "$destination"
+        elif [ "$window" = pre-promotion ]; then
+          printf '%s\n' "$marker" > "$OCM_INSTALL_PATH"
+        fi
+        return 0
+      fi
+      if [ "$destination" = "$OCM_INSTALL_PATH" ] && [ "$window" = post-promotion ]; then
+        command mv "$@" || return 1
+        printf '%s\n' "$marker" > "$OCM_INSTALL_PATH"
+        return 0
+      fi
+      command mv "$@"
+    }
+    install_managed_copy
+  ) || install_rc=$?
+  [ "$install_rc" -ne 0 ] || fail "public install accepted ${window} transaction drift"
+  case "$window" in
+    pre-promotion|post-promotion)
+      grep -Fx "$marker" "$OCM_INSTALL_PATH" >/dev/null \
+        || fail "public install overwrote foreign program during ${window}"
+      ;;
+    untrusted-backup)
+      [ ! -e "$OCM_INSTALL_PATH" ] || fail 'public install restored an untrusted program backup'
+      backup="$(find "$(dirname -- "$OCM_INSTALL_PATH")" -name '*.backup' -print -quit)"
+      [ -n "$backup" ] && grep -Fx "$marker" "$backup" >/dev/null \
+        || fail 'public install discarded untrusted program backup evidence'
+      ;;
+  esac
+}
+
+for public_install_window in pre-promotion post-promotion untrusted-backup; do
+  run_public_install_commit_guard "$public_install_window"
+done
+printf 'public install commit guard tests passed\n'
+
+# Public install is intentionally program/shortcut-only: it must not create
+# runtime/config state or call daemon-reload, including on a rollback path.
+rm -rf -- "$OCM_CONFIG_DIR" "$OCM_RUNTIME_DIR" "$(dirname -- "$OCM_INSTALL_PATH")"
+mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+if ! (
+  stage_shortcut() { return 0; }
+  ensure_dirs() { : > "$TEST_ROOT/public-install.ensure-dirs"; return 1; }
+  systemctl() { : > "$TEST_ROOT/public-install.systemctl"; return 1; }
+  install_managed_copy
+); then
+  fail 'public install unexpectedly required manager runtime directories'
+fi
+[ ! -e "$TEST_ROOT/public-install.ensure-dirs" ] || fail 'public install created manager runtime/config state'
+[ ! -e "$TEST_ROOT/public-install.systemctl" ] || fail 'public install invoked systemctl on its success path'
+[ ! -e "$OCM_CONFIG_DIR" ] && [ ! -e "$OCM_RUNTIME_DIR" ] \
+  || fail 'public install created a config or runtime directory'
+rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
+
+mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf '#!/usr/bin/env bash\nprintf old-public\n' > "$OCM_INSTALL_PATH"
+if (
+  stage_shortcut() { return 0; }
+  systemctl() { : > "$TEST_ROOT/public-install-rollback.systemctl"; return 1; }
+  mv() {
+    local destination="${!#}"
+    [ "$destination" != "$OCM_INSTALL_PATH" ] || return 1
+    command mv "$@"
+  }
+  install_managed_copy
+); then
+  fail 'public install accepted a forced promotion failure'
+fi
+[ ! -e "$TEST_ROOT/public-install-rollback.systemctl" ] \
+  || fail 'public install rollback invoked daemon-reload without unit changes'
+grep -F 'old-public' "$OCM_INSTALL_PATH" >/dev/null \
+  || fail 'public install rollback did not preserve the old program'
+rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")"
+printf 'public install boundary-effect tests passed\n'
+
 # A unit staging write failure whose local temporary cannot be deleted must
 # leave the evidence and emit a cleanup-specific diagnostic.
 mkdir -p -- "$OCM_SYSTEMD_DIR"
@@ -993,6 +1087,47 @@ printf 'unit writer failure propagation tests passed\n'
 if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
   && ln -s -- probe "${OCM_SHORTCUT_PATH}.probe" 2>/dev/null; then
   rm -f -- "${OCM_SHORTCUT_PATH}.probe"
+  # The optional shortcut has the same no-clobber contract as the program.
+  # Cover both an absent target becoming occupied before promotion and a
+  # foreign replacement immediately after the shortcut promotion.
+  run_public_shortcut_commit_guard() {
+    local window="$1" marker="foreign-shortcut-${window}" install_rc=0
+
+    rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+    mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+    printf '#!/usr/bin/env bash\nprintf old-public\n' > "$OCM_INSTALL_PATH"
+    (
+      mv() {
+        local source="${*: -2:1}" destination="${!#}"
+        if [ "$destination" = "$OCM_INSTALL_PATH" ] && [ "$source" != "$OCM_INSTALL_PATH" ]; then
+          command mv "$@" || return 1
+          if [ "$window" = pre-promotion ]; then
+            printf '%s\n' "$marker" > "$OCM_SHORTCUT_PATH"
+          fi
+          return 0
+        fi
+        if [ "$destination" = "$OCM_SHORTCUT_PATH" ] && [ "$window" = post-promotion ]; then
+          command mv "$@" || return 1
+          command rm -f -- "$OCM_SHORTCUT_PATH"
+          printf '%s\n' "$marker" > "$OCM_SHORTCUT_PATH"
+          return 0
+        fi
+        command mv "$@"
+      }
+      install_managed_copy
+    ) || install_rc=$?
+    [ "$install_rc" -ne 0 ] || fail "public install accepted shortcut ${window} drift"
+    grep -Fx "$marker" "$OCM_SHORTCUT_PATH" >/dev/null \
+      || fail "public install overwrote foreign shortcut during ${window}"
+    grep -F 'old-public' "$OCM_INSTALL_PATH" >/dev/null \
+      || fail "public install did not restore the program after shortcut ${window} drift"
+  }
+
+  for public_shortcut_window in pre-promotion post-promotion; do
+    run_public_shortcut_commit_guard "$public_shortcut_window"
+  done
+  printf 'public shortcut commit guard tests passed\n'
+
   failure=managed-shortcut
     mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
     printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"

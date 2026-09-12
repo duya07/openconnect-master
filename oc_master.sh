@@ -913,6 +913,38 @@ new_runtime_artifact_exists() {
     || [ -e "$HEALTH_RESTART_FILE" ] || [ -L "$HEALTH_RESTART_FILE" ]
 }
 
+# v8 wrote these two files as a bare decimal counter/timestamp. They are not
+# a generation proof when snapshot and state are both absent, but must never be
+# discarded until legacy recovery has proved and stopped the managed units.
+legacy_health_artifact_is_decimal_or_absent() {
+  [ "$#" -eq 1 ] || return 1
+  local artifact="$1"
+
+  if [ ! -e "$artifact" ] && [ ! -L "$artifact" ]; then return 0; fi
+  [ -f "$artifact" ] && [ ! -L "$artifact" ] || return 1
+  # Do not use command substitution here: it removes all trailing newlines
+  # and would turn a two-line `123\\n\\n` file into an apparent v8 value.
+  awk 'NR != 1 || $0 !~ /^[0-9]+$/ { invalid = 1 } END { exit (NR == 1 && !invalid) ? 0 : 1 }' \
+    "$artifact"
+}
+
+legacy_health_artifacts_are_safe() {
+  legacy_health_artifact_is_decimal_or_absent "$HEALTH_FAILURE_FILE" \
+    && legacy_health_artifact_is_decimal_or_absent "$HEALTH_RESTART_FILE"
+}
+
+legacy_health_artifacts_exist() {
+  [ -e "$HEALTH_FAILURE_FILE" ] || [ -L "$HEALTH_FAILURE_FILE" ] \
+    || [ -e "$HEALTH_RESTART_FILE" ] || [ -L "$HEALTH_RESTART_FILE" ]
+}
+
+remove_legacy_health_artifacts() {
+  legacy_health_artifacts_are_safe || return 1
+  rm -f -- "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE" || return 1
+  [ ! -e "$HEALTH_FAILURE_FILE" ] && [ ! -L "$HEALTH_FAILURE_FILE" ] \
+    && [ ! -e "$HEALTH_RESTART_FILE" ] && [ ! -L "$HEALTH_RESTART_FILE" ]
+}
+
 legacy_installation_exists() {
   local unit path
 
@@ -928,11 +960,18 @@ legacy_installation_exists() {
 }
 
 recover_legacy_installation() {
-  new_runtime_artifact_exists && return 1
-  legacy_installation_exists || return 0
+  if [ -e "$ACTIVE_RUN_FILE" ] || [ -L "$ACTIVE_RUN_FILE" ] \
+    || [ -e "$RUN_STATE_FILE" ] || [ -L "$RUN_STATE_FILE" ] \
+    || [ -e "$ROUTE_PLAN_FILE" ] || [ -L "$ROUTE_PLAN_FILE" ] \
+    || [ -e "$SERVICE_RUN_ID_FILE" ] || [ -L "$SERVICE_RUN_ID_FILE" ]; then
+    return 1
+  fi
+  legacy_health_artifacts_are_safe || return 1
+  legacy_installation_exists || legacy_health_artifacts_exist || return 0
 
   preflight_managed_units_ownership || return 1
   stop_and_disable_managed_units || return 1
+  remove_legacy_health_artifacts || return 1
   if [ -e "$ROUTE_OWNER_FILE" ] || [ -L "$ROUTE_OWNER_FILE" ]; then
     cleanup_legacy_return_routes || return 1
   fi
@@ -1165,83 +1204,81 @@ stage_shortcut() {
 }
 
 install_managed_copy() {
-  local program_tmp shortcut_tmp="" program_backup="" had_program=0 program_installed=0 shortcut_installed=0 cleanup_failed=0
-  preflight_managed_shortcut || return 1
-  program_tmp="$(stage_managed_program)" || return 1
-  shortcut_tmp="$(stage_shortcut)" || {
-    rm -f -- "$program_tmp" || { log_err "安装暂存清理失败，保留文件：$program_tmp"; return 1; }
-    return 1
-  }
+  local stage index target
+  local INSTALL_TX_REQUIRES_DAEMON_RELOAD=0
+  local -a INSTALL_TX_TARGETS=() INSTALL_TX_KINDS=() INSTALL_TX_STAGES=() INSTALL_TX_BACKUPS=()
+  local -a INSTALL_TX_HAD_OLD=() INSTALL_TX_INSTALLED=() INSTALL_TX_EXPECTED_TYPES=()
+  local -a INSTALL_TX_EXPECTED_FILES=() INSTALL_TX_EXPECTED_VALUES=()
+  local -a INSTALL_TX_STAGED_TYPES=() INSTALL_TX_STAGED_FILES=() INSTALL_TX_STAGED_VALUES=()
 
-  if [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; then
-    had_program=1
-    program_backup="${program_tmp}.backup"
-    if ! mv -f -- "$INSTALL_PATH" "$program_backup"; then
-      for temporary in "$program_tmp" "$shortcut_tmp"; do
-        [ -n "$temporary" ] || continue
-        if { [ -e "$temporary" ] || [ -L "$temporary" ]; } && ! rm -f -- "$temporary"; then
-          cleanup_failed=1
-        fi
-      done
-      [ "$cleanup_failed" -eq 0 ] || log_err "安装暂存清理失败，保留可诊断文件。"
+  preflight_managed_shortcut || return 1
+  INSTALL_TX_TARGETS=( "$INSTALL_PATH" )
+  INSTALL_TX_KINDS=( program )
+  stage="$(stage_managed_program)" || return 1
+  INSTALL_TX_STAGES=( "$stage" )
+  if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && ! shortcut_is_ours; then
+    stage="$(stage_shortcut)" || { cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true; return 1; }
+    if [ -n "$stage" ]; then
+      INSTALL_TX_TARGETS+=( "$SHORTCUT_PATH" )
+      INSTALL_TX_KINDS+=( shortcut )
+      INSTALL_TX_STAGES+=( "$stage" )
+    fi
+  fi
+  if ! snapshot_install_targets || ! preflight_managed_shortcut; then
+    cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
+    cleanup_install_expectations || true
+    return 1
+  fi
+  for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
+    target="${INSTALL_TX_TARGETS[index]}"
+    INSTALL_TX_BACKUPS[index]="${INSTALL_TX_STAGES[index]}.backup"
+    INSTALL_TX_HAD_OLD[index]=0
+    INSTALL_TX_INSTALLED[index]=0
+    if ! install_path_matches_snapshot "$target" "$index"; then
+      log_err "安装提交前目标已发生变化，拒绝覆盖：$target"
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
       return 1
     fi
-  fi
-  if ! mv -f -- "$program_tmp" "$INSTALL_PATH"; then
-    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$shortcut_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
-      log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+    if [ "${INSTALL_TX_EXPECTED_TYPES[index]}" != absent ]; then
+      if ! mv -T -n -- "$target" "${INSTALL_TX_BACKUPS[index]}" \
+        || [ -e "$target" ] || [ -L "$target" ] \
+        || { [ ! -e "${INSTALL_TX_BACKUPS[index]}" ] && [ ! -L "${INSTALL_TX_BACKUPS[index]}" ]; }; then
+        restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+        return 1
+      fi
+      INSTALL_TX_HAD_OLD[index]=1
+      if ! install_backup_is_safe "$index"; then
+        log_err "安装备份不再匹配预检目标，拒绝继续：${INSTALL_TX_BACKUPS[index]}"
+        restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+        return 1
+      fi
     fi
-    return 1
-  fi
-  program_installed=1
-  if [ -n "$shortcut_tmp" ] && ! mv -f -- "$shortcut_tmp" "$SHORTCUT_PATH"; then
-    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$shortcut_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
-      log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+    if [ -e "$target" ] || [ -L "$target" ] \
+      || ! mv -T -n -- "${INSTALL_TX_STAGES[index]}" "$target" \
+      || [ -e "${INSTALL_TX_STAGES[index]}" ] || [ -L "${INSTALL_TX_STAGES[index]}" ]; then
+      log_err "安装目标在提升暂存文件前被占用，拒绝覆盖：$target"
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+      return 1
     fi
-    return 1
-  fi
-  [ -n "$shortcut_tmp" ] && shortcut_installed=1
-  if [ -n "$program_backup" ] && { [ -e "$program_backup" ] || [ -L "$program_backup" ]; } && ! rm -f -- "$program_backup"; then
-    log_err "安装备份清理失败，保留旧程序备份：$program_backup"
-    if ! restore_managed_copy_transaction "$had_program" "$program_installed" "$shortcut_installed" "$program_backup" "$program_tmp" "$shortcut_tmp"; then
-      log_err "安装事务回滚未完成；请使用保留的备份恢复。"
-    fi
-    return 1
-  fi
-}
-
-restore_managed_copy_transaction() {
-  [ "$#" -eq 6 ] || return 1
-  local had_program="$1" program_installed="$2" shortcut_installed="$3" program_backup="$4" program_tmp="$5" shortcut_tmp="$6" failed=0
-  if [ "$program_installed" = 1 ] && { [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; } && ! rm -f -- "$INSTALL_PATH"; then
-    log_err "安装回滚失败，无法删除新程序：$INSTALL_PATH"
-    failed=1
-  fi
-  if [ "$shortcut_installed" = 1 ] && { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } && ! rm -f -- "$SHORTCUT_PATH"; then
-    log_err "安装回滚失败，无法删除新快捷命令：$SHORTCUT_PATH"
-    failed=1
-  fi
-  if [ "$had_program" = 1 ]; then
-    if [ ! -e "$program_backup" ] && [ ! -L "$program_backup" ]; then
-      log_err "安装回滚失败，旧程序备份丢失：$program_backup"
-      failed=1
-    elif [ -e "$INSTALL_PATH" ] || [ -L "$INSTALL_PATH" ]; then
-      log_err "安装回滚失败，目标仍存在；保留旧程序备份：$program_backup"
-      failed=1
-    elif ! mv -f -- "$program_backup" "$INSTALL_PATH"; then
-      log_err "安装回滚失败，保留旧程序备份：$program_backup"
-      failed=1
-    fi
-  fi
-  for temporary in "$program_tmp" "$shortcut_tmp"; do
-    [ -n "$temporary" ] || continue
-    if { [ -e "$temporary" ] || [ -L "$temporary" ]; } && ! rm -f -- "$temporary"; then
-      log_err "安装回滚暂存清理失败，保留文件：$temporary"
-      failed=1
+    INSTALL_TX_INSTALLED[index]=1
+    if ! installed_target_matches_transaction "$index"; then
+      log_err "安装目标在提升后不再匹配本轮内容，拒绝继续：$target"
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+      return 1
     fi
   done
-  [ "$failed" -eq 0 ] || log_err "安装事务回滚失败；已保留可恢复证据。"
-  return "$failed"
+  if ! verify_installed_transaction_targets; then
+    restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+    return 1
+  fi
+  # A committed target remains the verified new installation if only backup
+  # cleanup fails.  Rolling it back could itself be incomplete, so preserve
+  # the backup and both snapshots as recovery evidence instead.
+  if ! cleanup_committed_install_backups; then
+    log_err "安装备份清理异常；保留本轮目标快照作为核验依据。"
+    return 1
+  fi
+  cleanup_install_expectations
 }
 
 service_state_allows_install() {
@@ -1562,9 +1599,11 @@ restore_install_transaction() {
       fi
     done
   done
-  if ! systemctl daemon-reload; then
-    log_err "安装回滚失败，systemd daemon-reload 未成功；请在保留的备份旁手动恢复后重试。"
-    failed=1
+  if [ "${INSTALL_TX_REQUIRES_DAEMON_RELOAD:-0}" = 1 ]; then
+    if ! systemctl daemon-reload; then
+      log_err "安装回滚失败，systemd daemon-reload 未成功；请在保留的备份旁手动恢复后重试。"
+      failed=1
+    fi
   fi
   [ "$failed" -eq 0 ] || log_err "安装事务回滚失败；已保留可恢复证据。"
   return "$failed"
@@ -1594,6 +1633,7 @@ cleanup_committed_install_backups() {
 
 install_self_and_units() {
   local unit index target stage
+  local INSTALL_TX_REQUIRES_DAEMON_RELOAD=1
   local -a INSTALL_TX_TARGETS=() INSTALL_TX_KINDS=() INSTALL_TX_STAGES=() INSTALL_TX_BACKUPS=()
   local -a INSTALL_TX_HAD_OLD=() INSTALL_TX_INSTALLED=() INSTALL_TX_EXPECTED_TYPES=()
   local -a INSTALL_TX_EXPECTED_FILES=() INSTALL_TX_EXPECTED_VALUES=()
@@ -1698,11 +1738,43 @@ remove_managed_shortcut() {
 }
 
 remove_managed_units() {
-  local unit path
+  local unit path load_state rm_result
+  local -a removed_units=()
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     path="$(unit_path "$unit")" || return 1
     if unit_is_ours "$path" "$unit"; then
-      if ! rm -f -- "$path" || [ -e "$path" ] || [ -L "$path" ]; then
+      rm_result=0
+      rm -f -- "$path" || rm_result=$?
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        removed_units+=("$unit")
+        # An error after unlink is still a first-call failure, but systemd has
+        # already lost a fragment and must be reloaded before retry.
+        [ "$rm_result" -eq 0 ] && continue
+      else
+        rm_result=1
+      fi
+      if [ "$rm_result" -ne 0 ]; then
+        # A previous delete changes systemd's loaded view. Reload before
+        # returning the original failure so a later public uninstall can prove
+        # absence and retry without a manual daemon-reload.
+        if [ "${#removed_units[@]}" -gt 0 ]; then
+          if ! systemctl daemon-reload; then
+            log_err "删除失败后的 systemd daemon-reload 也失败；保留其余恢复证据。"
+          else
+            for unit in "${removed_units[@]}"; do
+              load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+              [ "$load_state" = not-found ] \
+                || log_err "daemon-reload 后无法证明已删除单元已消失：$unit"
+            done
+            for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+              path="$(unit_path "$unit")" || continue
+              if [ -e "$path" ] || [ -L "$path" ]; then
+                managed_unit_has_owned_source "$unit" \
+                  || log_err "daemon-reload 后无法证明保留单元仍属于 oc-master：$unit"
+              fi
+            done
+          fi
+        fi
         log_err "删除 systemd 单元失败，保留其余安装和恢复证据：$path"
         return 1
       fi
@@ -1899,6 +1971,78 @@ collect_route_plan_addresses() {
   output_addresses=("${collected_addresses[@]}")
 }
 
+collect_live_route_topology() {
+  local default_output ipv6_address_output line device="" default4="" default6="" count=0
+  local -a return4_addresses=() return6_addresses=()
+
+  default_output="$(ip -4 route show default 2>/dev/null)" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      blackhole\ default*|unreachable\ default*|prohibit\ default*) return 1 ;;
+    esac
+    device="$(route_default_device "$line")" || return 1
+    [ "$device" = "$VPN_INTERFACE" ] && continue
+    count=$((count + 1))
+    [ "$count" -eq 1 ] || return 1
+    default4="$line"
+    ROUTE_TOPOLOGY_DEV4="$device"
+  done <<< "$default_output"
+  [ "$count" -eq 1 ] || return 1
+  collect_route_plan_addresses -4 "$ROUTE_TOPOLOGY_DEV4" return4_addresses || return 1
+  [ "${#return4_addresses[@]}" -gt 0 ] || return 1
+
+  default_output="$(ip -6 route show default 2>/dev/null)" || return 1
+  count=0
+  ROUTE_TOPOLOGY_DEV6=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      blackhole\ default*|unreachable\ default*|prohibit\ default*) return 1 ;;
+    esac
+    device="$(route_default_device "$line")" || return 1
+    [ "$device" = "$VPN_INTERFACE" ] && continue
+    count=$((count + 1))
+    [ "$count" -eq 1 ] || return 1
+    default6="$line"
+    ROUTE_TOPOLOGY_DEV6="$device"
+  done <<< "$default_output"
+  if [ "$count" -eq 1 ]; then
+    collect_route_plan_addresses -6 "$ROUTE_TOPOLOGY_DEV6" return6_addresses || return 1
+  else
+    ipv6_address_output="$(ip -6 -o addr show scope global 2>/dev/null)" || return 1
+    [ -z "$ipv6_address_output" ] || return 1
+  fi
+
+  ROUTE_TOPOLOGY_DEFAULT4="$default4"
+  ROUTE_TOPOLOGY_DEFAULT6="$default6"
+  ROUTE_TOPOLOGY_RETURN4_ADDRESSES=("${return4_addresses[@]}")
+  ROUTE_TOPOLOGY_RETURN6_ADDRESSES=("${return6_addresses[@]}")
+}
+
+route_address_sets_match() {
+  [ "$#" -eq 2 ] || return 1
+  local -n expected_addresses="$1" actual_addresses="$2"
+  local address
+  local -A actual_set=()
+
+  [ "${#expected_addresses[@]}" -eq "${#actual_addresses[@]}" ] || return 1
+  for address in "${actual_addresses[@]}"; do actual_set["$address"]=1; done
+  for address in "${expected_addresses[@]}"; do
+    [ -n "${actual_set[$address]+x}" ] || return 1
+  done
+}
+
+loaded_route_plan_matches_live_topology() {
+  collect_live_route_topology || return 1
+  [ "$ROUTE_PLAN_DEFAULT4" = "$ROUTE_TOPOLOGY_DEFAULT4" ] \
+    && [ "$ROUTE_PLAN_DEV4" = "$ROUTE_TOPOLOGY_DEV4" ] \
+    && [ "$ROUTE_PLAN_DEFAULT6" = "$ROUTE_TOPOLOGY_DEFAULT6" ] \
+    && [ "$ROUTE_PLAN_DEV6" = "$ROUTE_TOPOLOGY_DEV6" ] \
+    && route_address_sets_match ROUTE_PLAN_RETURN4_ADDRESSES ROUTE_TOPOLOGY_RETURN4_ADDRESSES \
+    && route_address_sets_match ROUTE_PLAN_RETURN6_ADDRESSES ROUTE_TOPOLOGY_RETURN6_ADDRESSES
+}
+
 route_plan_values_are_valid() {
   local run_id="$1" default4="$2" dev4="$3" default6="$4" dev6="$5"
   local address parsed_device
@@ -1923,8 +2067,6 @@ route_plan_values_are_valid() {
 build_route_plan() {
   [ "$#" -eq 1 ] && valid_uuid "$1" || return 1
   local expected_run_id="$1" runtime_mode runtime_phase runtime_desired
-  local default_output ipv6_address_output line device="" default4="" default6="" count=0
-  local -a return4_addresses=() return6_addresses=()
 
   acquire_state_lock || return 1
   if ! load_runtime_state || [ "$RUN_ID" != "$expected_run_id" ]; then
@@ -1935,54 +2077,15 @@ build_route_plan() {
   release_state_lock
   [ "$runtime_mode" = global ] && [ "$runtime_phase" = PREPARING ] && [ "$runtime_desired" = 1 ] || return 1
   route_resources_are_available || return 1
-
-  default_output="$(ip -4 route show default 2>/dev/null)" || return 1
-  count=0
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -z "$line" ] && continue
-    case "$line" in
-      blackhole\ default*|unreachable\ default*|prohibit\ default*) return 1 ;;
-    esac
-    device="$(route_default_device "$line")" || return 1
-    [ "$device" = "$VPN_INTERFACE" ] && continue
-    count=$((count + 1))
-    [ "$count" -eq 1 ] || return 1
-    default4="$line"
-    ROUTE_PLAN_BUILD_DEV4="$device"
-  done <<< "$default_output"
-  [ "$count" -eq 1 ] || return 1
-  collect_route_plan_addresses -4 "$ROUTE_PLAN_BUILD_DEV4" return4_addresses || return 1
-  [ "${#return4_addresses[@]}" -gt 0 ] || return 1
-
-  default_output="$(ip -6 route show default 2>/dev/null)" || return 1
-  count=0
-  ROUTE_PLAN_BUILD_DEV6=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -z "$line" ] && continue
-    case "$line" in
-      blackhole\ default*|unreachable\ default*|prohibit\ default*) return 1 ;;
-    esac
-    device="$(route_default_device "$line")" || return 1
-    [ "$device" = "$VPN_INTERFACE" ] && continue
-    count=$((count + 1))
-    [ "$count" -eq 1 ] || return 1
-    default6="$line"
-    ROUTE_PLAN_BUILD_DEV6="$device"
-  done <<< "$default_output"
-  if [ "$count" -eq 1 ]; then
-    collect_route_plan_addresses -6 "$ROUTE_PLAN_BUILD_DEV6" return6_addresses || return 1
-  else
-    # 没有 IPv6 default 时只接受已确认不存在 global IPv6 地址的主机。
-    ipv6_address_output="$(ip -6 -o addr show scope global 2>/dev/null)" || return 1
-    [ -z "$ipv6_address_output" ] || return 1
-    return6_addresses=()
-  fi
+  collect_live_route_topology || return 1
 
   ROUTE_PLAN_BUILD_RUN_ID="$expected_run_id"
-  ROUTE_PLAN_BUILD_DEFAULT4="$default4"
-  ROUTE_PLAN_BUILD_DEFAULT6="$default6"
-  ROUTE_PLAN_BUILD_RETURN4_ADDRESSES=("${return4_addresses[@]}")
-  ROUTE_PLAN_BUILD_RETURN6_ADDRESSES=("${return6_addresses[@]}")
+  ROUTE_PLAN_BUILD_DEFAULT4="$ROUTE_TOPOLOGY_DEFAULT4"
+  ROUTE_PLAN_BUILD_DEV4="$ROUTE_TOPOLOGY_DEV4"
+  ROUTE_PLAN_BUILD_DEFAULT6="$ROUTE_TOPOLOGY_DEFAULT6"
+  ROUTE_PLAN_BUILD_DEV6="$ROUTE_TOPOLOGY_DEV6"
+  ROUTE_PLAN_BUILD_RETURN4_ADDRESSES=("${ROUTE_TOPOLOGY_RETURN4_ADDRESSES[@]}")
+  ROUTE_PLAN_BUILD_RETURN6_ADDRESSES=("${ROUTE_TOPOLOGY_RETURN6_ADDRESSES[@]}")
 }
 
 write_route_plan() {
@@ -2096,6 +2199,7 @@ apply_route_plan() {
   validate_route_plan_against_snapshot "$expected_run_id" || return 1
   state_allows_service_run "$expected_run_id" || return 1
   route_resources_are_available || return 1
+  loaded_route_plan_matches_live_topology || return 1
   write_route_owner_from_loaded_plan "$expected_run_id" || return 1
 
   read -r -a route_args4 <<< "$ROUTE_PLAN_DEFAULT4"
@@ -2778,7 +2882,7 @@ service_health() {
 rollback_unit_probe() {
   [ "$#" -eq 2 ] && valid_uuid "$1" || return 1
   local expected_run_id="$1" unit="$2"
-  local load_state transient fragment_path contract_value
+  local load_state transient fragment_path dropin_paths needs_reload contract_value
 
   case "$unit" in
     "${ROLLBACK_UNIT}.timer"|"${ROLLBACK_UNIT}.service") ;;
@@ -2798,6 +2902,14 @@ rollback_unit_probe() {
   fi
   if ! fragment_path="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null)" \
     || [ "$fragment_path" != "/run/systemd/transient/${unit}" ]; then
+    return 1
+  fi
+  if ! dropin_paths="$(systemctl show "$unit" --all --property=DropInPaths 2>/dev/null)" \
+    || [ "$dropin_paths" != 'DropInPaths=' ]; then
+    return 1
+  fi
+  if ! needs_reload="$(systemctl show "$unit" --property=NeedDaemonReload --value 2>/dev/null)" \
+    || [ "$needs_reload" != no ]; then
     return 1
   fi
 
@@ -3374,16 +3486,16 @@ stop_vpn() {
       log "VPN 已停止，oc-master 的策略路由已清理。"
       return 0
     fi
-    if new_runtime_artifact_exists; then
-      die "检测到不完整或非法的新运行状态；为避免破坏恢复证据，拒绝停止或清理。"
-      release_service_operation_lock
-      return 1
-    fi
-    if legacy_installation_exists; then
+    if legacy_installation_exists || legacy_health_artifacts_exist; then
       if ! recover_legacy_installation; then release_service_operation_lock; return 1; fi
       release_service_operation_lock
       log "VPN 已停止，oc-master 的策略路由已清理。"
       return 0
+    fi
+    if new_runtime_artifact_exists; then
+      die "检测到不完整或非法的新运行状态；为避免破坏恢复证据，拒绝停止或清理。"
+      release_service_operation_lock
+      return 1
     fi
     if ! stop_and_disable_managed_units; then release_service_operation_lock; return 1; fi
     if ! service_cleanup; then release_service_operation_lock; return 1; fi

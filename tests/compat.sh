@@ -768,11 +768,212 @@ assert_secret_boundary() {
   done
 }
 
+# These cases run the public dispatcher against isolated paths.  Only host
+# boundaries are replaced; the command handlers, their prompts and their
+# success/error text remain real code in each revision.
+run_public_surface_variant() {
+  local case_name="$1" script_path="$2" suffix="$3" command="$4" input_text="$5"
+  local version_root="${TEST_ROOT}/public-${case_name}-${suffix}"
+  local stdout_file="${version_root}/stdout" stderr_file="${version_root}/stderr"
+  local rc_file="${version_root}/rc"
+
+  # Windows Git Bash cannot reliably create the hidden staged shortcut used by
+  # the hardened public transaction. tests/install.sh covers that real path;
+  # this compatibility seam keeps shortcut equal to program so it can still
+  # reject added config/runtime/systemctl effects portably.
+  mkdir -p "$version_root/sbin" "$version_root/bin"
+  set +e
+  printf '%s' "$input_text" | env \
+    OCM_INSTALL_PATH="${version_root}/sbin/oc-master" \
+    OCM_SHORTCUT_PATH="${version_root}/sbin/oc-master" \
+    OCM_SYSTEMD_DIR="${version_root}/systemd" \
+    OCM_CONFIG_DIR="${version_root}/config" \
+    OCM_PROFILE_FILE="${version_root}/config/profile.conf" \
+    OCM_ACCOUNTS_FILE="${version_root}/accounts.env" \
+    OCM_RUNTIME_DIR="${version_root}/run" \
+    OCM_LOCK_FILE="${version_root}/lock/manager.lock" \
+    OCM_STATE_LOCK_FILE="${version_root}/lock/state.lock" \
+    OCM_SERVICE_LOCK_FILE="${version_root}/lock/service.lock" \
+    OCM_BOOT_ID_FILE="${version_root}/boot_id" \
+    OCM_UUID_FILE="${version_root}/uuid" \
+    OCM_PROC_ROOT="${version_root}/proc" \
+    PUBLIC_EFFECTS_PATH="${version_root}/systemctl.effects" \
+    "$BASH" -c '
+      source "$1"
+      BASH_ARGV0="$1"
+      # Preserve handler-provided success text while removing terminal colour
+      # setup from this non-TTY comparison seam.
+      log() { printf "SUCCESS:%s\\n" "$*"; }
+      check_root() { :; }
+      acquire_manager_lock() { :; }
+      acquire_service_operation_lock() { :; }
+      release_service_operation_lock() { :; }
+      flock() { :; }
+      install() {
+        local directory=0 source="" destination="" mode=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            -d) directory=1; shift ;;
+            -m) mode="$2"; shift 2 ;;
+            -o|-g) shift 2 ;;
+            --) shift ;;
+            *)
+              if [ "$directory" = 1 ]; then command mkdir -p -- "$1";
+              elif [ -z "$source" ]; then source="$1"; else destination="$1"; fi
+              shift
+              ;;
+          esac
+        done
+        if [ "$directory" != 1 ]; then
+          command cp -- "$source" "$destination"
+          [ -z "$mode" ] || command chmod "$mode" "$destination"
+        fi
+      }
+      ensure_dirs() { command mkdir -p -- "$CONFIG_DIR" "$RUNTIME_DIR" "${LOCK_FILE%/*}"; }
+      systemctl() {
+        case "${1:-}" in
+          is-active)
+            case " $* " in *" --quiet "*) ;; *) printf "inactive\\n" ;; esac
+            return 3
+            ;;
+          show)
+            case " $* " in
+              *LoadState*) printf "not-found\\n" ;;
+              *NeedDaemonReload*) printf "no\\n" ;;
+              *DropInPaths*) printf "DropInPaths=\\n" ;;
+              *) printf "\\n" ;;
+            esac
+            ;;
+          daemon-reload) printf "daemon-reload\\n" >> "$PUBLIC_EFFECTS_PATH" ;;
+          *) : ;;
+        esac
+      }
+      ensure_dependencies() { :; }
+      systemd-run() { :; }
+      health_once() { :; }
+      journalctl() { printf "journal-fixture\\n"; }
+      case "$2" in
+        uninstall)
+          install -d "$(dirname -- "$INSTALL_PATH")" "$CONFIG_DIR"
+          install -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH"
+          printf "MODE=proxy\\nACCOUNT_INDEX=0\\nSOCKS_PORT=1080\\n" > "$PROFILE_FILE"
+          ;;
+        accounts-delete)
+          printf "Compat|user|secret|vpn.example.test||nc\\n" > "$ACCOUNTS_FILE"
+          ;;
+      esac
+      case "$2" in
+        accounts-add|accounts-delete) run_main accounts ;;
+        *) run_main "$2" ;;
+      esac
+    ' compat-public "$script_path" "$command" > "$stdout_file" 2> "$stderr_file"
+  rc=$?
+  set -e
+  printf '%s\n' "$rc" > "$rc_file"
+  {
+    find "$version_root" -mindepth 1 -maxdepth 3 \( -type f -o -type d -o -type l \) \
+      ! -name stdout ! -name stderr ! -name rc -print \
+      | sed "s#^${version_root}/##" | LC_ALL=C sort
+    find "$version_root" -mindepth 1 -maxdepth 3 -type l -print \
+      | sed "s#^${version_root}/##" | LC_ALL=C sort
+  } > "${version_root}/effects"
+}
+
+public_surface_files_match() {
+  local baseline_file="$1" current_file="$2" case_name="$3" artifact="$4"
+
+  # The transactional stop path creates only its two manager/state lock files
+  # before proving cleanup. This is an intentional internal tightening from
+  # e03f2aa, not a public uninstall effect; do not normalize any config,
+  # runtime, systemd, account, program, shortcut, or output artifact.
+  if [ "$case_name:$artifact" = uninstall:effects ]; then
+    sed -e '/^lock$/d' -e '/^lock\/state\.lock$/d' "$baseline_file" > "${baseline_file}.normalized-effects"
+    sed -e '/^lock$/d' -e '/^lock\/state\.lock$/d' "$current_file" > "${current_file}.normalized-effects"
+    cmp -s -- "${baseline_file}.normalized-effects" "${current_file}.normalized-effects"
+    return
+  fi
+  lifecycle_files_match "$baseline_file" "$current_file" \
+    "${TEST_ROOT}/public-${case_name}-51" "${TEST_ROOT}/public-${case_name}-52"
+}
+
+compare_public_surface_case() {
+  local case_name="$1" command="$2" input_text="$3" artifact baseline_file current_file
+
+  run_public_surface_variant "$case_name" "$BASELINE_SCRIPT" 51 "$command" "$input_text"
+  run_public_surface_variant "$case_name" "$CURRENT_SCRIPT" 52 "$command" "$input_text"
+  for artifact in 51 52; do
+    [ "$(<"${TEST_ROOT}/public-${case_name}-${artifact}/rc")" = 0 ] || {
+      cat -- "${TEST_ROOT}/public-${case_name}-${artifact}/stderr" >&2
+      fail "public ${case_name} did not reach its normal success path"
+    }
+  done
+  for artifact in rc stdout stderr effects; do
+    baseline_file="${TEST_ROOT}/public-${case_name}-51/${artifact}"
+    current_file="${TEST_ROOT}/public-${case_name}-52/${artifact}"
+    if ! public_surface_files_match "$baseline_file" "$current_file" "$case_name" "$artifact"; then
+      diff -u --label "baseline public ${case_name}.${artifact}" \
+        --label "current public ${case_name}.${artifact}" \
+        "${TEST_ROOT}/compare-baseline" "${TEST_ROOT}/compare-current" >&2 || true
+      fail "public ${case_name}.${artifact} changed"
+    fi
+  done
+  case "$case_name" in
+    accounts-add|accounts-delete)
+      # Keep credential-bearing content out of diagnostics, but compare the
+      # real persisted account record byte-for-byte.
+      cmp -s "${TEST_ROOT}/public-${case_name}-51/accounts.env" \
+        "${TEST_ROOT}/public-${case_name}-52/accounts.env" \
+        || {
+          awk -F'|' 'BEGIN { OFS="|" } { if (NF >= 3) $3 = "<redacted>"; print }' \
+            "${TEST_ROOT}/public-${case_name}-51/accounts.env" > "${TEST_ROOT}/public-${case_name}-51/accounts.redacted"
+          awk -F'|' 'BEGIN { OFS="|" } { if (NF >= 3) $3 = "<redacted>"; print }' \
+            "${TEST_ROOT}/public-${case_name}-52/accounts.env" > "${TEST_ROOT}/public-${case_name}-52/accounts.redacted"
+          diff -u "${TEST_ROOT}/public-${case_name}-51/accounts.redacted" \
+            "${TEST_ROOT}/public-${case_name}-52/accounts.redacted" >&2 || true
+          fail "public ${case_name} account effect changed"
+        }
+      ;;
+  esac
+}
+
+self_test_public_surface_comparator() {
+  local install_original="${TEST_ROOT}/public-install-52/stdout"
+  local install_mutated="${TEST_ROOT}/public-install-52/stdout.mutated"
+
+  sed 's/sudo ocm/sudo ocm-mutated/' \
+    "$install_original" > "$install_mutated"
+  cmp -s "$install_original" "$install_mutated" \
+    && fail 'public success-text mutation fixture did not change output'
+  if public_surface_files_match "${TEST_ROOT}/public-install-51/stdout" "$install_mutated" install stdout; then
+    fail 'public comparator accepted a changed install success message'
+  fi
+
+  # A non-interactive read does not render its prompt, so mutate the actual
+  # confirmation input and compare the resulting public effects to the normal
+  # REMOVE path. This proves the comparator rejects accepting a wrong word.
+  run_public_surface_variant uninstall-confirmation-mutation "$CURRENT_SCRIPT" 53 uninstall $'REMOVE-MUTATED\n'
+  if lifecycle_files_match "${TEST_ROOT}/public-uninstall-51/effects" \
+    "${TEST_ROOT}/public-uninstall-confirmation-mutation-53/effects" \
+    "${TEST_ROOT}/public-uninstall-51" "${TEST_ROOT}/public-uninstall-confirmation-mutation-53"; then
+    fail 'public comparator accepted a changed uninstall confirmation word'
+  fi
+  printf 'public command comparator mutation self-tests passed\n'
+}
+
 compare_case 'unknown-command' 'unknown-command' ''
 compare_case 'status-without-profile' 'status' ''
 compare_case 'main-menu-exit' '' $'0\n'
 compare_case 'start-proxy-without-account' 'start-proxy' ''
 compare_case 'accounts-menu-exit-without-account' 'accounts' $'0\n'
+
+compare_public_surface_case deps deps ''
+compare_public_surface_case install install ''
+compare_public_surface_case uninstall uninstall $'REMOVE\n'
+compare_public_surface_case check check ''
+compare_public_surface_case logs logs ''
+compare_public_surface_case accounts-add accounts-add $'1\nCompat\nuser\nsecret\nvpn.example.test\n\n2\n0\n'
+compare_public_surface_case accounts-delete accounts-delete $'2\n1\n0\n'
+self_test_public_surface_comparator
 
 run_proxy_lifecycle "$BASELINE_SCRIPT" 31
 run_proxy_lifecycle "$CURRENT_SCRIPT" 32
