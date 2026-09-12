@@ -977,7 +977,7 @@ unit_is_ours() {
 
 managed_unit_has_owned_source() {
   [ "$#" -eq 1 ] || return 1
-  local unit="$1" path load_state fragment_path dropin_paths
+  local unit="$1" path load_state fragment_path dropin_paths needs_reload
 
   path="$(unit_path "$unit")" || return 1
   if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
@@ -992,6 +992,9 @@ managed_unit_has_owned_source() {
     || [ "$dropin_paths" != 'DropInPaths=' ]; then
     return 1
   fi
+  needs_reload="$(systemctl show "$unit" --property=NeedDaemonReload --value 2>/dev/null)" \
+    || return 1
+  [ "$needs_reload" = no ] || return 1
   unit_is_ours "$path" "$unit"
 }
 
@@ -1353,27 +1356,186 @@ cleanup_install_stages() {
   return "$failed"
 }
 
+snapshot_install_targets() {
+  local index target stage reference
+
+  for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
+    target="${INSTALL_TX_TARGETS[index]}"
+    stage="${INSTALL_TX_STAGES[index]}"
+    INSTALL_TX_EXPECTED_FILES[index]=''
+    INSTALL_TX_EXPECTED_VALUES[index]=''
+    INSTALL_TX_STAGED_FILES[index]=''
+    INSTALL_TX_STAGED_VALUES[index]=''
+    if [ -L "$stage" ]; then
+      INSTALL_TX_STAGED_TYPES[index]='link'
+      INSTALL_TX_STAGED_VALUES[index]="$(readlink "$stage" 2>/dev/null)" || return 1
+    elif [ -f "$stage" ]; then
+      INSTALL_TX_STAGED_TYPES[index]='file'
+      reference="${stage}.new-expected"
+      INSTALL_TX_STAGED_FILES[index]="$reference"
+      cp -- "$stage" "$reference" || return 1
+    else
+      return 1
+    fi
+    if [ -L "$target" ]; then
+      INSTALL_TX_EXPECTED_TYPES[index]='link'
+      INSTALL_TX_EXPECTED_VALUES[index]="$(readlink "$target" 2>/dev/null)" || return 1
+    elif [ -f "$target" ]; then
+      INSTALL_TX_EXPECTED_TYPES[index]='file'
+      reference="${INSTALL_TX_STAGES[index]}.expected"
+      INSTALL_TX_EXPECTED_FILES[index]="$reference"
+      cp -- "$target" "$reference" || return 1
+    elif [ -e "$target" ]; then
+      return 1
+    else
+      INSTALL_TX_EXPECTED_TYPES[index]='absent'
+    fi
+  done
+}
+
+install_path_matches_snapshot() {
+  [ "$#" -eq 2 ] || return 1
+  local path="$1" index="$2"
+
+  case "${INSTALL_TX_EXPECTED_TYPES[index]:-}" in
+    absent) [ ! -e "$path" ] && [ ! -L "$path" ] ;;
+    file)
+      [ -f "$path" ] && [ ! -L "$path" ] \
+        && cmp -s -- "$path" "${INSTALL_TX_EXPECTED_FILES[index]}"
+      ;;
+    link)
+      [ -L "$path" ] \
+        && [ "$(readlink "$path" 2>/dev/null)" = "${INSTALL_TX_EXPECTED_VALUES[index]}" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+install_path_matches_staged() {
+  [ "$#" -eq 2 ] || return 1
+  local path="$1" index="$2"
+
+  case "${INSTALL_TX_STAGED_TYPES[index]:-}" in
+    file)
+      [ -f "$path" ] && [ ! -L "$path" ] \
+        && cmp -s -- "$path" "${INSTALL_TX_STAGED_FILES[index]}"
+      ;;
+    link)
+      [ -L "$path" ] \
+        && [ "$(readlink "$path" 2>/dev/null)" = "${INSTALL_TX_STAGED_VALUES[index]}" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+install_backup_is_safe() {
+  [ "$#" -eq 1 ] || return 1
+  local index backup kind
+  index="$1"
+  backup="${INSTALL_TX_BACKUPS[index]}"
+  kind="${INSTALL_TX_KINDS[index]}"
+
+  install_path_matches_snapshot "$backup" "$index" || return 1
+  case "$kind" in
+    unit:*) unit_is_ours "$backup" "${kind#unit:}" ;;
+    shortcut) [ -L "$backup" ] && [ "$(readlink "$backup" 2>/dev/null)" = "$INSTALL_PATH" ] ;;
+    program) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+installed_target_matches_transaction() {
+  [ "$#" -eq 1 ] || return 1
+  local index target kind
+  index="$1"
+  target="${INSTALL_TX_TARGETS[index]}"
+  kind="${INSTALL_TX_KINDS[index]}"
+  install_path_matches_staged "$target" "$index" || return 1
+
+  case "$kind" in
+    program)
+      [ -f "$target" ] && [ ! -L "$target" ] && [ -x "$target" ]
+      ;;
+    unit:*) managed_unit_file_is_current "${kind#unit:}" ;;
+    shortcut) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_installed_transaction_targets() {
+  local index
+
+  for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
+    installed_target_matches_transaction "$index" || return 1
+  done
+}
+
+restore_moved_target_without_clobber() {
+  [ "$#" -eq 2 ] || return 1
+  local target="$1" backup="$2"
+
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    return 1
+  fi
+  mv -T -n -- "$backup" "$target" \
+    && [ ! -e "$backup" ] && [ ! -L "$backup" ]
+}
+
+cleanup_install_expectations() {
+  local reference failed=0
+
+  for reference in "${INSTALL_TX_EXPECTED_FILES[@]}" "${INSTALL_TX_STAGED_FILES[@]}"; do
+    [ -n "$reference" ] || continue
+    if { [ -e "$reference" ] || [ -L "$reference" ]; } \
+      && { ! rm -f -- "$reference" || [ -e "$reference" ] || [ -L "$reference" ]; }; then
+      log_err "安装目标快照清理失败，保留文件：$reference"
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
 restore_install_transaction() {
-  local index target backup stage failed=0 restored=0
+  local index target backup stage reference failed=0 restored=0 index_failed=0
   for ((index = ${#INSTALL_TX_TARGETS[@]} - 1; index >= 0; index--)); do
     target="${INSTALL_TX_TARGETS[index]}"
     backup="${INSTALL_TX_BACKUPS[index]:-}"
     stage="${INSTALL_TX_STAGES[index]:-}"
     restored=0
-    if [ "${INSTALL_TX_INSTALLED[index]:-0}" = 1 ] && { [ -e "$target" ] || [ -L "$target" ]; } && ! rm -f -- "$target"; then
-      log_err "安装回滚失败，无法删除新文件：$target"
-      failed=1
+    index_failed=0
+    if [ "${INSTALL_TX_INSTALLED[index]:-0}" = 1 ] \
+      && { [ -e "$target" ] || [ -L "$target" ]; }; then
+      if ! installed_target_matches_transaction "$index"; then
+        log_err "安装回滚检测到目标已被外部替换，保留当前文件与旧备份：$target"
+        failed=1
+        index_failed=1
+      elif ! rm -f -- "$target" || [ -e "$target" ] || [ -L "$target" ]; then
+        log_err "安装回滚失败，无法删除新文件：$target"
+        failed=1
+        index_failed=1
+      fi
     fi
     if [ "${INSTALL_TX_HAD_OLD[index]:-0}" = 1 ]; then
       if [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
         log_err "安装回滚失败，旧文件备份丢失：$backup"
         failed=1
+        index_failed=1
+      elif ! install_backup_is_safe "$index"; then
+        log_err "安装回滚失败，旧文件备份不再匹配受管目标；保留备份：$backup"
+        failed=1
+        index_failed=1
       elif [ -e "$target" ] || [ -L "$target" ]; then
         log_err "安装回滚失败，目标仍存在；保留旧文件备份：$backup"
         failed=1
-      elif ! mv -f -- "$backup" "$target"; then
+        index_failed=1
+      elif ! restore_moved_target_without_clobber "$target" "$backup"; then
         log_err "安装回滚失败，保留旧文件备份：$backup"
         failed=1
+        index_failed=1
+      elif ! install_path_matches_snapshot "$target" "$index"; then
+        log_err "安装回滚失败，恢复后的目标不再匹配旧文件：$target"
+        failed=1
+        index_failed=1
       else
         restored=1
       fi
@@ -1381,11 +1543,24 @@ restore_install_transaction() {
     if [ -n "$stage" ] && { [ -e "$stage" ] || [ -L "$stage" ]; } && ! rm -f -- "$stage"; then
       log_err "安装回滚暂存清理失败，保留文件：$stage"
       failed=1
+      index_failed=1
     fi
-    if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; } && [ "$restored" -eq 1 ]; then
+    if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; } \
+      && [ "$restored" -eq 1 ]; then
       log_err "安装回滚失败，旧文件备份仍存在：$backup"
       failed=1
+      index_failed=1
     fi
+    for reference in "${INSTALL_TX_EXPECTED_FILES[index]:-}" "${INSTALL_TX_STAGED_FILES[index]:-}"; do
+      [ -n "$reference" ] && { [ -e "$reference" ] || [ -L "$reference" ]; } || continue
+      if [ "$index_failed" -eq 1 ]; then
+        log_err "安装回滚保留目标快照：$reference"
+      elif ! rm -f -- "$reference" || [ -e "$reference" ] || [ -L "$reference" ]; then
+        log_err "安装回滚目标快照清理失败，保留文件：$reference"
+        failed=1
+        index_failed=1
+      fi
+    done
   done
   if ! systemctl daemon-reload; then
     log_err "安装回滚失败，systemd daemon-reload 未成功；请在保留的备份旁手动恢复后重试。"
@@ -1402,7 +1577,10 @@ cleanup_committed_install_backups() {
     backup="${INSTALL_TX_BACKUPS[index]:-}"
     [ -n "$backup" ] || continue
     if [ -e "$backup" ] || [ -L "$backup" ]; then
-      if ! rm -f -- "$backup" || [ -e "$backup" ] || [ -L "$backup" ]; then
+      if ! install_backup_is_safe "$index"; then
+        log_err "安装备份已发生变化，保留文件：$backup"
+        failed=1
+      elif ! rm -f -- "$backup" || [ -e "$backup" ] || [ -L "$backup" ]; then
         log_err "安装备份清理失败，保留文件：$backup"
         failed=1
       fi
@@ -1416,11 +1594,15 @@ cleanup_committed_install_backups() {
 
 install_self_and_units() {
   local unit index target stage
-  local -a INSTALL_TX_TARGETS INSTALL_TX_STAGES INSTALL_TX_BACKUPS INSTALL_TX_HAD_OLD INSTALL_TX_INSTALLED
+  local -a INSTALL_TX_TARGETS=() INSTALL_TX_KINDS=() INSTALL_TX_STAGES=() INSTALL_TX_BACKUPS=()
+  local -a INSTALL_TX_HAD_OLD=() INSTALL_TX_INSTALLED=() INSTALL_TX_EXPECTED_TYPES=()
+  local -a INSTALL_TX_EXPECTED_FILES=() INSTALL_TX_EXPECTED_VALUES=()
+  local -a INSTALL_TX_STAGED_TYPES=() INSTALL_TX_STAGED_FILES=() INSTALL_TX_STAGED_VALUES=()
   preflight_install_targets || return 1
   ensure_dirs || return 1
 
   INSTALL_TX_TARGETS=( "$INSTALL_PATH" "$(unit_path "$SERVICE_NAME")" "$(unit_path "$HEALTH_SERVICE_NAME")" "$(unit_path "$HEALTH_TIMER_NAME")" )
+  INSTALL_TX_KINDS=( program "unit:${SERVICE_NAME}" "unit:${HEALTH_SERVICE_NAME}" "unit:${HEALTH_TIMER_NAME}" )
   stage="$(stage_managed_program)" || return 1
   INSTALL_TX_STAGES+=( "$stage" )
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
@@ -1431,15 +1613,24 @@ install_self_and_units() {
     INSTALL_TX_STAGES+=( "$stage" )
   done
   if [ "$SHORTCUT_PATH" != "$INSTALL_PATH" ] && ! shortcut_is_ours; then
-    INSTALL_TX_TARGETS+=( "$SHORTCUT_PATH" )
     if ! stage="$(stage_shortcut)"; then
       cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
       return 1
     fi
-    INSTALL_TX_STAGES+=( "$stage" )
+    if [ -n "$stage" ]; then
+      INSTALL_TX_TARGETS+=( "$SHORTCUT_PATH" )
+      INSTALL_TX_KINDS+=( shortcut )
+      INSTALL_TX_STAGES+=( "$stage" )
+    fi
+  fi
+  if ! snapshot_install_targets; then
+    cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
+    cleanup_install_expectations || true
+    return 1
   fi
   if ! preflight_install_targets; then
     cleanup_install_stages "${INSTALL_TX_STAGES[@]}" || true
+    cleanup_install_expectations || true
     return 1
   fi
   for ((index = 0; index < ${#INSTALL_TX_TARGETS[@]}; index++)); do
@@ -1447,24 +1638,55 @@ install_self_and_units() {
     INSTALL_TX_HAD_OLD[index]=0
     INSTALL_TX_INSTALLED[index]=0
     target="${INSTALL_TX_TARGETS[index]}"
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      INSTALL_TX_HAD_OLD[index]=1
-      if ! mv -f -- "$target" "${INSTALL_TX_BACKUPS[index]}"; then
+    if ! install_path_matches_snapshot "$target" "$index"; then
+      log_err "安装提交前目标已发生变化，拒绝覆盖：$target"
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+      return 1
+    fi
+    if [ "${INSTALL_TX_EXPECTED_TYPES[index]}" != absent ]; then
+      if ! mv -T -n -- "$target" "${INSTALL_TX_BACKUPS[index]}"; then
         restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
         return 1
       fi
+      if ! install_backup_is_safe "$index"; then
+        log_err "安装备份不再匹配预检目标，拒绝继续：${INSTALL_TX_BACKUPS[index]}"
+        if ! restore_moved_target_without_clobber "$target" "${INSTALL_TX_BACKUPS[index]}"; then
+          log_err "无法无覆盖恢复刚移动的目标；保留当前目标与备份：$target"
+        fi
+        restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+        return 1
+      fi
+      INSTALL_TX_HAD_OLD[index]=1
     fi
-    if ! mv -f -- "${INSTALL_TX_STAGES[index]}" "$target"; then
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      log_err "安装目标在提升暂存文件前被占用，拒绝覆盖：$target"
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+      return 1
+    fi
+    if ! mv -T -n -- "${INSTALL_TX_STAGES[index]}" "$target" \
+      || [ -e "${INSTALL_TX_STAGES[index]}" ] || [ -L "${INSTALL_TX_STAGES[index]}" ]; then
       restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
       return 1
     fi
     INSTALL_TX_INSTALLED[index]=1
+    if ! installed_target_matches_transaction "$index"; then
+      log_err "安装目标在提升后不再匹配本轮内容，拒绝继续：$target"
+      restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+      return 1
+    fi
   done
-  if ! systemctl daemon-reload || ! verify_installed_units; then
+  if ! verify_installed_transaction_targets \
+    || ! systemctl daemon-reload \
+    || ! verify_installed_units \
+    || ! verify_installed_transaction_targets; then
     restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
     return 1
   fi
-  cleanup_committed_install_backups
+  if ! cleanup_committed_install_backups; then
+    log_err "安装备份清理异常；保留本轮目标快照作为核验依据。"
+    return 1
+  fi
+  cleanup_install_expectations
 }
 
 remove_managed_shortcut() {
