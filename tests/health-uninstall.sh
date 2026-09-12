@@ -424,15 +424,41 @@ migrate_legacy_profile() { legacy_migration_called=1; }
 if prepare_runtime_configuration_for_start >/dev/null 2>&1; then fail 'partial new state fell back to legacy'; fi
 [ "$legacy_migration_called" = 0 ] || fail 'partial new state invoked legacy migration'
 
-# Each health evidence artifact is itself a new-runtime marker. Test each one
-# in isolation, including non-regular forms that must remain fail-closed.
+# v8's bare decimal counter/timestamp is legacy residue only after unit
+# ownership and quiescence have been established. It must be removed by the
+# start recovery path; arbitrary new-generation-looking health evidence stays
+# fail-closed and must not trigger legacy mutations.
 for health_artifact in "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"; do
-  for artifact_kind in regular symlink directory; do
+  reset_runtime
+  ensure_dirs
+  write_profile proxy 0 nc 1080
+  printf '%s\n' 12345 > "$health_artifact"
+  legacy_cleanup_called=0
+  legacy_migration_called=0
+  preflight_managed_units_ownership() { legacy_cleanup_called=$((legacy_cleanup_called + 1)); }
+  stop_and_disable_managed_units() { [ "$legacy_cleanup_called" -eq 1 ] || return 1; legacy_cleanup_called=$((legacy_cleanup_called + 1)); }
+  migrate_legacy_profile() { legacy_migration_called=1; }
+  prepare_runtime_configuration_for_start \
+    || fail "v8 decimal ${health_artifact##*/} did not converge through start recovery"
+  [ "$legacy_cleanup_called" -eq 2 ] \
+    || fail "v8 decimal ${health_artifact##*/} was removed before unit ownership/quiescence"
+  [ "$legacy_migration_called" = 1 ] \
+    || fail "v8 decimal ${health_artifact##*/} did not continue legacy start migration"
+  [ ! -e "$health_artifact" ] && [ ! -L "$health_artifact" ] \
+    || fail "v8 decimal ${health_artifact##*/} remained after verified legacy recovery"
+done
+
+# Non-decimal regular files, multi-line files, links and directories are never
+# v8 residue.
+for health_artifact in "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"; do
+  for artifact_kind in regular multiline trailing-blank symlink directory; do
     reset_runtime
     ensure_dirs
     write_profile proxy 0 nc 1080
     case "$artifact_kind" in
       regular) printf '%s\n' evidence > "$health_artifact" ;;
+      multiline) printf '%s\n%s\n' 123 UNKNOWN > "$health_artifact" ;;
+      trailing-blank) printf '123\n\n' > "$health_artifact" ;;
       symlink) printf '%s\n' target > "${TEST_ROOT}/health-target"; ln -s -- "${TEST_ROOT}/health-target" "$health_artifact" ;;
       directory) mkdir -p -- "$health_artifact" ;;
     esac
@@ -446,6 +472,32 @@ for health_artifact in "$HEALTH_FAILURE_FILE" "$HEALTH_RESTART_FILE"; do
     [ "$legacy_cleanup_called" = 0 ] || fail "${health_artifact##*/} ${artifact_kind} attempted legacy unit cleanup"
     [ "$legacy_migration_called" = 0 ] || fail "${health_artifact##*/} ${artifact_kind} invoked legacy migration"
   done
+done
+
+# The public stop and uninstall routes must take the same verified legacy
+# recovery branch as start.  This guards the actual dispatch chain rather than
+# merely calling the recovery helper directly.
+for legacy_public_action in stop uninstall; do
+  reset_runtime
+  ensure_dirs
+  write_profile proxy 0 nc 1080
+  printf '%s\n' 12345 > "$HEALTH_FAILURE_FILE"
+  legacy_public_calls="${TEST_ROOT}/legacy-public-${legacy_public_action}.calls"
+  preflight_managed_units_ownership() { printf '%s\n' preflight >> "$legacy_public_calls"; }
+  stop_and_disable_managed_units() { printf '%s\n' stop >> "$legacy_public_calls"; }
+  acquire_service_operation_lock() { :; }
+  release_service_operation_lock() { :; }
+  systemctl() { [ "$*" = daemon-reload ] || return 0; }
+  if [ "$legacy_public_action" = stop ]; then
+    stop_vpn || fail 'v8 decimal residue did not converge through public stop'
+  else
+    printf 'REMOVE\n' | uninstall_manager \
+      || fail 'v8 decimal residue did not converge through uninstall-via-stop'
+  fi
+  [ "$(cat "$legacy_public_calls")" = $'preflight\nstop' ] \
+    || fail "public ${legacy_public_action} skipped verified legacy unit recovery"
+  [ ! -e "$HEALTH_FAILURE_FILE" ] && [ ! -L "$HEALTH_FAILURE_FILE" ] \
+    || fail "public ${legacy_public_action} retained v8 decimal residue"
 done
 
 make_owned_install() {
@@ -548,6 +600,36 @@ done
 grep -F '删除 systemd 单元失败' "$unit_remove_postcondition_output" >/dev/null \
   || fail 'unit deletion postcondition failure lacked a diagnostic'
 
+# An unlink may have happened even when rm reports failure. This is still a
+# partial delete: reload before returning the original failure so systemd does
+# not keep a stale fragment that blocks the next public uninstall.
+reset_runtime
+ensure_dirs
+mkdir -p -- "$SYSTEMD_DIR"
+for unit_path_fixture in "${managed_unit_paths[@]}"; do
+  printf '%s\n' '# Managed by oc-master' > "$unit_path_fixture"
+done
+rm_after_unlink_reload_log="${TEST_ROOT}/rm-after-unlink.reload"
+if (
+  rm() {
+    local target="${!#}"
+    if [ "$target" = "${managed_unit_paths[0]}" ]; then command rm "$@"; return 1; fi
+    command rm "$@"
+  }
+  systemctl() {
+    case "$*" in
+      daemon-reload) printf '%s\n' reload >> "$rm_after_unlink_reload_log" ;;
+      "show $SERVICE_NAME --property=LoadState --value") printf '%s\n' not-found ;;
+      *) return 0 ;;
+    esac
+  }
+  remove_managed_units
+); then
+  fail 'rm failure after unlink was incorrectly reported as success'
+fi
+[ ! -e "${managed_unit_paths[0]}" ] || fail 'rm-after-unlink fixture did not remove the first unit'
+[ -f "$rm_after_unlink_reload_log" ] || fail 'rm failure after unlink did not daemon-reload before returning'
+
 # The full uninstaller must not cross the unit-removal boundary after a middle
 # failure: daemon-reload, program/shortcut removal, and recovery evidence all
 # remain untouched.
@@ -579,7 +661,7 @@ else
   uninstall_unit_failure_result=$?
 fi
 [ "$uninstall_unit_failure_result" -ne 0 ] || fail 'uninstall masked a managed unit deletion failure'
-[ ! -e "$uninstall_daemon_calls" ] || fail 'uninstall daemon-reloaded after managed unit deletion failure'
+[ -f "$uninstall_daemon_calls" ] || fail 'uninstall did not daemon-reload after a partial managed-unit deletion'
 for preserved in "$INSTALL_PATH" "$PROFILE_FILE" "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE"; do
   [ -e "$preserved" ] || fail "unit deletion failure let uninstall remove $preserved"
 done
@@ -588,6 +670,66 @@ done
 [ -f "${managed_unit_paths[1]}" ] && [ -f "${managed_unit_paths[2]}" ] \
   || fail 'uninstall continued deleting units after the middle failure'
 printf 'managed unit removal failure tests passed\n'
+
+# A failed first/middle/last deletion must leave a retryable public uninstall.
+# In particular, units deleted before the failure need a reload immediately so
+# the next invocation does not see stale loaded fragments and require a manual
+# daemon-reload.
+for uninstall_retry_case in first middle last; do
+  case "$uninstall_retry_case" in
+    first) uninstall_retry_index=0 ;;
+    middle) uninstall_retry_index=1 ;;
+    last) uninstall_retry_index=2 ;;
+  esac
+  reset_runtime
+  ensure_dirs
+  make_owned_install
+  write_active_run "$RUN_PROXY" "$BOOT_ID" proxy 0 nc 1080 "$ACCOUNT"
+  write_run_state "$RUN_PROXY" CLEANED 0 0
+  uninstall_retry_marker="${TEST_ROOT}/uninstall-retry-${uninstall_retry_case}.injected"
+  uninstall_retry_reload_log="${TEST_ROOT}/uninstall-retry-${uninstall_retry_case}.reload"
+  if ! (
+    stop_vpn() { :; }
+    systemctl() {
+      local unit path
+      case "$*" in
+        daemon-reload) printf '%s\n' reload >> "$uninstall_retry_reload_log" ;;
+        "show "*" --property=LoadState --value")
+          unit="$2"; path="$(unit_path "$unit")"
+          if [ -e "$path" ] || [ -L "$path" ]; then printf '%s\n' loaded; else printf '%s\n' not-found; fi
+          ;;
+        "show "*" --property=FragmentPath --value") unit="$2"; unit_path "$unit" ;;
+        "show "*" --all --property=DropInPaths") printf '%s\n' 'DropInPaths=' ;;
+        "show "*" --property=NeedDaemonReload --value") printf '%s\n' no ;;
+        *) return 0 ;;
+      esac
+    }
+    rm() {
+      local target="${!#}"
+      if [ "$target" = "${managed_unit_paths[uninstall_retry_index]}" ] && [ ! -e "$uninstall_retry_marker" ]; then
+        : > "$uninstall_retry_marker"
+        return 1
+      fi
+      command rm "$@"
+    }
+    if printf 'REMOVE\n' | uninstall_manager >/dev/null 2>&1; then
+      fail "uninstall retry fixture accepted its first ${uninstall_retry_case} deletion failure"
+    fi
+    [ -e "$uninstall_retry_marker" ] || fail "uninstall retry fixture did not inject ${uninstall_retry_case} failure"
+    if [ "$uninstall_retry_index" -gt 0 ]; then
+      [ -s "$uninstall_retry_reload_log" ] || fail "${uninstall_retry_case} failure did not reload deleted units"
+    fi
+    printf 'REMOVE\n' | uninstall_manager >/dev/null 2>&1 \
+      || fail "public uninstall did not converge after ${uninstall_retry_case} failure"
+  ); then
+    fail "uninstall retry regression failed for ${uninstall_retry_case}"
+  fi
+  for removed in "${managed_unit_paths[@]}" "$INSTALL_PATH" "$PROFILE_FILE" "$ACTIVE_RUN_FILE" "$RUN_STATE_FILE"; do
+    [ ! -e "$removed" ] && [ ! -L "$removed" ] \
+      || fail "retry after ${uninstall_retry_case} failure retained $removed"
+  done
+done
+printf 'public uninstall retry convergence tests passed\n'
 
 # Uninstall removes only confirmed-owned objects after a committed CLEANED
 # state; accounts and foreign files are retained.
