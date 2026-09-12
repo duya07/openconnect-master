@@ -14,7 +14,14 @@ trap 'cleanup_test_root "$TEST_ROOT"' EXIT
 export_test_paths "$TEST_ROOT"
 
 # shellcheck source=../oc_master.sh
-source ./oc_master.sh
+if [ "${OCM_INSTALL_SELF_PATH_CASE:-0}" = 1 ]; then
+  mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
+  cp -- ./oc_master.sh "$OCM_INSTALL_PATH"
+  chmod 0755 -- "$OCM_INSTALL_PATH"
+  source "$OCM_INSTALL_PATH"
+else
+  source ./oc_master.sh
+fi
 
 # Directory ownership is not part of the deployment transaction and Git for
 # Windows cannot emulate root-owned 0700 directories.
@@ -186,6 +193,69 @@ save_legacy_originals() {
   cp -- "${OCM_SYSTEMD_DIR}/${HEALTH_SERVICE_NAME}" "$TEST_ROOT/original-health"
   cp -- "${OCM_SYSTEMD_DIR}/${HEALTH_TIMER_NAME}" "$TEST_ROOT/original-timer"
 }
+
+run_self_path_post_promotion_race() {
+  local race_marker='foreign post-promotion self-path program' injected backup new_reference install_rc=0
+  local -a INSTALL_TX_TARGETS=() INSTALL_TX_KINDS=() INSTALL_TX_STAGED_TYPES=()
+  local -a INSTALL_TX_STAGED_FILES=() INSTALL_TX_STAGED_VALUES=()
+
+  seed_legacy_units
+  save_legacy_originals
+  new_reference="${TEST_ROOT}/self-path-program.new-expected"
+  cp -- "$INSTALL_PATH" "$new_reference"
+  INSTALL_TX_TARGETS=( "$INSTALL_PATH" )
+  INSTALL_TX_KINDS=( program )
+  INSTALL_TX_STAGED_TYPES=( file )
+  INSTALL_TX_STAGED_FILES=( "$new_reference" )
+  INSTALL_TX_STAGED_VALUES=( '' )
+  # The production verifier consumes these arrays through Bash dynamic scope.
+  : "${INSTALL_TX_TARGETS[@]}" "${INSTALL_TX_KINDS[@]}" "${INSTALL_TX_STAGED_TYPES[@]}" \
+    "${INSTALL_TX_STAGED_FILES[@]}" "${INSTALL_TX_STAGED_VALUES[@]}"
+  printf '#!/usr/bin/env bash\n# %s\n' "$race_marker" > "$INSTALL_PATH"
+  [ "$SCRIPT_PATH" = "$INSTALL_PATH" ] || fail 'self-path fixture did not bind SCRIPT_PATH to INSTALL_PATH'
+  [ -f "$INSTALL_PATH" ] && [ ! -L "$INSTALL_PATH" ] && [ -x "$INSTALL_PATH" ] \
+    || fail 'self-path replacement did not retain the executable file shape'
+  if installed_target_matches_transaction 0; then
+    fail 'self-path verifier accepted bytes that differ from the staged program'
+  fi
+
+  seed_legacy_units
+  save_legacy_originals
+  injected="${TEST_ROOT}/post-promotion-self-path.injected"
+  shortcut_is_ours() { return 0; }
+  preflight_install_targets() { return 0; }
+  MOCK_DAEMON_RELOAD_FAIL=1
+  mv() {
+    local source="${*: -2:1}" destination="${!#}"
+    if [ ! -e "$injected" ] && [ "$destination" = "$INSTALL_PATH" ] \
+      && [[ "$source" != *.backup ]]; then
+      command mv "$@" || return 1
+      printf '#!/usr/bin/env bash\n# %s\n' "$race_marker" > "$INSTALL_PATH"
+      : > "$injected"
+      return 0
+    fi
+    command mv "$@"
+  }
+  install_self_and_units >/dev/null 2>&1 || install_rc=$?
+  [ -e "$injected" ] || fail 'self-path fixture did not replace the promoted program'
+  [ "$install_rc" -ne 0 ] || fail 'self-path post-promotion race reported success'
+  grep -Fx "# $race_marker" "$INSTALL_PATH" >/dev/null \
+    || fail 'self-path rollback deleted the foreign replacement'
+  backup="$(find "$(dirname -- "$INSTALL_PATH")" -maxdepth 1 -name '*.backup' -print -quit)"
+  [ -n "$backup" ] || fail 'self-path rollback did not retain the old program backup'
+  cmp -s "$TEST_ROOT/original-program" "$backup" \
+    || fail 'self-path rollback changed the old program backup'
+}
+
+if [ "${OCM_INSTALL_SELF_PATH_CASE:-0}" = 1 ]; then
+  run_self_path_post_promotion_race
+  printf 'self-path post-promotion race test passed\n'
+  exit 0
+fi
+
+if ! OCM_INSTALL_SELF_PATH_CASE=1 "${BASH}" tests/install.sh; then
+  fail 'installed-path program identity guard regressed'
+fi
 
 # A replacement while the main unit is transitioning can race with systemd's
 # restart/stop machinery.  Only inactive, failed, or absent units are safe.
@@ -409,6 +479,261 @@ for staging_race in unit-create unit-replace shortcut-create shortcut-replace; d
 done
 unset MOCK_SYSTEMCTL_MUTATIONS MOCK_SOURCE_UNIT MOCK_SOURCE_CASE
 printf 'post-staging preflight race tests passed\n'
+
+# A loaded unit whose exact fragment still needs daemon-reload is not safe to
+# replace.  Reject it before staging or any systemd mutation.
+commit_guard_failures=0
+record_commit_guard_failure() {
+  printf 'commit guard regression: %s\n' "$*" >&2
+  commit_guard_failures=$((commit_guard_failures + 1))
+}
+
+for reload_case in yes empty query-fail; do
+  seed_legacy_units
+  reload_stage_marker="${TEST_ROOT}/reload-needed-install-${reload_case}.stage"
+  reload_mutations="${TEST_ROOT}/reload-needed-install-${reload_case}.systemctl"
+  : > "$reload_mutations"
+  reload_install_rc=0
+  (
+    MOCK_NEED_RELOAD_UNIT="$SERVICE_NAME"
+    MOCK_NEED_RELOAD_CASE="$reload_case"
+    MOCK_SYSTEMCTL_MUTATIONS="$reload_mutations"
+    stage_managed_program() { : > "$reload_stage_marker"; return 1; }
+    install_self_and_units >/dev/null 2>&1
+  ) || reload_install_rc=$?
+  [ "$reload_install_rc" -ne 0 ] \
+    || record_commit_guard_failure "install accepted NeedDaemonReload=$reload_case"
+  [ ! -e "$reload_stage_marker" ] \
+    || record_commit_guard_failure "install staged before rejecting NeedDaemonReload=$reload_case"
+  [ ! -s "$reload_mutations" ] \
+    || record_commit_guard_failure "install mutated systemd for NeedDaemonReload=$reload_case"
+  rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+done
+
+# If the shortcut becomes managed between the outer decision and
+# stage_shortcut's inner recheck, its empty stage means there is no target to
+# commit.  It must not enter the transaction or create a relative `.backup`.
+seed_legacy_units
+empty_shortcut_backup_call="${TEST_ROOT}/empty-shortcut-stage.backup-call"
+empty_shortcut_rc=0
+(
+  cd -- "$TEST_ROOT"
+  shortcut_is_ours() {
+    if [ -f "$SHORTCUT_PATH" ] \
+      && grep -Fx 'managed shortcut appeared during staging' "$SHORTCUT_PATH" >/dev/null; then
+      return 0
+    fi
+    mkdir -p -- "$(dirname -- "$SHORTCUT_PATH")"
+    printf '%s\n' 'managed shortcut appeared during staging' > "$SHORTCUT_PATH"
+    return 1
+  }
+  mv() {
+    local destination="${!#}"
+    [ "$destination" != .backup ] || : > "$empty_shortcut_backup_call"
+    command mv "$@"
+  }
+  install_self_and_units >/dev/null 2>&1
+) || empty_shortcut_rc=$?
+[ "$empty_shortcut_rc" -eq 0 ] \
+  || record_commit_guard_failure 'empty shortcut stage entered the transaction'
+[ ! -e "$empty_shortcut_backup_call" ] \
+  || record_commit_guard_failure 'empty shortcut stage formed a relative .backup'
+grep -Fx 'managed shortcut appeared during staging' "$OCM_SHORTCUT_PATH" >/dev/null \
+  || record_commit_guard_failure 'managed shortcut changed after an empty stage'
+rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+
+# A snapshot that fails after creating earlier old/new references must remove
+# every reference and stage without changing any target.
+seed_legacy_units
+save_legacy_originals
+snapshot_failure_rc=0
+(
+  shortcut_is_ours() { return 0; }
+  preflight_install_targets() { return 0; }
+  snapshot_copy_count=0
+  cp() {
+    local destination="${!#}"
+    if [[ "$destination" == *.expected ]]; then
+      snapshot_copy_count=$((snapshot_copy_count + 1))
+      [ "$snapshot_copy_count" -ne 3 ] || return 1
+    fi
+    command cp "$@"
+  }
+  install_self_and_units >/dev/null 2>&1
+) || snapshot_failure_rc=$?
+[ "$snapshot_failure_rc" -ne 0 ] \
+  || record_commit_guard_failure 'mid-snapshot copy failure reported success'
+assert_legacy_restored
+rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+
+# Commit-race assertions use the first target (program) and the last target
+# when no shortcut stage is needed (health timer), so both loop boundaries are
+# covered without relying on POSIX symlink support.
+assert_non_raced_targets_restored() {
+  local label="$1" raced_target="$2" unit target original
+  if [ "$raced_target" != "$INSTALL_PATH" ] \
+    && ! cmp -s "$TEST_ROOT/original-program" "$INSTALL_PATH"; then
+    record_commit_guard_failure "$label did not restore the non-raced program"
+  fi
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    target="$(unit_path "$unit")"
+    [ "$raced_target" != "$target" ] || continue
+    case "$unit" in
+      "$SERVICE_NAME") original="$TEST_ROOT/original-main" ;;
+      "$HEALTH_SERVICE_NAME") original="$TEST_ROOT/original-health" ;;
+      "$HEALTH_TIMER_NAME") original="$TEST_ROOT/original-timer" ;;
+    esac
+    cmp -s "$original" "$target" \
+      || record_commit_guard_failure "$label did not restore non-raced $unit"
+  done
+}
+
+assert_race_backup_retained() {
+  local label="$1" target="$2" original="$3" backup stage old_reference new_reference
+  backup="$(find "$(dirname -- "$target")" -maxdepth 1 -name '*.backup' -print -quit)"
+  if [ -z "$backup" ]; then
+    record_commit_guard_failure "$label did not retain the old managed backup"
+    return
+  fi
+  cmp -s "$original" "$backup" \
+    || record_commit_guard_failure "$label changed the old managed backup"
+  stage="${backup%.backup}"
+  old_reference="${stage}.expected"
+  new_reference="${stage}.new-expected"
+  [ -f "$old_reference" ] \
+    || record_commit_guard_failure "$label did not retain the old target reference"
+  [ -f "$new_reference" ] \
+    || record_commit_guard_failure "$label did not retain the staged-new reference"
+  if [ -f "$new_reference" ] && cmp -s "$target" "$new_reference"; then
+    record_commit_guard_failure "$label foreign target matched the staged-new reference"
+  fi
+}
+
+assert_no_race_leftovers() {
+  local label="$1"
+  if find "$TEST_ROOT" \( -name '*.backup' -o -name '.*.oc-master.*' \) -print -quit | grep -q .; then
+    record_commit_guard_failure "$label left a transaction file"
+  fi
+}
+
+write_foreign_commit_target() {
+  local target="$1" marker="$2"
+
+  if [ "$target" = "$INSTALL_PATH" ]; then
+    printf '#!/usr/bin/env bash\n# %s\n' "$marker" > "$target"
+  else
+    printf '%s\n' "$marker" > "$target"
+  fi
+}
+
+assert_foreign_commit_target() {
+  local label="$1" target="$2" marker="$3" expected
+  expected="$marker"
+
+  [ "$target" != "$INSTALL_PATH" ] || expected="# $marker"
+  grep -Fx "$expected" "$target" >/dev/null \
+    || record_commit_guard_failure "$label overwrote foreign bytes"
+}
+
+run_commit_race_case() {
+  local window="$1" race_position="$2" race_target race_original shape label race_marker race_injected install_rc=0
+
+  seed_legacy_units
+  save_legacy_originals
+  case "$race_position" in
+    first)
+      race_target="$INSTALL_PATH"
+      race_original="$TEST_ROOT/original-program"
+      ;;
+    last)
+      race_target="$(unit_path "$HEALTH_TIMER_NAME")"
+      race_original="$TEST_ROOT/original-timer"
+      ;;
+    *) return 1 ;;
+  esac
+  case "$window" in
+    post-preflight)
+      shape=replace
+      if [ "$race_position" = last ]; then
+        shape=create
+        rm -f -- "$race_target"
+      fi
+      label="post-preflight-${race_position}-${shape}"
+      race_marker="foreign ${label}"
+      (
+        shortcut_is_ours() { return 0; }
+        install_preflight_calls=0
+        preflight_install_targets() {
+          install_preflight_calls=$((install_preflight_calls + 1))
+          if [ "$install_preflight_calls" -eq 2 ]; then
+            write_foreign_commit_target "$race_target" "$race_marker"
+          fi
+          return 0
+        }
+        install_self_and_units >/dev/null 2>&1
+      ) || install_rc=$?
+      ;;
+    post-backup-move|pre-promotion|post-promotion)
+      label="${window}-${race_position}"
+      race_marker="foreign ${label}"
+      race_injected="${TEST_ROOT}/${label}.injected"
+      [ "$window" != pre-promotion ] || rm -f -- "$race_target"
+      (
+        shortcut_is_ours() { return 0; }
+        preflight_install_targets() { return 0; }
+        if [ "$window" = post-promotion ]; then
+          MOCK_DAEMON_RELOAD_FAIL=1
+        fi
+        mv() {
+          local source="${*: -2:1}" destination="${!#}"
+          if [ ! -e "$race_injected" ] && [ "$window" = post-backup-move ] \
+            && [ "$source" = "$race_target" ] && [[ "$destination" == *.backup ]]; then
+            command mv "$@" || return 1
+            write_foreign_commit_target "$race_target" "$race_marker"
+            : > "$race_injected"
+            return 0
+          fi
+          if [ ! -e "$race_injected" ] && [ "$destination" = "$race_target" ] \
+            && [[ "$source" != *.backup ]]; then
+            if [ "$window" = post-promotion ]; then
+              command mv "$@" || return 1
+            fi
+            write_foreign_commit_target "$race_target" "$race_marker"
+            : > "$race_injected"
+            [ "$window" != post-promotion ] || return 0
+          fi
+          command mv "$@"
+        }
+        install_self_and_units >/dev/null 2>&1
+      ) || install_rc=$?
+      [ -e "$race_injected" ] \
+        || record_commit_guard_failure "$label fixture did not reach its commit window"
+      ;;
+    *) return 1 ;;
+  esac
+
+  [ "$install_rc" -ne 0 ] || record_commit_guard_failure "$label reported success"
+  assert_foreign_commit_target "$label" "$race_target" "$race_marker"
+  case "$window" in
+    post-backup-move|post-promotion) assert_race_backup_retained "$label" "$race_target" "$race_original" ;;
+    post-preflight|pre-promotion) assert_no_race_leftovers "$label" ;;
+  esac
+  assert_non_raced_targets_restored "$label" "$race_target"
+  rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+}
+
+# Cross the four commit windows with both loop boundaries.  This preserves the
+# create/replace, no-clobber, source-disappearance and rollback ownership checks
+# while keeping the race injector identical across positions.
+for race_window in post-preflight post-backup-move pre-promotion post-promotion; do
+  for race_position in first last; do
+    run_commit_race_case "$race_window" "$race_position"
+  done
+done
+
+[ "$commit_guard_failures" -eq 0 ] \
+  || fail "$commit_guard_failures install commit guard regression(s) detected"
+printf 'install commit guard tests passed\n'
 
 # Headerless v8 units are recognized by their complete legacy identity and
 # migrate to the stable managed header.
@@ -749,6 +1074,11 @@ for backup_failure_case in first middle last; do
   [ -s "$failed_backup_record" ] || fail "$backup_failure_case backup cleanup failure was not injected"
   failed_backup_path="$(<"$failed_backup_record")"
   [ -f "$failed_backup_path" ] || fail "$backup_failure_case failed backup was not retained"
+  failed_backup_stage="${failed_backup_path%.backup}"
+  [ -f "${failed_backup_stage}.expected" ] \
+    || fail "$backup_failure_case cleanup failure discarded the old target reference"
+  [ -f "${failed_backup_stage}.new-expected" ] \
+    || fail "$backup_failure_case cleanup failure discarded the staged-new reference"
   [ "$(find "$TEST_ROOT" -name '*.backup' -type f | wc -l | tr -d ' ')" = 1 ] \
     || fail "$backup_failure_case backup cleanup retained more than the failed backup"
   cmp -s -- "$SCRIPT_PATH" "$OCM_INSTALL_PATH" \
@@ -759,6 +1089,8 @@ for backup_failure_case in first middle last; do
   done
   grep -F '安装已提交并验证，但备份清理未完成' "$backup_cleanup_output" >/dev/null \
     || fail "$backup_failure_case backup cleanup failure lacked committed-state diagnostic"
+  grep -F '保留本轮目标快照作为核验依据' "$backup_cleanup_output" >/dev/null \
+    || fail "$backup_failure_case cleanup failure lacked retained-reference diagnostic"
   rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
 done
 printf 'committed backup cleanup failure tests passed\n'
@@ -791,8 +1123,15 @@ fi
   || fail 'committed install trusted rm success although a backup still existed'
 [ "$(find "$TEST_ROOT" -name '*.backup' -type f | wc -l | tr -d ' ')" = 1 ] \
   || fail 'backup postcondition failure did not retain exactly the undeleted backup'
+postcondition_backup="$(find "$TEST_ROOT" -name '*.backup' -type f -print -quit)"
+[ -f "${postcondition_backup%.backup}.expected" ] \
+  || fail 'backup postcondition failure discarded the old target reference'
+[ -f "${postcondition_backup%.backup}.new-expected" ] \
+  || fail 'backup postcondition failure discarded the staged-new reference'
 grep -F '安装已提交并验证，但备份清理未完成' "$backup_postcondition_output" >/dev/null \
   || fail 'backup postcondition failure lacked committed-state diagnostic'
+grep -F '保留本轮目标快照作为核验依据' "$backup_postcondition_output" >/dev/null \
+  || fail 'backup postcondition failure lacked retained-reference diagnostic'
 rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
 printf 'committed backup cleanup postcondition test passed\n'
 

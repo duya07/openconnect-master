@@ -165,6 +165,7 @@ systemctl() {
     "show $SERVICE_NAME --property=LoadState --value") printf '%s\n' loaded ;;
     "show $SERVICE_NAME --property=FragmentPath --value") unit_path "$SERVICE_NAME" ;;
     "show $SERVICE_NAME --all --property=DropInPaths") printf 'DropInPaths=\n' ;;
+    "show $SERVICE_NAME --property=NeedDaemonReload --value") printf '%s\n' no ;;
     *) record_systemctl_call "$@" ;;
   esac
 }
@@ -279,8 +280,16 @@ unit_source_probe_systemctl() {
       [ "$SOURCE_PROBE_MODE" != fragment-query-failure ] || return 1
       case "$SOURCE_PROBE_MODE" in
         empty-fragment) : ;;
-        owned|missing-owned-fragment) unit_path "$unit" ;;
+        owned|missing-owned-fragment|reload-query-failure|reload-empty|reload-yes) unit_path "$unit" ;;
         *) printf '/run/systemd/transient/%s\n' "$unit" ;;
+      esac
+      ;;
+    --property=NeedDaemonReload)
+      case "$SOURCE_PROBE_MODE" in
+        reload-query-failure) return 1 ;;
+        reload-empty) : ;;
+        reload-yes) printf '%s\n' yes ;;
+        *) printf '%s\n' no ;;
       esac
       ;;
     *) return 1 ;;
@@ -314,6 +323,59 @@ done
 SOURCE_PROBE_MODE=owned
 systemctl() { unit_source_probe_systemctl "$@"; }
 preflight_managed_units_ownership || fail 'owned loaded unit fragments were rejected'
+
+# Stop and legacy recovery are destructive systemd paths.  A loaded unit at
+# the owned FragmentPath is still unprovable while daemon-reload is pending or
+# its state cannot be read, so both paths must reject before their first
+# mutation and preserve recovery evidence.
+seed_owned_source_units() {
+  local unit
+  mkdir -p -- "$SYSTEMD_DIR"
+  for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+    printf '%s\n' '# Managed by oc-master' > "$(unit_path "$unit")"
+  done
+}
+
+reload_guard_failures=0
+record_reload_guard_failure() {
+  printf 'NeedDaemonReload guard regression: %s\n' "$*" >&2
+  reload_guard_failures=$((reload_guard_failures + 1))
+}
+
+for SOURCE_PROBE_MODE in reload-yes reload-empty reload-query-failure; do
+  reset_runtime
+  ensure_dirs
+  seed_owned_source_units
+  : > "$unit_mutation_calls"
+  systemctl() { unit_source_probe_systemctl "$@"; }
+  reload_stop_rc=0
+  stop_and_disable_managed_units >/dev/null 2>&1 || reload_stop_rc=$?
+  [ "$reload_stop_rc" -ne 0 ] \
+    || record_reload_guard_failure "stop accepted NeedDaemonReload evidence: $SOURCE_PROBE_MODE"
+  [ ! -s "$unit_mutation_calls" ] \
+    || record_reload_guard_failure "stop mutated systemd for NeedDaemonReload evidence: $SOURCE_PROBE_MODE"
+
+  reset_runtime
+  ensure_dirs
+  seed_owned_source_units
+  write_profile proxy 0 nc 1080
+  printf '%s\n' 'DEFAULT4=default via 192.0.2.1 dev eth0' > "$ROUTE_OWNER_FILE"
+  : > "$unit_mutation_calls"
+  systemctl() { unit_source_probe_systemctl "$@"; }
+  reload_recovery_rc=0
+  recover_legacy_installation >/dev/null 2>&1 || reload_recovery_rc=$?
+  [ "$reload_recovery_rc" -ne 0 ] \
+    || record_reload_guard_failure "legacy recovery accepted NeedDaemonReload evidence: $SOURCE_PROBE_MODE"
+  [ ! -s "$unit_mutation_calls" ] \
+    || record_reload_guard_failure "legacy recovery mutated systemd for NeedDaemonReload evidence: $SOURCE_PROBE_MODE"
+  [ -f "$PROFILE_FILE" ] \
+    || record_reload_guard_failure "legacy recovery removed profile for $SOURCE_PROBE_MODE"
+  [ -f "$ROUTE_OWNER_FILE" ] \
+    || record_reload_guard_failure "legacy recovery removed route evidence for $SOURCE_PROBE_MODE"
+done
+[ "$reload_guard_failures" -eq 0 ] \
+  || fail "$reload_guard_failures NeedDaemonReload stop/recovery regression(s) detected"
+printf 'NeedDaemonReload stop/recovery guards passed\n'
 
 # Global health binds plan generation and both data-plane directions: ordinary
 # traffic uses ocm0 and each saved source address retains its planned egress.
