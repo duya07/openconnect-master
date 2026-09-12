@@ -1644,19 +1644,18 @@ install_self_and_units() {
       return 1
     fi
     if [ "${INSTALL_TX_EXPECTED_TYPES[index]}" != absent ]; then
-      if ! mv -T -n -- "$target" "${INSTALL_TX_BACKUPS[index]}"; then
-        restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
-        return 1
-      fi
-      if ! install_backup_is_safe "$index"; then
-        log_err "安装备份不再匹配预检目标，拒绝继续：${INSTALL_TX_BACKUPS[index]}"
-        if ! restore_moved_target_without_clobber "$target" "${INSTALL_TX_BACKUPS[index]}"; then
-          log_err "无法无覆盖恢复刚移动的目标；保留当前目标与备份：$target"
-        fi
+      if ! mv -T -n -- "$target" "${INSTALL_TX_BACKUPS[index]}" \
+        || [ -e "$target" ] || [ -L "$target" ] \
+        || { [ ! -e "${INSTALL_TX_BACKUPS[index]}" ] && [ ! -L "${INSTALL_TX_BACKUPS[index]}" ]; }; then
         restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
         return 1
       fi
       INSTALL_TX_HAD_OLD[index]=1
+      if ! install_backup_is_safe "$index"; then
+        log_err "安装备份不再匹配预检目标，拒绝继续：${INSTALL_TX_BACKUPS[index]}"
+        restore_install_transaction || log_err "安装事务回滚未完成；请使用保留的备份恢复。"
+        return 1
+      fi
     fi
     if [ -e "$target" ] || [ -L "$target" ]; then
       log_err "安装目标在提升暂存文件前被占用，拒绝覆盖：$target"
