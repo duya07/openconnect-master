@@ -589,7 +589,8 @@ assert_non_raced_targets_restored() {
 }
 
 assert_race_backup_retained() {
-  local label="$1" target="$2" original="$3" backup stage old_reference new_reference
+  local label="$1" target="$2" original="$3" retain_references="${4:-1}"
+  local backup stage old_reference new_reference
   backup="$(find "$(dirname -- "$target")" -maxdepth 1 -name '*.backup' -print -quit)"
   if [ -z "$backup" ]; then
     record_commit_guard_failure "$label did not retain the old managed backup"
@@ -600,6 +601,7 @@ assert_race_backup_retained() {
   stage="${backup%.backup}"
   old_reference="${stage}.expected"
   new_reference="${stage}.new-expected"
+  [ "$retain_references" = 1 ] || return 0
   [ -f "$old_reference" ] \
     || record_commit_guard_failure "$label did not retain the old target reference"
   [ -f "$new_reference" ] \
@@ -715,7 +717,11 @@ run_commit_race_case() {
   [ "$install_rc" -ne 0 ] || record_commit_guard_failure "$label reported success"
   assert_foreign_commit_target "$label" "$race_target" "$race_marker"
   case "$window" in
-    post-backup-move|post-promotion) assert_race_backup_retained "$label" "$race_target" "$race_original" ;;
+    # A target that reappears before the post-move disappearance check cannot
+    # arm rollback.  Its safe backup remains, but its references are not
+    # recovery evidence for a confirmed migration.
+    post-backup-move) assert_race_backup_retained "$label" "$race_target" "$race_original" 0 ;;
+    post-promotion) assert_race_backup_retained "$label" "$race_target" "$race_original" ;;
     post-preflight|pre-promotion) assert_no_race_leftovers "$label" ;;
   esac
   assert_non_raced_targets_restored "$label" "$race_target"
@@ -729,6 +735,69 @@ for race_window in post-preflight post-backup-move pre-promotion post-promotion;
   for race_position in first last; do
     run_commit_race_case "$race_window" "$race_position"
   done
+done
+
+# Once a managed target has moved to its backup, that backup is evidence rather
+# than an interchangeable replacement.  A byte change before verification must
+# not put it back at the target or discard either transaction reference.
+run_untrusted_backup_case() {
+  local race_position="$1" race_target label race_marker backup_marker backup stage old_reference new_reference
+  local race_injected install_rc=0
+
+  seed_legacy_units
+  save_legacy_originals
+  case "$race_position" in
+    first) race_target="$INSTALL_PATH" ;;
+    last) race_target="$(unit_path "$HEALTH_TIMER_NAME")" ;;
+    *) return 1 ;;
+  esac
+  label="untrusted-backup-${race_position}"
+  race_marker="tampered ${label}"
+  [ "$race_target" = "$INSTALL_PATH" ] && backup_marker="# $race_marker" || backup_marker="$race_marker"
+  race_injected="${TEST_ROOT}/${label}.injected"
+  (
+    shortcut_is_ours() { return 0; }
+    preflight_install_targets() { return 0; }
+    mv() {
+      local source="${*: -2:1}" destination="${!#}"
+      if [ ! -e "$race_injected" ] && [ "$source" = "$race_target" ] \
+        && [[ "$destination" == *.backup ]]; then
+        command mv "$@" || return 1
+        printf '%s\n' "$backup_marker" >> "$destination"
+        : > "$race_injected"
+        return 0
+      fi
+      command mv "$@"
+    }
+    install_self_and_units >/dev/null 2>&1
+  ) || install_rc=$?
+
+  [ -e "$race_injected" ] \
+    || record_commit_guard_failure "$label fixture did not tamper after the backup move"
+  [ "$install_rc" -ne 0 ] \
+    || record_commit_guard_failure "$label reported success"
+  [ ! -e "$race_target" ] && [ ! -L "$race_target" ] \
+    || record_commit_guard_failure "$label restored the untrusted backup to the target"
+  backup="$(find "$(dirname -- "$race_target")" -maxdepth 1 -name '*.backup' -print -quit)"
+  if [ -z "$backup" ]; then
+    record_commit_guard_failure "$label did not retain the untrusted backup"
+  else
+    grep -Fx "$backup_marker" "$backup" >/dev/null \
+      || record_commit_guard_failure "$label did not retain the tampered backup bytes"
+    stage="${backup%.backup}"
+    old_reference="${stage}.expected"
+    new_reference="${stage}.new-expected"
+    [ -f "$old_reference" ] \
+      || record_commit_guard_failure "$label did not retain the old target reference"
+    [ -f "$new_reference" ] \
+      || record_commit_guard_failure "$label did not retain the staged-new reference"
+  fi
+  assert_non_raced_targets_restored "$label" "$race_target"
+  rm -rf -- "$OCM_SYSTEMD_DIR" "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
+}
+
+for race_position in first last; do
+  run_untrusted_backup_case "$race_position"
 done
 
 [ "$commit_guard_failures" -eq 0 ] \
