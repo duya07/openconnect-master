@@ -514,8 +514,10 @@ reset_rollback_unit_mock() {
   ROLLBACK_SERVICE_EXEC_START=''
   ROLLBACK_SERVICE_ACTIVE=inactive
   ROLLBACK_QUERY_FAIL=''
-  ROLLBACK_DROPIN_MODE=empty
-  ROLLBACK_NEED_RELOAD=no
+  ROLLBACK_TIMER_DROPIN_MODE=empty
+  ROLLBACK_SERVICE_DROPIN_MODE=empty
+  ROLLBACK_TIMER_NEED_RELOAD=no
+  ROLLBACK_SERVICE_NEED_RELOAD=no
   ROLLBACK_STOP_STICKS=''
   ROLLBACK_STOP_EMPTIES=''
 }
@@ -547,7 +549,12 @@ mock_rollback_systemctl() {
       property="${2:-}"
       if [ "$property" = --all ] && [ "${3:-}" = --property=DropInPaths ]; then
         [ "$ROLLBACK_QUERY_FAIL" != "${unit}:--property=DropInPaths" ] || return 1
-        case "$ROLLBACK_DROPIN_MODE" in
+        case "$unit" in
+          "${ROLLBACK_UNIT}.timer") value="$ROLLBACK_TIMER_DROPIN_MODE" ;;
+          "${ROLLBACK_UNIT}.service") value="$ROLLBACK_SERVICE_DROPIN_MODE" ;;
+          *) return 96 ;;
+        esac
+        case "$value" in
           empty) printf 'DropInPaths=\n' ;;
           present) printf 'DropInPaths=/etc/systemd/system/%s.d/override.conf\n' "$unit" ;;
           *) return 96 ;;
@@ -562,13 +569,13 @@ mock_rollback_systemctl() {
         "${ROLLBACK_UNIT}.timer:--property=FragmentPath") value="$ROLLBACK_TIMER_FRAGMENT" ;;
         "${ROLLBACK_UNIT}.timer:--property=Triggers") value="$ROLLBACK_TIMER_TRIGGERS" ;;
         "${ROLLBACK_UNIT}.timer:--property=ActiveState") value="$ROLLBACK_TIMER_ACTIVE" ;;
-        "${ROLLBACK_UNIT}.timer:--property=NeedDaemonReload") value="$ROLLBACK_NEED_RELOAD" ;;
+        "${ROLLBACK_UNIT}.timer:--property=NeedDaemonReload") value="$ROLLBACK_TIMER_NEED_RELOAD" ;;
         "${ROLLBACK_UNIT}.service:--property=LoadState") value="$ROLLBACK_SERVICE_LOAD" ;;
         "${ROLLBACK_UNIT}.service:--property=Transient") value="$ROLLBACK_SERVICE_TRANSIENT" ;;
         "${ROLLBACK_UNIT}.service:--property=FragmentPath") value="$ROLLBACK_SERVICE_FRAGMENT" ;;
         "${ROLLBACK_UNIT}.service:--property=ExecStart") value="$ROLLBACK_SERVICE_EXEC_START" ;;
         "${ROLLBACK_UNIT}.service:--property=ActiveState") value="$ROLLBACK_SERVICE_ACTIVE" ;;
-        "${ROLLBACK_UNIT}.service:--property=NeedDaemonReload") value="$ROLLBACK_NEED_RELOAD" ;;
+        "${ROLLBACK_UNIT}.service:--property=NeedDaemonReload") value="$ROLLBACK_SERVICE_NEED_RELOAD" ;;
         *) return 96 ;;
       esac
       printf '%s\n' "$value"
@@ -632,11 +639,16 @@ run_rejected_rollback_cancel_case() (
     triggers-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=Triggers" ;;
     wrong-trigger) ROLLBACK_TIMER_TRIGGERS=foreign.service ;;
     multiple-triggers) ROLLBACK_TIMER_TRIGGERS="${ROLLBACK_UNIT}.service foreign.service" ;;
-    dropin-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=DropInPaths" ;;
-    dropin-present) ROLLBACK_DROPIN_MODE=present ;;
-    reload-query-fail) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=NeedDaemonReload" ;;
-    reload-empty) ROLLBACK_NEED_RELOAD='' ;;
-    reload-yes) ROLLBACK_NEED_RELOAD=yes ;;
+    dropin-query-fail-timer) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=DropInPaths" ;;
+    dropin-query-fail-service) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=DropInPaths" ;;
+    dropin-present-timer) ROLLBACK_TIMER_DROPIN_MODE=present ;;
+    dropin-present-service) ROLLBACK_SERVICE_DROPIN_MODE=present ;;
+    reload-query-fail-timer) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=NeedDaemonReload" ;;
+    reload-query-fail-service) ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=NeedDaemonReload" ;;
+    reload-empty-timer) ROLLBACK_TIMER_NEED_RELOAD='' ;;
+    reload-empty-service) ROLLBACK_SERVICE_NEED_RELOAD='' ;;
+    reload-yes-timer) ROLLBACK_TIMER_NEED_RELOAD=yes ;;
+    reload-yes-service) ROLLBACK_SERVICE_NEED_RELOAD=yes ;;
     *) return 96 ;;
   esac
   systemctl() { mock_rollback_systemctl "$@"; }
@@ -730,7 +742,9 @@ done
 for rollback_rejection in query-fail empty-load masked-load transient-query-fail transient-empty \
   transient-no fragment-query-fail empty-fragment external-source exec-query-fail wrong-uuid \
   extra-argument ignored-exec triggers-query-fail wrong-trigger multiple-triggers \
-  dropin-query-fail dropin-present reload-query-fail reload-empty reload-yes; do
+  dropin-query-fail-timer dropin-query-fail-service dropin-present-timer dropin-present-service \
+  reload-query-fail-timer reload-query-fail-service reload-empty-timer reload-empty-service \
+  reload-yes-timer reload-yes-service; do
   run_rejected_rollback_cancel_case "$rollback_rejection"
 done
 
@@ -762,7 +776,9 @@ done
 # without printing the armed-success warning.
 for arm_shape in complete service-only wrong-uuid timer-inactive timer-empty \
   timer-query-fail service-active service-empty service-query-fail \
-  dropin-query-fail dropin-present reload-query-fail reload-empty reload-yes; do
+  dropin-query-fail-timer dropin-query-fail-service dropin-present-timer dropin-present-service \
+  reload-query-fail-timer reload-query-fail-service reload-empty-timer reload-empty-service \
+  reload-yes-timer reload-yes-service; do
   write_runtime_fixture "$RUN_A" "$BOOT_A" global STARTING 1 0
   reset_rollback_unit_mock
   ROLLBACK_MUTATIONS="${TEST_ROOT}/rollback-arm-${arm_shape}.mutations"
@@ -792,25 +808,45 @@ for arm_shape in complete service-only wrong-uuid timer-inactive timer-empty \
         seed_owned_rollback_timer
         ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=ActiveState"
         ;;
-      dropin-query-fail)
+      dropin-query-fail-timer)
         seed_owned_rollback_timer
         ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=DropInPaths"
         ;;
-      dropin-present)
+      dropin-query-fail-service)
         seed_owned_rollback_timer
-        ROLLBACK_DROPIN_MODE=present
+        ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=DropInPaths"
         ;;
-      reload-query-fail)
+      dropin-present-timer)
+        seed_owned_rollback_timer
+        ROLLBACK_TIMER_DROPIN_MODE=present
+        ;;
+      dropin-present-service)
+        seed_owned_rollback_timer
+        ROLLBACK_SERVICE_DROPIN_MODE=present
+        ;;
+      reload-query-fail-timer)
+        seed_owned_rollback_timer
+        ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.timer:--property=NeedDaemonReload"
+        ;;
+      reload-query-fail-service)
         seed_owned_rollback_timer
         ROLLBACK_QUERY_FAIL="${ROLLBACK_UNIT}.service:--property=NeedDaemonReload"
         ;;
-      reload-empty)
+      reload-empty-timer)
         seed_owned_rollback_timer
-        ROLLBACK_NEED_RELOAD=''
+        ROLLBACK_TIMER_NEED_RELOAD=''
         ;;
-      reload-yes)
+      reload-empty-service)
         seed_owned_rollback_timer
-        ROLLBACK_NEED_RELOAD=yes
+        ROLLBACK_SERVICE_NEED_RELOAD=''
+        ;;
+      reload-yes-timer)
+        seed_owned_rollback_timer
+        ROLLBACK_TIMER_NEED_RELOAD=yes
+        ;;
+      reload-yes-service)
+        seed_owned_rollback_timer
+        ROLLBACK_SERVICE_NEED_RELOAD=yes
         ;;
     esac
   }

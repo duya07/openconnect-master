@@ -782,6 +782,8 @@ run_public_surface_variant() {
   # this compatibility seam keeps shortcut equal to program so it can still
   # reject added config/runtime/systemctl effects portably.
   mkdir -p "$version_root/sbin" "$version_root/bin"
+  : > "${version_root}/systemctl.transcript"
+  : > "${version_root}/systemctl.mutations"
   set +e
   printf '%s' "$input_text" | env \
     OCM_INSTALL_PATH="${version_root}/sbin/oc-master" \
@@ -798,6 +800,8 @@ run_public_surface_variant() {
     OCM_UUID_FILE="${version_root}/uuid" \
     OCM_PROC_ROOT="${version_root}/proc" \
     PUBLIC_EFFECTS_PATH="${version_root}/systemctl.effects" \
+    PUBLIC_SYSTEMCTL_TRANSCRIPT="${version_root}/systemctl.transcript" \
+    PUBLIC_SYSTEMCTL_MUTATIONS="${version_root}/systemctl.mutations" \
     "$BASH" -c '
       source "$1"
       BASH_ARGV0="$1"
@@ -829,9 +833,11 @@ run_public_surface_variant() {
           [ -z "$mode" ] || command chmod "$mode" "$destination"
         fi
       }
-      ensure_dirs() { command mkdir -p -- "$CONFIG_DIR" "$RUNTIME_DIR" "${LOCK_FILE%/*}"; }
-      systemctl() {
-        case "${1:-}" in
+       ensure_dirs() { command mkdir -p -- "$CONFIG_DIR" "$RUNTIME_DIR" "${LOCK_FILE%/*}"; }
+       systemctl() {
+         printf "<%s>" "$@" >> "$PUBLIC_SYSTEMCTL_TRANSCRIPT"
+         printf "\\n" >> "$PUBLIC_SYSTEMCTL_TRANSCRIPT"
+         case "${1:-}" in
           is-active)
             case " $* " in *" --quiet "*) ;; *) printf "inactive\\n" ;; esac
             return 3
@@ -844,8 +850,14 @@ run_public_surface_variant() {
               *) printf "\\n" ;;
             esac
             ;;
-          daemon-reload) printf "daemon-reload\\n" >> "$PUBLIC_EFFECTS_PATH" ;;
-          *) : ;;
+           daemon-reload)
+             printf "<%s>" "$@" >> "$PUBLIC_SYSTEMCTL_MUTATIONS"
+             printf "\\n" >> "$PUBLIC_SYSTEMCTL_MUTATIONS"
+             printf "<%s>" "$@" >> "$PUBLIC_EFFECTS_PATH"
+             printf "\\n" >> "$PUBLIC_EFFECTS_PATH"
+             ;;
+           start|stop|enable|disable|reset-failed|restart|reload) : ;;
+           *) return 96 ;;
         esac
       }
       ensure_dependencies() { :; }
@@ -870,13 +882,19 @@ run_public_surface_variant() {
   rc=$?
   set -e
   printf '%s\n' "$rc" > "$rc_file"
-  {
-    find "$version_root" -mindepth 1 -maxdepth 3 \( -type f -o -type d -o -type l \) \
-      ! -name stdout ! -name stderr ! -name rc -print \
-      | sed "s#^${version_root}/##" | LC_ALL=C sort
-    find "$version_root" -mindepth 1 -maxdepth 3 -type l -print \
-      | sed "s#^${version_root}/##" | LC_ALL=C sort
-  } > "${version_root}/effects"
+  while IFS= read -r path; do
+    relative_path="${path#"${version_root}/"}"
+    if [ -L "$path" ]; then
+      printf '%s|link|%s|%s\n' "$relative_path" "$(stat -c '%a' -- "$path")" "$(readlink -- "$path")"
+    elif [ -d "$path" ]; then
+      printf '%s|dir|%s|\n' "$relative_path" "$(stat -c '%a' -- "$path")"
+    elif [ -f "$path" ]; then
+      printf '%s|file|%s|\n' "$relative_path" "$(stat -c '%a' -- "$path")"
+    else
+      printf '%s|other|%s|\n' "$relative_path" "$(stat -c '%a' -- "$path")"
+    fi
+  done < <(find "$version_root" -mindepth 1 -maxdepth 3 \( -type f -o -type d -o -type l \) \
+    ! -name stdout ! -name stderr ! -name rc ! -name effects -print | LC_ALL=C sort) > "${version_root}/effects"
 }
 
 public_surface_files_match() {
@@ -887,8 +905,8 @@ public_surface_files_match() {
   # e03f2aa, not a public uninstall effect; do not normalize any config,
   # runtime, systemd, account, program, shortcut, or output artifact.
   if [ "$case_name:$artifact" = uninstall:effects ]; then
-    sed -e '/^lock$/d' -e '/^lock\/state\.lock$/d' "$baseline_file" > "${baseline_file}.normalized-effects"
-    sed -e '/^lock$/d' -e '/^lock\/state\.lock$/d' "$current_file" > "${current_file}.normalized-effects"
+    sed -e '/^lock|/d' -e '/^lock\/state\.lock|/d' "$baseline_file" > "${baseline_file}.normalized-effects"
+    sed -e '/^lock|/d' -e '/^lock\/state\.lock|/d' "$current_file" > "${current_file}.normalized-effects"
     cmp -s -- "${baseline_file}.normalized-effects" "${current_file}.normalized-effects"
     return
   fi
@@ -907,7 +925,9 @@ compare_public_surface_case() {
       fail "public ${case_name} did not reach its normal success path"
     }
   done
-  for artifact in rc stdout stderr effects; do
+  # Read-only queries are retained in the per-variant transcript for audit;
+  # the exact public effect contract compares every state-changing argv.
+  for artifact in rc stdout stderr effects systemctl.mutations; do
     baseline_file="${TEST_ROOT}/public-${case_name}-51/${artifact}"
     current_file="${TEST_ROOT}/public-${case_name}-52/${artifact}"
     if ! public_surface_files_match "$baseline_file" "$current_file" "$case_name" "$artifact"; then
@@ -939,6 +959,10 @@ compare_public_surface_case() {
 self_test_public_surface_comparator() {
   local install_original="${TEST_ROOT}/public-install-52/stdout"
   local install_mutated="${TEST_ROOT}/public-install-52/stdout.mutated"
+  local mutation_original="${TEST_ROOT}/public-install-52/systemctl.mutations"
+  local mutation_mutated="${TEST_ROOT}/public-install-52/systemctl.mutations.mutated"
+  local effects_original="${TEST_ROOT}/public-install-52/effects"
+  local effects_mutated="${TEST_ROOT}/public-install-52/effects.mutated"
 
   sed 's/sudo ocm/sudo ocm-mutated/' \
     "$install_original" > "$install_mutated"
@@ -946,6 +970,20 @@ self_test_public_surface_comparator() {
     && fail 'public success-text mutation fixture did not change output'
   if public_surface_files_match "${TEST_ROOT}/public-install-51/stdout" "$install_mutated" install stdout; then
     fail 'public comparator accepted a changed install success message'
+  fi
+
+  cp -- "$mutation_original" "$mutation_mutated"
+  printf '<restart><oc-master.service>\n' >> "$mutation_mutated"
+  if public_surface_files_match "${TEST_ROOT}/public-install-51/systemctl.mutations" \
+    "$mutation_mutated" install systemctl.mutations; then
+    fail 'public comparator accepted an extra systemctl mutation'
+  fi
+
+  sed '0,/|file|755|/s//|file|700|/' "$effects_original" > "$effects_mutated"
+  cmp -s "$effects_original" "$effects_mutated" \
+    && fail 'public install-mode mutation fixture did not change the manifest'
+  if public_surface_files_match "${TEST_ROOT}/public-install-51/effects" "$effects_mutated" install effects; then
+    fail 'public comparator accepted a changed install mode'
   fi
 
   # A non-interactive read does not render its prompt, so mutate the actual

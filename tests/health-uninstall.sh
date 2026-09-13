@@ -688,10 +688,12 @@ for uninstall_retry_case in first middle last; do
   write_run_state "$RUN_PROXY" CLEANED 0 0
   uninstall_retry_marker="${TEST_ROOT}/uninstall-retry-${uninstall_retry_case}.injected"
   uninstall_retry_reload_log="${TEST_ROOT}/uninstall-retry-${uninstall_retry_case}.reload"
+  uninstall_retry_queries="${TEST_ROOT}/uninstall-retry-${uninstall_retry_case}.queries"
   if ! (
-    stop_vpn() { :; }
+    check_root() { :; }
     systemctl() {
       local unit path
+      printf '%s\n' "$*" >> "$uninstall_retry_queries"
       case "$*" in
         daemon-reload) printf '%s\n' reload >> "$uninstall_retry_reload_log" ;;
         "show "*" --property=LoadState --value")
@@ -701,6 +703,8 @@ for uninstall_retry_case in first middle last; do
         "show "*" --property=FragmentPath --value") unit="$2"; unit_path "$unit" ;;
         "show "*" --all --property=DropInPaths") printf '%s\n' 'DropInPaths=' ;;
         "show "*" --property=NeedDaemonReload --value") printf '%s\n' no ;;
+        'show -p MainPID --value '*) printf '%s\n' 0 ;;
+        'is-active '*) printf '%s\n' inactive ;;
         *) return 0 ;;
       esac
     }
@@ -716,11 +720,20 @@ for uninstall_retry_case in first middle last; do
       fail "uninstall retry fixture accepted its first ${uninstall_retry_case} deletion failure"
     fi
     [ -e "$uninstall_retry_marker" ] || fail "uninstall retry fixture did not inject ${uninstall_retry_case} failure"
+    grep -Fx "show $SERVICE_NAME --property=LoadState --value" "$uninstall_retry_queries" >/dev/null \
+      || fail "first ${uninstall_retry_case} uninstall bypassed stop_vpn ownership preflight"
     if [ "$uninstall_retry_index" -gt 0 ]; then
       [ -s "$uninstall_retry_reload_log" ] || fail "${uninstall_retry_case} failure did not reload deleted units"
     fi
+    : > "$uninstall_retry_queries"
     printf 'REMOVE\n' | uninstall_manager >/dev/null 2>&1 \
       || fail "public uninstall did not converge after ${uninstall_retry_case} failure"
+    grep -Fx "show $SERVICE_NAME --property=LoadState --value" "$uninstall_retry_queries" >/dev/null \
+      || fail "second ${uninstall_retry_case} uninstall bypassed stop_vpn ownership preflight"
+    grep -Fx "show $HEALTH_SERVICE_NAME --property=LoadState --value" "$uninstall_retry_queries" >/dev/null \
+      || fail "second ${uninstall_retry_case} uninstall did not query health service ownership"
+    grep -Fx "show $HEALTH_TIMER_NAME --property=LoadState --value" "$uninstall_retry_queries" >/dev/null \
+      || fail "second ${uninstall_retry_case} uninstall did not query health timer ownership"
   ); then
     fail "uninstall retry regression failed for ${uninstall_retry_case}"
   fi
