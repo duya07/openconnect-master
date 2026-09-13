@@ -25,6 +25,13 @@ export OCM_PROC_ROOT="${TEST_ROOT}/proc"
 # shellcheck source=../oc_master.sh
 source ./oc_master.sh
 
+# Later fixtures replace these functions at shell scope. Preserve their real
+# definitions so the retry regression can restore and exercise the production
+# stop/preflight chain instead of inheriting an earlier test double.
+PRODUCTION_PREFLIGHT_MANAGED_UNITS_OWNERSHIP="$(declare -f preflight_managed_units_ownership)"
+PRODUCTION_STOP_AND_DISABLE_MANAGED_UNITS="$(declare -f stop_and_disable_managed_units)"
+readonly PRODUCTION_PREFLIGHT_MANAGED_UNITS_OWNERSHIP PRODUCTION_STOP_AND_DISABLE_MANAGED_UNITS
+
 # The production directory owner is root.  This portable test only needs the
 # temporary directory side effect, so leave ownership to the test runner.
 install() {
@@ -691,6 +698,8 @@ for uninstall_retry_case in first middle last; do
   uninstall_retry_queries="${TEST_ROOT}/uninstall-retry-${uninstall_retry_case}.queries"
   if ! (
     check_root() { :; }
+    eval "$PRODUCTION_PREFLIGHT_MANAGED_UNITS_OWNERSHIP"
+    eval "$PRODUCTION_STOP_AND_DISABLE_MANAGED_UNITS"
     systemctl() {
       local unit path
       printf '%s\n' "$*" >> "$uninstall_retry_queries"
