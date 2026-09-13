@@ -1133,14 +1133,19 @@ if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
   printf 'public shortcut commit guard tests passed\n'
 
   failure=managed-shortcut
+    rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
     mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
     printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
     cp -- "$OCM_INSTALL_PATH" "$TEST_ROOT/original-managed-program"
     MOCK_MANAGED_PROGRAM_MOVES=0
+    MOCK_MANAGED_SHORTCUT_MOVES=0
     mv() {
       local destination="${!#}"
       if [ "$destination" = "$OCM_INSTALL_PATH" ]; then
         MOCK_MANAGED_PROGRAM_MOVES=$((MOCK_MANAGED_PROGRAM_MOVES + 1))
+      fi
+      if [ "$destination" = "$OCM_SHORTCUT_PATH" ]; then
+        MOCK_MANAGED_SHORTCUT_MOVES=$((MOCK_MANAGED_SHORTCUT_MOVES + 1))
       fi
       if [ "$failure" = managed-program ] && [ "$destination" = "$OCM_INSTALL_PATH" ] && [ "$MOCK_MANAGED_PROGRAM_MOVES" -eq 1 ]; then return 1; fi
       if [ "$failure" = managed-shortcut ] && [ "$destination" = "$OCM_SHORTCUT_PATH" ]; then return 1; fi
@@ -1150,34 +1155,35 @@ if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
       fail "install_managed_copy unexpectedly succeeded after $failure failure"
     fi
     unset -f mv
+    [ "$MOCK_MANAGED_SHORTCUT_MOVES" -eq 1 ] \
+      || fail 'install_managed_copy managed-shortcut fixture did not reach shortcut promotion'
     cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail "install_managed_copy did not restore old program after $failure failure"
     [ ! -e "$OCM_SHORTCUT_PATH" ] && [ ! -L "$OCM_SHORTCUT_PATH" ] || fail "install_managed_copy left shortcut after $failure failure"
     assert_no_transaction_leftovers
     rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
   printf 'managed-copy shortcut commit rollback test passed\n'
 
-  # When removing a committed shortcut fails during rollback, retain it as
+  # When removing a promoted shortcut fails during rollback, retain it as
   # evidence and report the rollback failure instead of claiming success.
   mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
   printf '#!/usr/bin/env bash\nprintf old-managed-program\\n' > "$OCM_INSTALL_PATH"
-  MOCK_BACKUP_DELETE_FAIL=1
-  MOCK_SHORTCUT_REMOVE_FAIL=1
-  rm() {
-    local target="${!#}"
-    if [ "${MOCK_BACKUP_DELETE_FAIL:-0}" = 1 ] && [[ "$target" == *.backup ]]; then
-      MOCK_BACKUP_DELETE_FAIL=0
-      return 1
-    fi
-    if [ "${MOCK_SHORTCUT_REMOVE_FAIL:-0}" = 1 ] && [ "$target" = "$OCM_SHORTCUT_PATH" ]; then
-      MOCK_SHORTCUT_REMOVE_FAIL=0
-      return 1
-    fi
-    command rm "$@"
-  }
-  if install_managed_copy >"$TEST_ROOT/managed-shortcut-restore-failure.out" 2>&1; then
+  shortcut_remove_marker="$TEST_ROOT/managed-shortcut-restore-failure.injected"
+  if (
+    verify_installed_transaction_targets() { return 1; }
+    rm() {
+      local target="${!#}"
+      if [ "$target" = "$OCM_SHORTCUT_PATH" ] && [ ! -e "$shortcut_remove_marker" ]; then
+        : > "$shortcut_remove_marker"
+        return 1
+      fi
+      command rm "$@"
+    }
+    install_managed_copy
+  ) >"$TEST_ROOT/managed-shortcut-restore-failure.out" 2>&1; then
     fail 'install_managed_copy succeeded although shortcut restoration failed'
   fi
-  unset -f rm
+  [ -e "$shortcut_remove_marker" ] \
+    || fail 'shortcut restoration failure fixture did not reach rollback removal'
   cmp -s "$TEST_ROOT/original-managed-program" "$OCM_INSTALL_PATH" || fail 'shortcut restoration failure did not restore old program'
   [ -e "$OCM_SHORTCUT_PATH" ] || [ -L "$OCM_SHORTCUT_PATH" ] \
     || fail 'shortcut restoration failure discarded diagnostic evidence'
