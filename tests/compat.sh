@@ -773,6 +773,7 @@ assert_secret_boundary() {
 # success/error text remain real code in each revision.
 run_public_surface_variant() {
   local case_name="$1" script_path="$2" suffix="$3" command="$4" input_text="$5"
+  local injected_systemctl_action="${6:-}"
   local version_root="${TEST_ROOT}/public-${case_name}-${suffix}"
   local stdout_file="${version_root}/stdout" stderr_file="${version_root}/stderr"
   local rc_file="${version_root}/rc"
@@ -802,6 +803,7 @@ run_public_surface_variant() {
     PUBLIC_EFFECTS_PATH="${version_root}/systemctl.effects" \
     PUBLIC_SYSTEMCTL_TRANSCRIPT="${version_root}/systemctl.transcript" \
     PUBLIC_SYSTEMCTL_MUTATIONS="${version_root}/systemctl.mutations" \
+    PUBLIC_INJECT_SYSTEMCTL_ACTION="$injected_systemctl_action" \
     "$BASH" -c '
       source "$1"
       BASH_ARGV0="$1"
@@ -850,16 +852,18 @@ run_public_surface_variant() {
               *) printf "\\n" ;;
             esac
             ;;
-           daemon-reload)
+           daemon-reload|start|stop|enable|disable|reset-failed|restart|reload)
              printf "<%s>" "$@" >> "$PUBLIC_SYSTEMCTL_MUTATIONS"
              printf "\\n" >> "$PUBLIC_SYSTEMCTL_MUTATIONS"
              printf "<%s>" "$@" >> "$PUBLIC_EFFECTS_PATH"
              printf "\\n" >> "$PUBLIC_EFFECTS_PATH"
              ;;
-           start|stop|enable|disable|reset-failed|restart|reload) : ;;
            *) return 96 ;;
-        esac
-      }
+         esac
+       }
+      if [ -n "${PUBLIC_INJECT_SYSTEMCTL_ACTION:-}" ]; then
+        systemctl "$PUBLIC_INJECT_SYSTEMCTL_ACTION" oc-master.service
+      fi
       ensure_dependencies() { :; }
       systemd-run() { :; }
       health_once() { :; }
@@ -897,8 +901,32 @@ run_public_surface_variant() {
     ! -name stdout ! -name stderr ! -name rc ! -name effects -print | LC_ALL=C sort) > "${version_root}/effects"
 }
 
+self_test_public_systemctl_mutation_recorder() {
+  local recorder_root="${TEST_ROOT}/public-systemctl-recorder-mutation-54"
+  local expected="${recorder_root}/expected-systemctl-mutation"
+
+  run_public_surface_variant systemctl-recorder-mutation "$CURRENT_SCRIPT" 54 deps '' restart
+  printf '<restart><oc-master.service>\n' > "$expected"
+  cmp -s "$expected" "${recorder_root}/systemctl.mutations" \
+    || fail 'public systemctl recorder dropped an injected restart mutation'
+  cmp -s "$expected" "${recorder_root}/systemctl.effects" \
+    || fail 'public effects recorder dropped an injected restart mutation'
+  printf 'public systemctl mutation recorder self-test passed\n'
+}
+
 public_surface_files_match() {
   local baseline_file="$1" current_file="$2" case_name="$3" artifact="$4"
+
+  # The hardened uninstall no longer stops/resets an unowned transient rollback
+  # service. Normalize only those baseline-side unsafe mutations; current-side
+  # additions remain visible and therefore still fail compatibility comparison.
+  if [ "$case_name:$artifact" = uninstall:systemctl.mutations ]; then
+    sed -e '/^<stop><oc-master-rollback\.timer><oc-master-rollback\.service>$/d' \
+      -e '/^<reset-failed><oc-master-rollback\.service>$/d' \
+      "$baseline_file" > "${baseline_file}.normalized-mutations"
+    cmp -s -- "${baseline_file}.normalized-mutations" "$current_file"
+    return
+  fi
 
   # The transactional stop path creates only its two manager/state lock files
   # before proving cleanup. This is an intentional internal tightening from
@@ -1011,6 +1039,7 @@ compare_public_surface_case check check ''
 compare_public_surface_case logs logs ''
 compare_public_surface_case accounts-add accounts-add $'1\nCompat\nuser\nsecret\nvpn.example.test\n\n2\n0\n'
 compare_public_surface_case accounts-delete accounts-delete $'2\n1\n0\n'
+self_test_public_systemctl_mutation_recorder
 self_test_public_surface_comparator
 
 run_proxy_lifecycle "$BASELINE_SCRIPT" 31
