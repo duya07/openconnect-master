@@ -962,7 +962,8 @@ printf 'managed-copy empty cleanup test passed\n'
 # no-clobber contract as the persistent-unit installer. These hooks model the
 # three observable commit windows without installing any unit.
 run_public_install_commit_guard() {
-  local window="$1" marker="foreign-public-${window}" backup install_rc=0
+  local window="$1" backup install_rc=0
+  local marker="foreign-public-${window}"
 
   rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
   mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
@@ -1033,8 +1034,10 @@ if (
   stage_shortcut() { return 0; }
   systemctl() { : > "$TEST_ROOT/public-install-rollback.systemctl"; return 1; }
   mv() {
-    local destination="${!#}"
-    [ "$destination" != "$OCM_INSTALL_PATH" ] || return 1
+    local source="${*: -2:1}" destination="${!#}"
+    if [ "$destination" = "$OCM_INSTALL_PATH" ] && [[ "$source" != *.backup ]]; then
+      return 1
+    fi
     command mv "$@"
   }
   install_managed_copy
@@ -1091,7 +1094,8 @@ if mkdir -p -- "$(dirname -- "$OCM_SHORTCUT_PATH")" \
   # Cover both an absent target becoming occupied before promotion and a
   # foreign replacement immediately after the shortcut promotion.
   run_public_shortcut_commit_guard() {
-    local window="$1" marker="foreign-shortcut-${window}" install_rc=0
+    local window="$1" install_rc=0
+    local marker="foreign-shortcut-${window}"
 
     rm -rf -- "$(dirname -- "$OCM_INSTALL_PATH")" "$(dirname -- "$OCM_SHORTCUT_PATH")"
     mkdir -p -- "$(dirname -- "$OCM_INSTALL_PATH")"
