@@ -496,6 +496,16 @@ prepare_dual_plan
 printf '%s\n' 'default proto static metric 100 nexthop via 192.0.2.1 dev eth0 weight 1 nexthop via 198.51.100.1 dev eth1 weight 1' > "$MOCK_DEFAULT4"
 assert_apply_topology_drift_rejected 'apply accepted an ECMP default replacing the planned default'
 
+# Keep IPv4 unchanged: these independently prove that IPv6 topology is checked
+# before owner creation or any route mutation.
+prepare_dual_plan
+printf '%s\n' 'default proto static metric 100 nexthop via 2001:db8::1 dev eth0 weight 1 nexthop via 2001:db8::2 dev eth1 weight 1' > "$MOCK_DEFAULT6"
+assert_apply_topology_drift_rejected 'apply accepted an IPv6 ECMP default replacing the planned default'
+
+prepare_dual_plan
+printf '%s\n' '2: eth0 inet6 2001:db8::11/64 scope global secondary eth0' >> "$MOCK_ADDR6"
+assert_apply_topology_drift_rejected 'apply accepted a newly added IPv6 global address'
+
 prepare_dual_plan
 printf '%s\n' 'default via 198.51.100.1 dev eth1 metric 100' > "$MOCK_DEFAULT4"
 printf '%s\n' '3: eth1 inet 192.0.2.10/24 scope global eth1' > "$MOCK_ADDR4"

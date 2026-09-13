@@ -1738,7 +1738,7 @@ remove_managed_shortcut() {
 }
 
 remove_managed_units() {
-  local unit path load_state rm_result
+  local unit path load_state rm_result failure_path removed_unit remaining_unit remaining_path
   local -a removed_units=()
   for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
     path="$(unit_path "$unit")" || return 1
@@ -1754,6 +1754,7 @@ remove_managed_units() {
         rm_result=1
       fi
       if [ "$rm_result" -ne 0 ]; then
+        failure_path="$path"
         # A previous delete changes systemd's loaded view. Reload before
         # returning the original failure so a later public uninstall can prove
         # absence and retry without a manual daemon-reload.
@@ -1761,21 +1762,21 @@ remove_managed_units() {
           if ! systemctl daemon-reload; then
             log_err "删除失败后的 systemd daemon-reload 也失败；保留其余恢复证据。"
           else
-            for unit in "${removed_units[@]}"; do
-              load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+            for removed_unit in "${removed_units[@]}"; do
+              load_state="$(systemctl show "$removed_unit" --property=LoadState --value 2>/dev/null || true)"
               [ "$load_state" = not-found ] \
-                || log_err "daemon-reload 后无法证明已删除单元已消失：$unit"
+                || log_err "daemon-reload 后无法证明已删除单元已消失：$removed_unit"
             done
-            for unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
-              path="$(unit_path "$unit")" || continue
-              if [ -e "$path" ] || [ -L "$path" ]; then
-                managed_unit_has_owned_source "$unit" \
-                  || log_err "daemon-reload 后无法证明保留单元仍属于 oc-master：$unit"
+            for remaining_unit in "$SERVICE_NAME" "$HEALTH_SERVICE_NAME" "$HEALTH_TIMER_NAME"; do
+              remaining_path="$(unit_path "$remaining_unit")" || continue
+              if [ -e "$remaining_path" ] || [ -L "$remaining_path" ]; then
+                managed_unit_has_owned_source "$remaining_unit" \
+                  || log_err "daemon-reload 后无法证明保留单元仍属于 oc-master：$remaining_unit"
               fi
             done
           fi
         fi
-        log_err "删除 systemd 单元失败，保留其余安装和恢复证据：$path"
+        log_err "删除 systemd 单元失败，保留其余安装和恢复证据：$failure_path"
         return 1
       fi
     elif [ -e "$path" ] || [ -L "$path" ]; then
