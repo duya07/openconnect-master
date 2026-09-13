@@ -97,6 +97,8 @@ Installation creates:
 /usr/local/bin/ocm -> /usr/local/sbin/oc-master
 ```
 
+`/usr/local/sbin/oc-master` is the persistent installed program used by the systemd services and independent rollback job; `/usr/local/bin/ocm` is only the short command symlink.
+
 `install` only installs or updates the script and shortcut. It does not connect the VPN or install system packages without confirmation. If another program owns `ocm`, installation stops instead of overwriting it.
 
 ### Update
@@ -137,6 +139,8 @@ See [examples/vpn_accounts.example](examples/vpn_accounts.example).
 
 The account file is root-only `0600` **plaintext**, not an encrypted vault. Fields cannot contain `|` and passwords cannot contain newlines. Legacy five-field records remain readable but require an explicit protocol choice on each start.
 
+Each start stores the complete selected account record in that run's snapshot. Reordering the account list afterward cannot make the current connection read a different account from the same index; the next explicit start still uses the list and selection available at that time.
+
 ### 🔌 Local SOCKS5 Mode (Recommended)
 
 Use this mode when only selected applications or services need the VPN egress:
@@ -164,6 +168,8 @@ Use this mode when the host's default outbound traffic must use the VPN. During 
 5. Asks you to establish a new external SSH or proxy connection and enter `KEEP` within 120 seconds.
 
 Keep the provider console available on first use. If a new inbound connection fails, do not enter `KEEP`; the manager stops and restores its routing state.
+
+Host-global mode starts only when it can uniquely prove the original egress and inbound return path. Multiple non-VPN default egresses, ECMP, multi-WAN, or policy routing that cannot be resolved safely are rejected before any network configuration is written. Use local SOCKS5 mode on such hosts, or simplify the routing topology first.
 
 A global VPN can cause ordinary DDNS jobs to publish the VPN egress instead of the VPS address. The manager only detects and warns; it never disables third-party jobs. Pause DDNS first or bind its IP lookup and API request to the original interface/source address.
 
@@ -241,6 +247,10 @@ Common checks:
    - Do not enter `KEEP`; allow the safety rollback to run.
    - Check for multiple interfaces, public addresses, third-party policy routing, or another VPN.
    - Verify that DDNS did not publish the VPN egress.
+
+4. **Logs report `CLEANUP_FAILED` or incomplete cleanup**
+   - Run `sudo ocm stop` first to retry explicit recovery; do not start another mode directly.
+   - If it still fails, use `sudo ocm logs` to identify the project-owned resource that could not be removed. Recovery evidence is retained and new starts are rejected until cleanup can be proven complete.
 
 A healthy result requires a systemd-supervised OpenConnect process, the expected listener or route, and a successful real HTTP request. A PID or listening socket alone is not proof.
 

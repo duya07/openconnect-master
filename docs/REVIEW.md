@@ -161,3 +161,66 @@ sudo ocm logs
 ```
 
 不要只检查 PID。出口请求、监听、systemd 状态和停止后的残留需要一起成立。
+
+## 事务化控制面重构证据（2026-09-13）
+
+本节审查范围为 `e03f2aa` 之后的事务化控制面重构。这里只记录代码、回归测试和已保存输出能够复核的事实；上文的真实 VPN/路由实机证据没有在本轮重跑，也不把隔离测试冒充为真实链路验收。
+
+### 架构问题与实现映射
+
+| 原控制面风险 | 候选实现 | 可复核入口 |
+|---|---|---|
+| 运行中再次按可变账户索引取值，账户重排可能切换凭据 | `active-run.conf` 保存同一 `run_id` 的完整单行账户记录；worker 只读取严格解析的不可变快照 | `tests/snapshot.sh` |
+| profile、进程和松散文件无法共同证明当前运行代际 | `active-run.conf` 与 `run-state.conf` 使用小写 UUID 绑定，原子替换并拒绝缺字段、重复字段、未知字段和代际不一致 | `tests/state.sh` |
+| `KEEP`、定时 rollback、stop 和 health 可能并发反转彼此结果 | manager、service-operation、state 三层锁固定顺序；阶段变更由同一 `run_id` 的 compare-and-set 完成 | `tests/lifecycle.sh` |
+| Global 启停时重新推断路由，清理失败仍可能进入下一模式 | 启动前生成并校验代际 route plan；清理不能被证明时保留 owner/plan 并进入 `CLEANUP_FAILED`，新启动必须先显式恢复 | `tests/routes.sh`、`tests/functions.sh` |
+| 单出口假设在多 default 或 ECMP 主机上没有被证明 | 多个非 VPN 默认出口、ECMP、多 WAN、跨出口地址和无法解析的 policy rule 在任何网络写入前 fail-closed | `tests/routes.sh` |
+| 安装中途失败可能留下程序、快捷链接和 unit 的混合版本 | 程序本体、快捷链接和三个 persistent unit 作为一个可回滚安装事务；覆盖前验证受管内容，旧版恢复还要证明 systemd 的实际加载来源 | `tests/install.sh`、`tests/health-uninstall.sh` |
+
+`/usr/local/sbin/oc-master` 仍是 systemd `ExecStart`、`ExecStopPost`、health 和 rollback 使用的持久程序本体，`/usr/local/bin/ocm` 仍是兼容的受管符号链接；公开菜单、命令和 OpenConnect 数据路径没有因此改名。
+
+### 隔离 Linux 验证
+
+验证机为 <测试机 A> 的 Debian x86_64（Linux 6.10.10，约 974 MiB RAM，无 swap）。候选源码以归档上传到 `/tmp/oc-master-verify-20260913-9f667c9-step8`，归档 SHA-256 为 `5e03094aca10c2a7614b29bf58023a6bb38dbd801590ce5aa86402a81f8c4fda`。所有测试通过 `OCM_*` 使用该目录内的配置、运行时、unit、锁、命令桩和伪 `/proc` 路径，没有调用真实 `start-global`/`start-proxy`。
+
+| 检查 | 结果 | elapsed | max RSS |
+|---|---:|---:|---:|
+| `bash -n oc_master.sh oc_master_en.sh tests/*.sh` | exit 0 | - | - |
+| 完整运行时回归（`tests/static.sh`，ShellCheck 单独执行） | exit 0 | `1:43.99` | `7688 KiB` |
+| 独立行为差分 `tests/compat.sh` | exit 0 | `0:09.57` | `7496 KiB` |
+| 独立微基准 `tests/performance.sh` | exit 0 | `0:18.88` | `6936 KiB` |
+| POSIX 安装事务夹具 `tests/install.sh` | exit 0 | `0:15.89` | `6636 KiB` |
+
+Linux 回归还发现并修正了两个只在真实 POSIX 文件语义下暴露的测试夹具问题：前一用例遗留的外来快捷链接污染下一用例，以及把“已完成提交后的备份清理失败”误当作应回滚的提交前失败。生产语义没有为迁就测试而放宽。
+
+### 静态检查的资源边界
+
+ShellCheck warning 级逐文件检查通过了两个生产脚本及除 `tests/state.sh` 外的所有测试文件；主脚本单文件检查峰值约 `651172 KiB`。`tests/state.sh` 在不展开外部 `source` 时也通过 warning 级检查，并由完整运行时回归实际执行。
+
+在这台 1 GiB、无 swap 的隔离机上，`shellcheck -x -S warning tests/state.sh` 使用 Debian 的 v0.9.0 和校验过官方 SHA-256 的 v0.11.0 都在约 `771232 KiB` RSS 时被 OOM killer 以 signal 9 终止。因此多文件一次性 `shellcheck -x` 没有可声称的成功结果；这里保留该限制，而不通过跳过源码展开来制造“全通过”。
+
+### 性能与资源结果
+
+独立 Linux 微基准中，proxy/global 各执行 200 次状态 load/CAS 往返，分别耗时 `9267 ms` 和 `9394 ms`；观测到的状态目录最大分别为 `375 B` 和 `372 B`，低于 `32 KiB` 上限。测试前后 shell 后台 job 数相同，没有新增常驻进程。未配置 `show_status` 的公网请求计数为 baseline `2` 次、候选版本 `2` 次，没有增加网络请求轮次。
+
+绝对耗时包含 Bash 进程、`flock` 和临时文件系统开销，因此 `tests/performance.sh` 记录数值和有界资源断言，不设置跨平台耗时阈值。事务状态和 route plan 的文件数量有固定上限，单次读取、校验、原子提交仍是常量规模；可靠性收益来自更严格的代际与所有权证明，而不是缓存或后台守护进程。
+
+### 验收命令
+
+```bash
+bash -n oc_master.sh oc_master_en.sh tests/*.sh
+shellcheck -x -S warning oc_master.sh oc_master_en.sh tests/*.sh
+bash tests/static.sh
+bash tests/compat.sh
+bash tests/performance.sh
+git diff --check
+```
+
+其中一次性 ShellCheck 命令受上述内存边界限制；其余命令退出 0。发布前仍须从最终提交重新执行 fresh 验证，并核对暂存路径、提交差异和远端 SHA，不能复用本节结果直接宣称推送完成。
+
+### 未施工候选
+
+- 多 WAN、ECMP 和跨出口公网地址若要自动支持，需要引入 connmark/nftables 等新的数据面所有权；当前选择明确拒绝，而不是猜测回程。
+- ocproxy 路径仍只承载 TCP/IPv4；UDP、QUIC 和代理侧 IPv6 没有被本次控制面重构扩展。
+- 账户文件仍是 root-only 明文文件；改接内核 keyring 或外部 secret manager 会改变部署和恢复接口，未在兼容性重构中引入。
+- 仍需在不同发行版、复杂既有 policy rule 以及真实长时链路中积累候选版本的运行证据；静态和隔离测试不能替代这些验证。
