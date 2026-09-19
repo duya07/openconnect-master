@@ -640,7 +640,12 @@ cleanup_ssh_protect_routes() {
 }
 
 stop_vpn() {
-  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then log_info "VPN is not running"; return; fi
+  # Do not take the early exit while the state file exists: a failed start has already
+  # written state and installed policy routes; the early exit skips
+  # cleanup_ssh_protect_routes and rm, leaving a stale ip rule and state behind (measured:
+  # iprule left at 4 lines; with the health cron installed it would also retry the bad
+  # account every 5 minutes).
+  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ] && ! [ -f "$STATE_FILE" ]; then log_info "VPN is not running"; return; fi
   log_info "Stopping VPN and cleaning up environment...";
   # || true: this one is especially dangerous - the assignment is the last command of an
   # `[ -f ] && ...` list, so a failure aborts stop_vpn entirely: no process killed, no temp

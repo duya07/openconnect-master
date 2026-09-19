@@ -632,7 +632,10 @@ cleanup_ssh_protect_routes() {
 }
 
 stop_vpn() {
-  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then log_info "VPN 未运行"; return; fi
+  # state 文件在时不能早退：失败的启动已写 state 并配好策略路由，早退会跳过
+  # cleanup_ssh_protect_routes 和 rm —— 残留 ip rule 和 state（实测 iprule 4 行残留；
+  # 装了守护任务还会每 5 分钟拿坏账户重连一次）。
+  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ] && ! [ -f "$STATE_FILE" ]; then log_info "VPN 未运行"; return; fi
   log_info "正在停止VPN并清理环境...";
   # || true：这一行尤其危险——赋值是 `[ -f ] && ...` 的最后一条命令，失败会直接终止
   # 整个 stop_vpn：进程没杀、临时文件没删、保底任务也没撤（实测 rc=1 且什么都没清）。
