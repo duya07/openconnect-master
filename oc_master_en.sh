@@ -382,6 +382,10 @@ cleanup_netns() {
   
   "$IP_CMD" netns del "${NETNS_NAME}" 2>/dev/null || true
   "$IP_CMD" link del "${VETH_HOST}" 2>/dev/null || true
+  # setup_netns writes a resolv.conf into /etc/netns/<name>/ (ip netns exec bind-mounts
+  # it over /etc/resolv.conf). Remove it here too, otherwise every Netns run leaves a
+  # directory behind on the system, and it survives uninstalling the script.
+  rm -rf "/etc/netns/${NETNS_NAME}" 2>/dev/null || true
   log "Netns base environment has been cleaned up."
 }
 

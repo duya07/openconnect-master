@@ -372,6 +372,10 @@ cleanup_netns() {
   
   "$IP_CMD" netns del "${NETNS_NAME}" 2>/dev/null || true
   "$IP_CMD" link del "${VETH_HOST}" 2>/dev/null || true
+  # setup_netns 会往 /etc/netns/<名字>/ 放一份 resolv.conf（ip netns exec 会把它
+  # bind-mount 到 /etc/resolv.conf）。这里一并删掉，否则每跑一次 Netns 模式就在系统里
+  # 留一个目录，脚本卸载之后也还在。
+  rm -rf "/etc/netns/${NETNS_NAME}" 2>/dev/null || true
   log "Netns 基础环境已清理。"
 }
 
