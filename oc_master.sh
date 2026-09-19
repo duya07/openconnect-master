@@ -20,6 +20,11 @@ SOCAT_PID_FILE_V6="${SOCAT_PID_FILE}.v6"
 STATE_FILE="/var/run/oc_manager.state"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
 SHORTCUT_PATH="/usr/local/bin/ocm"
+# 依赖标记：只记录"由本脚本安装"的依赖。卸载时据此区分——脚本装的默认删，
+# 用户自己装的默认保留并提醒，避免顺手删掉别的用途在用的东西。
+# 老版本升上来的机器没有这个文件，于是所有依赖都算"用户自己的"（偏保守）。
+DEPS_STATE_DIR="/var/lib/oc-master"
+DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
 
 # --- 路由与网络配置 ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -94,6 +99,70 @@ cleanup_on_interrupt() {
 }
 
 # --- 依赖检查 ---
+_mark_dep_installed() {
+  local name="$1"
+  mkdir -p "$DEPS_STATE_DIR" 2>/dev/null || return 0
+  if ! grep -qxF "$name" "$DEPS_MARK_FILE" 2>/dev/null; then
+    echo "$name" >> "$DEPS_MARK_FILE" 2>/dev/null || true
+  fi
+  return 0
+}
+# 0 = 这个依赖是本脚本装的；非 0 = 本来就有（或标记文件不存在）
+_dep_installed_by_us() { grep -qxF "$1" "$DEPS_MARK_FILE" 2>/dev/null; }
+
+# 可卸载的依赖：标记名|命令|用途。iptables/iproute2 属于系统基础件，不列入。
+_DEPS_LIST=(
+  "openconnect|openconnect|VPN 客户端（三种模式都要）"
+  "ocproxy|ocproxy|ocproxy 模式"
+  "gost|gost|Netns 模式的 SOCKS5 服务端"
+  "socat|socat|Netns 模式的端口转发"
+)
+
+# 菜单 7：先扫描现状，再决定装什么
+show_deps() {
+  local entry name cmd desc state
+  title "📦 依赖状态:"
+  for entry in "${_DEPS_LIST[@]}"; do
+    IFS='|' read -r name cmd desc <<< "$entry"
+    if command -v "$cmd" &>/dev/null; then
+      if _dep_installed_by_us "$name"; then
+        state="${C_GREEN}✔ 已安装${C_RESET} ${C_GREY}(本脚本安装，卸载时可安全删除)${C_RESET}"
+      else
+        state="${C_GREEN}✔ 已安装${C_RESET} ${C_YELLOW}(你自己装的，卸载时默认保留)${C_RESET}"
+      fi
+    else
+      state="${C_RED}✘ 缺失${C_RESET}"
+    fi
+    # 注意用 echo -e：颜色变量里存的是字面 \033[...m，printf 的 %s 不会解释转义
+    printf '  %-12s ' "$name"
+    echo -e "${desc}  ${state}"
+  done
+  sep
+}
+manage_deps() {
+  show_deps
+  local entry name cmd desc todo=() ans
+  for entry in "${_DEPS_LIST[@]}"; do
+    IFS='|' read -r name cmd desc <<< "$entry"
+    command -v "$cmd" &>/dev/null || todo+=("$entry")
+  done
+  if [ ${#todo[@]} -eq 0 ]; then log "全部依赖已就绪，无需安装。"; return 0; fi
+  log_warn "有 ${#todo[@]} 项依赖缺失。"
+  read -rp "是否立即安装缺失的依赖? [Y/n]: " ans || ans=""
+  [[ "$ans" =~ ^[nN]$ ]] && { log_info "已跳过安装。"; return 0; }
+  for entry in "${todo[@]}"; do
+    IFS='|' read -r name cmd desc <<< "$entry"
+    if [ "$name" = "gost" ]; then
+      _install_gost_now || true
+    else
+      _pkg_install "$name"
+      if command -v "$cmd" &>/dev/null; then _mark_dep_installed "$name"; log "$name 已安装。"
+      else log_err "$name 安装失败，请手动安装。"; fi
+    fi
+  done
+  sep; show_deps
+}
+
 _pkg_install() {
   local pkg="$1"
   log_info "安装 $pkg..."
@@ -105,16 +174,11 @@ _pkg_install() {
     dnf install -y "$pkg" >/dev/null || true
   fi
 }
-ensure_pkg_openconnect() { command -v openconnect &>/dev/null || { _pkg_install openconnect; command -v openconnect &>/dev/null || { log_err "安装 openconnect 失败"; exit 1; }; log "OpenConnect 就绪"; }; }
-ensure_pkg_ocproxy()     { command -v ocproxy     &>/dev/null || { _pkg_install ocproxy; command -v ocproxy &>/dev/null || { log_err "安装 ocproxy 失败"; exit 1; }; log "ocproxy 就绪"; }; }
+ensure_pkg_openconnect() { command -v openconnect &>/dev/null || { _pkg_install openconnect; command -v openconnect &>/dev/null || { log_err "安装 openconnect 失败"; exit 1; }; _mark_dep_installed openconnect; log "OpenConnect 已安装（记为本脚本安装）"; }; }
+ensure_pkg_ocproxy()     { command -v ocproxy     &>/dev/null || { _pkg_install ocproxy; command -v ocproxy &>/dev/null || { log_err "安装 ocproxy 失败"; exit 1; }; _mark_dep_installed ocproxy; log "ocproxy 已安装（记为本脚本安装）"; }; }
 ensure_pkg_iptables()    { command -v iptables    &>/dev/null || { _pkg_install iptables; command -v iptables &>/dev/null || { log_err "安装 iptables 失败"; exit 1; }; log "iptables 就绪"; }; }
 ensure_cmd_ss()          { command -v ss &>/dev/null || { _pkg_install iproute2 || _pkg_install iproute; log "iproute2 就绪"; }; }
-ensure_cmd_gost() {
-  command -v gost &>/dev/null && return 0
-  log_warn "Netns 模式需要 'gost' 作为 SOCKS5 服务器。"
-  read -rp "是否立即使用官方脚本自动安装 gost? [Y/n]: " yn
-  [[ "$yn" =~ ^[nN]$ ]] && { log_err "用户取消安装，Netns 模式无法启动。"; return 1; }
-  
+_install_gost_now() { # 只负责装，不询问（询问交给调用方，避免重复提问）
   log_info "正在使用官方脚本安装 gost..."
   if ! command -v curl &>/dev/null; then _pkg_install curl; fi
   bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install || {
@@ -125,16 +189,27 @@ ensure_cmd_gost() {
     log_err "gost 安装后仍未找到命令，请检查 PATH 环境变量或脚本输出。"
     return 1
   fi
+  _mark_dep_installed gost
   log "gost 已成功安装。"
   return 0
+}
+ensure_cmd_gost() {
+  command -v gost &>/dev/null && return 0
+  log_warn "Netns 模式需要 'gost' 作为 SOCKS5 服务器。"
+  local yn=""
+  read -rp "是否立即使用官方脚本自动安装 gost? [Y/n]: " yn || yn=""
+  [[ "$yn" =~ ^[nN]$ ]] && { log_err "用户取消安装，Netns 模式无法启动。"; return 1; }
+  _install_gost_now
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
   log_warn "Netns 模式推荐使用 'socat' 进行端口转发。"
-  read -rp "是否立即安装 socat? [Y/n]: " yn
+  local yn=""
+  read -rp "是否立即安装 socat? [Y/n]: " yn || yn=""
   [[ "$yn" =~ ^[nN]$ ]] && { log_info "将使用 iptables 作为备用方案。"; return 1; }
   _pkg_install socat
   command -v socat &>/dev/null || { log_warn "socat 安装失败，将使用 iptables。"; return 1; }
+  _mark_dep_installed socat
   log "socat 已安装。"
   return 0
 }
@@ -677,14 +752,33 @@ manage_cron() {
   done
 }
 
+# 卸载依赖前的询问。核心区别：
+#   本脚本装的      → 默认 Y（用户装它就是为了这个脚本）
+#   本来就在机器上   → 提醒 + 默认 N，避免删掉别的用途在用的东西
+# 返回 0 = 用户确认删除。
+_ask_uninstall_dep() {
+  local name="$1" desc="$2" ans=""
+  if _dep_installed_by_us "$name"; then
+    read -rp "是否卸载 $name? ($desc，由本脚本安装) [Y/n]: " ans || ans=""
+    [[ "$ans" =~ ^[nN]$ ]] && { log_info "已保留 $name。"; return 1; }
+    return 0
+  fi
+  log_warn "$name 不是本脚本安装的（可能是你自己装的，或还有别的用途）。"
+  read -rp "确定要卸载 $name 吗? [y/N]: " ans || ans=""
+  if [[ "$ans" =~ ^[yY]$ ]]; then return 0; fi
+  log_info "已保留 $name。"
+  return 1
+}
+
 uninstall() {
-  read -rp "⚠️  确认要卸载此脚本及其所有相关配置吗？[y/N]: " y; [[ "$y" =~ ^[yY]$ ]] || { log_info "已取消"; exit 0; }
+  local y=""
+  read -rp "⚠️  确认要卸载此脚本及其所有相关配置吗？[y/N]: " y || y=""
+  [[ "$y" =~ ^[yY]$ ]] || { log_info "已取消"; exit 0; }
   log_info "开始卸载..."; stop_vpn
   crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "定时任务已清理"
   
   if command -v gost &>/dev/null; then
-    read -rp "是否卸载 gost? (由 Netns 模式自动安装) [Y/n]: " yn_gost
-    if [[ ! "$yn_gost" =~ ^[nN]$ ]]; then
+    if _ask_uninstall_dep gost "Netns 模式的 SOCKS5 服务端"; then
       # 官方 install.sh 只认 --install 一个参数，没有卸载分支：传 --remove 之类的参数
       # 会掉进"选择版本"的安装菜单（交互选一次就真的把它装回去/升级），
       # 而 select 在非交互下失败后旧代码仍打印"已尝试卸载"——是句假话。
@@ -698,16 +792,17 @@ uninstall() {
   fi
   
   if command -v socat &>/dev/null; then
-    read -rp "是否卸载 socat? (由 Netns 模式自动安装) [Y/n]: " yn_socat
-    if [[ ! "$yn_socat" =~ ^[nN]$ ]]; then
+    if _ask_uninstall_dep socat "Netns 模式的端口转发"; then
       if command -v apt-get &>/dev/null; then apt-get purge -y socat >/dev/null || true
       elif command -v yum &>/dev/null; then yum remove -y socat >/dev/null || true
       elif command -v dnf &>/dev/null; then dnf remove -y socat >/dev/null || true; fi
-      log "socat 已尝试卸载。"
+      if command -v socat &>/dev/null; then log_warn "socat 卸载失败，请手动删除。"
+      else log "socat 已卸载。"; fi
     fi
   fi
 
-  read -rp "是否卸载 OpenConnect 和 ocproxy 软件包? [y/N]: " yn_oc
+  log_warn "OpenConnect / ocproxy 是常用软件包，其它程序也可能在用；不确定就选 N 保留。"
+  read -rp "是否卸载 OpenConnect 和 ocproxy 软件包? [y/N]: " yn_oc || yn_oc=""
   if [[ "$yn_oc" =~ ^[yY]$ ]]; then
     if command -v apt-get &>/dev/null; then apt-get purge -y openconnect ocproxy >/dev/null || true
     elif command -v yum &>/dev/null; then yum remove -y openconnect ocproxy >/dev/null || true
@@ -716,6 +811,7 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "账户文件已删除"
+  rm -f "$DEPS_MARK_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
   remove_shortcut
   log_info "正在删除脚本文件: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "卸载完成，再见！"
 }
@@ -767,7 +863,7 @@ main_menu() {
     4) stop_vpn || true;;
     5) manage_accounts;;
     6) manage_cron;;
-    7) ensure_pkg_openconnect; ensure_pkg_ocproxy; ensure_cmd_gost || true; ensure_cmd_socat || true;;
+    7) manage_deps;;
     8) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
          test_netns_ipv6 || true
        else

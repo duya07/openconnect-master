@@ -19,6 +19,13 @@ SOCAT_PID_FILE_V6="${SOCAT_PID_FILE}.v6"
 STATE_FILE="/var/run/oc_manager.state"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
 SHORTCUT_PATH="/usr/local/bin/ocm"
+# Dependency marker: records only the dependencies THIS script installed. Uninstall
+# uses it to tell them apart - what we installed is offered for removal by default,
+# what was already on the box is kept by default with a warning, so nobody deletes
+# something another program still uses. Machines upgraded from an older version have
+# no marker file, so every dependency counts as "already there" (the safe direction).
+DEPS_STATE_DIR="/var/lib/oc-master"
+DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
 
 # --- Routing & Network Config ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -96,6 +103,72 @@ cleanup_on_interrupt() {
 }
 
 # --- Dependency Checks ---
+_mark_dep_installed() {
+  local name="$1"
+  mkdir -p "$DEPS_STATE_DIR" 2>/dev/null || return 0
+  if ! grep -qxF "$name" "$DEPS_MARK_FILE" 2>/dev/null; then
+    echo "$name" >> "$DEPS_MARK_FILE" 2>/dev/null || true
+  fi
+  return 0
+}
+# 0 = this script installed it; non-zero = it was already there (or no marker file)
+_dep_installed_by_us() { grep -qxF "$1" "$DEPS_MARK_FILE" 2>/dev/null; }
+
+# Removable dependencies: marker name|command|purpose. iptables/iproute2 are core
+# system packages and are deliberately not listed.
+_DEPS_LIST=(
+  "openconnect|openconnect|VPN client (needed by all three modes)"
+  "ocproxy|ocproxy|ocproxy mode"
+  "gost|gost|SOCKS5 server for Netns mode"
+  "socat|socat|Port forwarding for Netns mode"
+)
+
+# Menu 7: scan the current state first, then decide what to install
+show_deps() {
+  local entry name cmd desc state
+  title "📦 Dependency status:"
+  for entry in "${_DEPS_LIST[@]}"; do
+    IFS='|' read -r name cmd desc <<< "$entry"
+    if command -v "$cmd" &>/dev/null; then
+      if _dep_installed_by_us "$name"; then
+        state="${C_GREEN}✔ installed${C_RESET} ${C_GREY}(installed by this script, safe to remove)${C_RESET}"
+      else
+        state="${C_GREEN}✔ installed${C_RESET} ${C_YELLOW}(pre-existing, kept by default on uninstall)${C_RESET}"
+      fi
+    else
+      state="${C_RED}✘ missing${C_RESET}"
+    fi
+    # echo -e is required: the colour variables hold a literal \033[...m and
+    # printf's %s does not expand escapes.
+    printf '  %-12s ' "$name"
+    echo -e "${desc}  ${state}"
+  done
+  sep
+}
+manage_deps() {
+  show_deps
+  local entry name cmd desc todo=() ans=""
+  for entry in "${_DEPS_LIST[@]}"; do
+    IFS='|' read -r name cmd desc <<< "$entry"
+    command -v "$cmd" &>/dev/null || todo+=("$entry")
+  done
+  if [ ${#todo[@]} -eq 0 ]; then log "All dependencies are present, nothing to install."; return 0; fi
+  log_warn "${#todo[@]} dependenc(ies) missing."
+  read -rp "Install the missing dependencies now? [Y/n]: " ans || ans=""
+  [[ "$ans" =~ ^[nN]$ ]] && { log_info "Installation skipped."; return 0; }
+  for entry in "${todo[@]}"; do
+    IFS='|' read -r name cmd desc <<< "$entry"
+    if [ "$name" = "gost" ]; then
+      _install_gost_now || true
+    else
+      _pkg_install "$name"
+      if command -v "$cmd" &>/dev/null; then _mark_dep_installed "$name"; log "$name installed."
+      else log_err "Failed to install $name, please install it manually."; fi
+    fi
+  done
+  sep; show_deps
+}
+
 _pkg_install() {
   local pkg="$1"
   log_info "Installing $pkg..."
@@ -107,16 +180,11 @@ _pkg_install() {
     dnf install -y "$pkg" >/dev/null || true
   fi
 }
-ensure_pkg_openconnect() { command -v openconnect &>/dev/null || { _pkg_install openconnect; command -v openconnect &>/dev/null || { log_err "Failed to install openconnect"; exit 1; }; log "OpenConnect is ready"; }; }
-ensure_pkg_ocproxy()     { command -v ocproxy     &>/dev/null || { _pkg_install ocproxy; command -v ocproxy &>/dev/null || { log_err "Failed to install ocproxy"; exit 1; }; log "ocproxy is ready"; }; }
+ensure_pkg_openconnect() { command -v openconnect &>/dev/null || { _pkg_install openconnect; command -v openconnect &>/dev/null || { log_err "Failed to install openconnect"; exit 1; }; _mark_dep_installed openconnect; log "OpenConnect installed (marked as installed by this script)"; }; }
+ensure_pkg_ocproxy()     { command -v ocproxy     &>/dev/null || { _pkg_install ocproxy; command -v ocproxy &>/dev/null || { log_err "Failed to install ocproxy"; exit 1; }; _mark_dep_installed ocproxy; log "ocproxy installed (marked as installed by this script)"; }; }
 ensure_pkg_iptables()    { command -v iptables    &>/dev/null || { _pkg_install iptables; command -v iptables &>/dev/null || { log_err "Failed to install iptables"; exit 1; }; log "iptables is ready"; }; }
 ensure_cmd_ss()          { command -v ss &>/dev/null || { _pkg_install iproute2 || _pkg_install iproute; log "iproute2 is ready"; }; }
-ensure_cmd_gost() {
-  command -v gost &>/dev/null && return 0
-  log_warn "Netns mode requires 'gost' as a SOCKS5 server."
-  read -rp "Do you want to auto-install gost using the official script now? [Y/n]: " yn
-  [[ "$yn" =~ ^[nN]$ ]] && { log_err "User cancelled installation. Netns mode cannot be started."; return 1; }
-  
+_install_gost_now() { # installs only, never prompts (the caller already asked)
   log_info "Installing gost using the official script..."
   if ! command -v curl &>/dev/null; then _pkg_install curl; fi
   bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install || {
@@ -127,16 +195,27 @@ ensure_cmd_gost() {
     log_err "gost command not found after installation. Please check your PATH variable or the script output."
     return 1
   fi
+  _mark_dep_installed gost
   log "gost has been successfully installed."
   return 0
+}
+ensure_cmd_gost() {
+  command -v gost &>/dev/null && return 0
+  log_warn "Netns mode requires 'gost' as a SOCKS5 server."
+  local yn=""
+  read -rp "Do you want to auto-install gost using the official script now? [Y/n]: " yn || yn=""
+  [[ "$yn" =~ ^[nN]$ ]] && { log_err "User cancelled installation. Netns mode cannot be started."; return 1; }
+  _install_gost_now
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
   log_warn "Netns mode recommends using 'socat' for port forwarding."
-  read -rp "Do you want to install socat now? [Y/n]: " yn
+  local yn=""
+  read -rp "Do you want to install socat now? [Y/n]: " yn || yn=""
   [[ "$yn" =~ ^[nN]$ ]] && { log_info "iptables will be used as a fallback."; return 1; }
   _pkg_install socat
   command -v socat &>/dev/null || { log_warn "socat installation failed, will use iptables."; return 1; }
+  _mark_dep_installed socat
   log "socat has been installed."
   return 0
 }
@@ -680,14 +759,34 @@ manage_cron() {
   done
 }
 
+# Ask before removing a dependency. The whole point is the difference:
+#   installed by this script -> default Y (the user installed it for this script)
+#   already on the machine     -> warning + default N, so nothing another program
+#                                 still uses gets deleted by accident
+# Returns 0 when the user confirmed removal.
+_ask_uninstall_dep() {
+  local name="$1" desc="$2" ans=""
+  if _dep_installed_by_us "$name"; then
+    read -rp "Uninstall $name? ($desc, installed by this script) [Y/n]: " ans || ans=""
+    [[ "$ans" =~ ^[nN]$ ]] && { log_info "Keeping $name."; return 1; }
+    return 0
+  fi
+  log_warn "$name was not installed by this script (you may have installed it yourself, or something else may use it)."
+  read -rp "Are you sure you want to uninstall $name? [y/N]: " ans || ans=""
+  if [[ "$ans" =~ ^[yY]$ ]]; then return 0; fi
+  log_info "Keeping $name."
+  return 1
+}
+
 uninstall() {
-  read -rp "⚠️  Are you sure you want to uninstall this script and all related configurations? [y/N]: " y; [[ "$y" =~ ^[yY]$ ]] || { log_info "Cancelled"; exit 0; }
+  local y=""
+  read -rp "⚠️  Are you sure you want to uninstall this script and all related configurations? [y/N]: " y || y=""
+  [[ "$y" =~ ^[yY]$ ]] || { log_info "Cancelled"; exit 0; }
   log_info "Starting uninstallation..."; stop_vpn
   crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "Cron jobs cleared"
   
   if command -v gost &>/dev/null; then
-    read -rp "Uninstall gost? (was auto-installed by Netns mode) [Y/n]: " yn_gost
-    if [[ ! "$yn_gost" =~ ^[nN]$ ]]; then
+    if _ask_uninstall_dep gost "SOCKS5 server for Netns mode"; then
       # The official install.sh only understands --install; it has no uninstall branch.
       # Passing --remove (or anything else) drops it into the interactive "pick a
       # version" installer, so the old code could actually reinstall/upgrade gost and
@@ -702,16 +801,17 @@ uninstall() {
   fi
   
   if command -v socat &>/dev/null; then
-    read -rp "Uninstall socat? (was auto-installed by Netns mode) [Y/n]: " yn_socat
-    if [[ ! "$yn_socat" =~ ^[nN]$ ]]; then
+    if _ask_uninstall_dep socat "Port forwarding for Netns mode"; then
       if command -v apt-get &>/dev/null; then apt-get purge -y socat >/dev/null || true
       elif command -v yum &>/dev/null; then yum remove -y socat >/dev/null || true
       elif command -v dnf &>/dev/null; then dnf remove -y socat >/dev/null || true; fi
-      log "socat uninstallation attempted."
+      if command -v socat &>/dev/null; then log_warn "Failed to uninstall socat, please remove it manually."
+      else log "socat has been uninstalled."; fi
     fi
   fi
 
-  read -rp "Uninstall OpenConnect and ocproxy packages? [y/N]: " yn_oc
+  log_warn "OpenConnect / ocproxy are common packages that other programs may also use; choose N if unsure."
+  read -rp "Uninstall OpenConnect and ocproxy packages? [y/N]: " yn_oc || yn_oc=""
   if [[ "$yn_oc" =~ ^[yY]$ ]]; then
     if command -v apt-get &>/dev/null; then apt-get purge -y openconnect ocproxy >/dev/null || true
     elif command -v yum &>/dev/null; then yum remove -y openconnect ocproxy >/dev/null || true
@@ -720,6 +820,7 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "Account file deleted"
+  rm -f "$DEPS_MARK_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
   remove_shortcut
   log_info "Deleting script file: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "Uninstallation complete. Goodbye!"
 }
@@ -771,7 +872,7 @@ main_menu() {
     4) stop_vpn || true;;
     5) manage_accounts;;
     6) manage_cron;;
-    7) ensure_pkg_openconnect; ensure_pkg_ocproxy; ensure_cmd_gost || true; ensure_cmd_socat || true;;
+    7) manage_deps;;
     8) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
          test_netns_ipv6 || true
        else

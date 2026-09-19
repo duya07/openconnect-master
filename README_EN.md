@@ -354,6 +354,15 @@ For more issues, refer to [FAQ Documentation](docs/FAQ.md)
 - ✨ **Enhancement**: socat forwarding supports IPv4 and IPv6 dual-stack listening
 - 📝 **Documentation**: Improved usage documentation and troubleshooting guide
 
+**Follow-up fixes (still v7.7.7)**
+
+- 🔧 **Fix**: Netns mode intermittently reported a startup failure right after "TUN interface is ready" - under `set -o pipefail`, `grep -q` exits early and `ip` dies from SIGPIPE, so a successful match was treated as a failure (measured ~17% of runs)
+- 🔧 **Fix**: Uninstalling gost used `--remove`, which the official script does not support - it actually opened the interactive "pick a version" installer and aborted the uninstall; it now deletes the binary directly
+- 🔧 **Fix**: Deleting a VPN account left the account file with mode 644 instead of 600
+- 🔧 **Fix**: Stopping Netns mode left openconnect running for a long time (its logout path was torn down first, and the leftover process fought the next connection)
+- 🔧 **Fix**: A failed start did not cancel the failsafe rollback job, which killed the connection the user had re-established 2 minutes later
+- ✨ **New**: Menu 7 now scans dependency status and marks "installed by this script" vs "pre-existing"; on uninstall the latter is kept by default with a warning, so packages used elsewhere are not removed by accident
+
 ### v7.7.6 (2025-01-10)
 
 - 🔧 **Fix**: Adopted correct architecture of "service built-in (gost in netns), port external (socat/DNAT)"
