@@ -395,6 +395,10 @@ manage_accounts() {
 # Format: Display Name|Username|Password|VPN Host|Auth Group(Optional)
 EOT
     chmod 600 "$ACCOUNTS_FILE" || true; }
+  # c must be local: otherwise this submenu overwrites the main menu's option
+  # variable, and main_menu's "press any key" test then uses the wrong value
+  # (a spurious extra pause that also eats one character of the next input).
+  local c
   while true; do
     clear; title "🔐 Manage VPN Accounts ($ACCOUNTS_FILE)"; sep
     grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  File is empty."
@@ -405,7 +409,15 @@ EOT
          echo "$d|$u|$p|$h|$g" >> "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "Added $d"; read -n1 -s -p "Press any key to continue";;
       2) mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ ${#A[@]} -eq 0 ] && { log_info "No accounts found"; sleep 1; continue; }
          read -rp "Enter the number to delete: " i; [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#A[@]}" ] || { log_err "Invalid number"; continue; }
-         grep -vF "${A[$((i-1))]}" "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp" && mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "Deleted"; read -n1 -s -p "Press any key to continue";;
+         # Delete exactly the i-th entry of the filtered list. The old grep -vF approach had
+         # two problems: (1) deleting the last entry produced no output, grep returned 1, so
+         # `&& mv` never ran - the file stayed unchanged while "Deleted" was printed anyway
+         # (false success) and a .tmp file was left behind; (2) two identical accounts were
+         # both removed at once.
+         if ! awk -v n="$i" 'BEGIN{k=0} /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next} {k++; if (k!=n) print}' "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp"; then
+           log_err "Delete failed: cannot write the temporary file."; rm -f "${ACCOUNTS_FILE}.tmp"; read -n1 -s -p "Press any key to continue"; continue
+         fi
+         mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "Deleted"; read -n1 -s -p "Press any key to continue";;
       3) break;;
       *) log_err "Invalid option"; sleep 1;;
     esac
@@ -607,8 +619,10 @@ cleanup_ssh_protect_routes() {
   local vps4="" vps6=""
   if [ -f "$STATE_FILE" ]; then
     log_info "🔍 Loading route info from state file for precise cleanup..."
-    vps4=$(grep '^VPS4=' "$STATE_FILE" | cut -d'=' -f2)
-    vps6=$(grep '^VPS6=' "$STATE_FILE" | cut -d'=' -f2)
+    # || true: if the state file exists but lacks this key, grep returns 1, the assignment
+    # fails and set -e aborts the whole cleanup (measured: it exited without cleaning a thing).
+    vps4=$(grep '^VPS4=' "$STATE_FILE" | cut -d'=' -f2 || true)
+    vps6=$(grep '^VPS6=' "$STATE_FILE" | cut -d'=' -f2 || true)
   else
     log_warn "State file not found, will attempt generic cleanup."
   fi
@@ -628,7 +642,10 @@ cleanup_ssh_protect_routes() {
 stop_vpn() {
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then log_info "VPN is not running"; return; fi
   log_info "Stopping VPN and cleaning up environment...";
-  local MODE; [ -f "$STATE_FILE" ] && MODE=$(grep '^MODE=' "$STATE_FILE" | cut -d'=' -f2)
+  # || true: this one is especially dangerous - the assignment is the last command of an
+  # `[ -f ] && ...` list, so a failure aborts stop_vpn entirely: no process killed, no temp
+  # files removed, no safety-net job cancelled (measured rc=1 with nothing cleaned up).
+  local MODE; [ -f "$STATE_FILE" ] && MODE=$(grep '^MODE=' "$STATE_FILE" | cut -d'=' -f2 || true)
 
   case "${MODE:-unknown}" in
     netns)
@@ -741,6 +758,8 @@ show_status() {
 
 # --- Cron & Uninstall ---
 manage_cron() {
+  # Same as manage_accounts: c must be local, or it clobbers the main menu's choice.
+  local c
   while true; do
     clear; title "🗓️ Cron / Daemon Jobs"; sep
     crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || log_info "  No cron jobs found for this script."
@@ -835,7 +854,7 @@ _internal_cron_handler() {
     _internal_check_health)
       if ! is_vpn_running && [ -f "$STATE_FILE" ]; then
         log_info "Daemon: Connection loss detected, attempting to reconnect automatically..."; 
-        . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX}"
+        . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"
         case "${MODE:-}" in
           default) _start_default_logic ;;
           ocproxy) _start_ocproxy_logic ;;
@@ -868,7 +887,9 @@ main_menu() {
   echo -e "  ${C_CYAN}10) 🔗 Install ocm shortcut command (then just type ocm)${C_RESET}"
   echo -e "  0) 🚪 Exit"
   echo
-  read -rp "Please select [0-9] or 10: " c
+  # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
+  # menu loop forever, issuing two public-IP lookups per iteration. read fails on EOF.
+  read -rp "Please select [0-9] or 10: " c || { echo; log_info "Standard input closed, exiting."; exit 0; }
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -887,7 +908,11 @@ main_menu() {
     0) exit 0;;
     *) log_err "Invalid option '$c'";;
   esac
+  # For options 5/6, a bare Enter or a wrong key, the AND list above returns 1; and a
+  # function whose last statement returns non-zero makes set -e terminate the whole script
+  # (measured: pressing Enter at the main menu quit the program). Return explicitly.
   [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
+  return 0
 }
 
 # --- Script Entrypoint ---

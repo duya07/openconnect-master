@@ -385,6 +385,10 @@ manage_accounts() {
 # 格式: 显示名|用户名|密码|VPN主机|认证组(可选)
 EOT
     chmod 600 "$ACCOUNTS_FILE" || true; }
+  # c 必须是 local：否则子菜单会把主菜单的选项变量覆盖成自己的选择，返回主菜单后
+  # "是否要按任意键"的判断（main_menu 末尾）就用错值，表现为凭空多出一次
+  # "按任意键返回主菜单"的暂停——而且它恰好把后面要输入的选项吃掉一格。
+  local c
   while true; do
     clear; title "🔐 管理 VPN 账户 ($ACCOUNTS_FILE)"; sep
     grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  文件为空。"
@@ -395,7 +399,13 @@ EOT
          echo "$d|$u|$p|$h|$g" >> "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已添加 $d"; read -n1 -s -p "按任意键继续";;
       2) mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ ${#A[@]} -eq 0 ] && { log_info "无账户"; sleep 1; continue; }
          read -rp "输入要删除的序号: " i; [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#A[@]}" ] || { log_err "无效序号"; continue; }
-         grep -vF "${A[$((i-1))]}" "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp" && mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已删除"; read -n1 -s -p "按任意键继续";;
+         # 按"过滤后列表里的第 i 条"精确删除一行。原先用 grep -vF 删整行字符串有两个坑：
+         # ① 删最后一条时 grep 没有输出、返回 1，`&& mv` 于是不执行——文件原样没动却照样
+         #    打印"已删除"（假成功），还留下一个 .tmp；② 两条账户内容完全相同时会被一起删掉。
+         if ! awk -v n="$i" 'BEGIN{k=0} /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next} {k++; if (k!=n) print}' "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp"; then
+           log_err "删除失败：无法写入临时文件。"; rm -f "${ACCOUNTS_FILE}.tmp"; read -n1 -s -p "按任意键继续"; continue
+         fi
+         mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已删除"; read -n1 -s -p "按任意键继续";;
       3) break;;
       *) log_err "无效选项"; sleep 1;;
     esac
@@ -601,8 +611,10 @@ cleanup_ssh_protect_routes() {
   local vps4="" vps6=""
   if [ -f "$STATE_FILE" ]; then
     log_info "🔍 从状态文件加载路由信息进行精确清理..."
-    vps4=$(grep '^VPS4=' "$STATE_FILE" | cut -d'=' -f2)
-    vps6=$(grep '^VPS6=' "$STATE_FILE" | cut -d'=' -f2)
+    # || true：状态文件存在、但缺这个键时 grep 返回 1，赋值随之失败，set -e 会直接
+    # 终止整个清理流程（实测：一个字段都没清理就退出，策略路由全留着）。
+    vps4=$(grep '^VPS4=' "$STATE_FILE" | cut -d'=' -f2 || true)
+    vps6=$(grep '^VPS6=' "$STATE_FILE" | cut -d'=' -f2 || true)
   else
     log_warn "未找到状态文件，将尝试通用清理。"
   fi
@@ -622,7 +634,9 @@ cleanup_ssh_protect_routes() {
 stop_vpn() {
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then log_info "VPN 未运行"; return; fi
   log_info "正在停止VPN并清理环境...";
-  local MODE; [ -f "$STATE_FILE" ] && MODE=$(grep '^MODE=' "$STATE_FILE" | cut -d'=' -f2)
+  # || true：这一行尤其危险——赋值是 `[ -f ] && ...` 的最后一条命令，失败会直接终止
+  # 整个 stop_vpn：进程没杀、临时文件没删、保底任务也没撤（实测 rc=1 且什么都没清）。
+  local MODE; [ -f "$STATE_FILE" ] && MODE=$(grep '^MODE=' "$STATE_FILE" | cut -d'=' -f2 || true)
 
   case "${MODE:-unknown}" in
     netns)
@@ -734,6 +748,8 @@ show_status() {
 
 # --- 定时与卸载 ---
 manage_cron() {
+  # 同 manage_accounts：c 必须 local，否则会覆盖主菜单的选项变量。
+  local c
   while true; do
     clear; title "🗓️ 定时/守护任务"; sep
     crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || log_info "  当前无此脚本的定时任务。"
@@ -826,7 +842,7 @@ _internal_cron_handler() {
     _internal_check_health)
       if ! is_vpn_running && [ -f "$STATE_FILE" ]; then
         log_info "守护进程: 检测到连接断开, 正在尝试自动重连..."; 
-        . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX}"
+        . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"
         case "${MODE:-}" in
           default) _start_default_logic ;;
           ocproxy) _start_ocproxy_logic ;;
@@ -859,7 +875,9 @@ main_menu() {
   echo -e "  ${C_CYAN}10) 🔗 安装 ocm 快捷命令 (以后直接输 ocm)${C_RESET}"
   echo -e "  0) 🚪 退出"
   echo
-  read -rp "请选择 [0-9] 或 10: " c
+  # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，
+  # 每轮还会发两次公网 IP 查询。read 失败正是 EOF 的情形。
+  read -rp "请选择 [0-9] 或 10: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -878,7 +896,11 @@ main_menu() {
     0) exit 0;;
     *) log_err "无效选项 '$c'";;
   esac
+  # 选项 5/6、直接回车或输错键时，上面那条 AND 列表返回 1；而"函数最后一条语句返回
+  # 非 0"会让 set -e 结束整个脚本（实测：在主菜单按一下回车程序就退出了）。
+  # 显式 return 0，保证任何输入都回到菜单循环里。
   [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
+  return 0
 }
 
 # --- 脚本入口 ---

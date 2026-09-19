@@ -362,6 +362,11 @@ For more issues, refer to [FAQ Documentation](docs/FAQ.md)
 - 🔧 **Fix**: Stopping Netns mode left openconnect running for a long time (its logout path was torn down first, and the leftover process fought the next connection)
 - 🔧 **Fix**: A failed start did not cancel the failsafe rollback job, which killed the connection the user had re-established 2 minutes later
 - ✨ **New**: Menu 7 now scans dependency status and marks "installed by this script" vs "pre-existing"; on uninstall the latter is kept by default with a warning, so packages used elsewhere are not removed by accident
+- 🔧 **Fix**: `cleanup_netns` never removed `/etc/netns/<name>/`, so every Netns run left a directory behind on the system (still there after uninstalling the script)
+- 🔧 **Fix**: A wrong key or a bare Enter at the main menu quit the whole program - the trailing `[[ ]] && read` in `main_menu` returns 1, and "a function whose last statement returns non-zero" makes `set -e` terminate the script; it now returns explicitly and exits cleanly when stdin ends (otherwise it would spin on the menu)
+- 🔧 **Fix**: The account and cron submenus reused the main menu's option variable (no `local`), so the "press any key" decision after returning used the submenu's value - after choosing 5/6 that produced a spurious extra "press any key to return to the main menu" that also swallowed the next input character
+- 🔧 **Fix**: `stop` aborted halfway when the state file existed but lacked `MODE=`/`VPS4=`/`VPS6=` (the assignment is the last command of an `[ -f ] && ...` list, and `grep` returning 1 made `set -e` end the whole stop path: no process killed, no temp file removed, no safety-net job cancelled)
+- 🔧 **Fix**: Account deletion now removes exactly the row at the given index of the filtered list. The old `grep -vF ... && mv` printed "Deleted" without changing the file when the last entry was removed (`grep` produced no output, returned 1, so `mv` never ran) and also removed two identical accounts at once
 
 ### v7.7.6 (2025-01-10)
 
