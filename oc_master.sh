@@ -308,7 +308,11 @@ _execute_with_safety_net() {
   local func_to_run="$1"
   trap cleanup_on_interrupt SIGINT
   check_atd
-  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 分钟之前 2>&1 | awk '/job/{print $2}' || echo "none")
+  # 保底回滚：先排一个 2 分钟后执行的 stop，连接稳定后再取消它（见下方 atrm）。
+  # 注意 at 的时间表达式必须是英文单位：原写成 `at now + 2 分钟之前`，at 会以
+  # "Garbled time" 拒绝，job 取到空值后整条保底机制静默失效（README 承诺的
+  # "自动回滚保护" 因此从未生效过）。这里用标准写法。
+  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || echo "none")
   [ "$job" != "none" ] && log_warn "已设保底清理任务 (Job $job), 2分钟内连接失败将自动回滚。"
 
   if "$func_to_run"; then
