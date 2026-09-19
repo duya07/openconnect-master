@@ -5,6 +5,7 @@
 #   - Fix(Netns): Enhanced IPv6 detection in show_status, improving success rate through multiple methods (increased timeout, fallback check points, direct netns connection).
 #   - Enhancement(Netns): socat forwarding now supports dual-stack (IPv4 & IPv6) listening.
 #   - New(Netns): Added active IPv6 connectivity test function at startup and in the menu.
+#   - New: OpenConnect protocol selection, supporting AnyConnect / Pulse(Ivanti) / NC(Juniper).
 # =================================================================
 set -euo pipefail
 
@@ -17,6 +18,7 @@ SOCAT_PID_FILE="/var/run/oc_socat.pid"
 SOCAT_PID_FILE_V6="${SOCAT_PID_FILE}.v6"
 STATE_FILE="/var/run/oc_manager.state"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
+SHORTCUT_PATH="/usr/local/bin/ocm"
 
 # --- Routing & Network Config ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -43,6 +45,48 @@ log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
 sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "Please run as root"; exit 1; }; }
+
+# --- ocm Shortcut Command ---
+# Use a symlink instead of a copy: the script resolves its own real path with
+# readlink -f "$0", so calling it through /usr/local/bin/ocm behaves exactly the
+# same (menu, ocm stop and _internal_* all keep working).
+# Only takes over a link that already points at this script; an existing real
+# file at that path is never overwritten.
+install_shortcut() {
+  local current=""
+  if [ -L "$SHORTCUT_PATH" ]; then
+    current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+    if [ "$current" = "$SCRIPT_PATH" ]; then
+      log "Shortcut command is already in place: ${SHORTCUT_PATH}"
+      return 0
+    fi
+    log_err "${SHORTCUT_PATH} is a symlink pointing elsewhere (${current:-unknown}), refusing to overwrite."
+    return 1
+  fi
+  if [ -e "$SHORTCUT_PATH" ]; then
+    log_err "${SHORTCUT_PATH} already exists and is not a symlink, refusing to overwrite."
+    return 1
+  fi
+  # A symlink requires the target itself to be executable. The normal install
+  # flow already runs chmod +x, but if the script was started with
+  # `bash oc_master_en.sh` the execute bit may be missing, so add it here.
+  [ -x "$SCRIPT_PATH" ] || chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+  if [ ! -x "$SCRIPT_PATH" ]; then
+    log_err "The script is not executable, so the shortcut would not work: ${SCRIPT_PATH}"
+    return 1
+  fi
+  ln -s "$SCRIPT_PATH" "$SHORTCUT_PATH" || { log_err "Failed to create shortcut command: ${SHORTCUT_PATH}"; return 1; }
+  log "Shortcut command installed: ${SHORTCUT_PATH} -> ${SCRIPT_PATH}"
+  log_info "From now on you can simply run: ocm   or   ocm stop"
+}
+
+remove_shortcut() {
+  local current=""
+  [ -L "$SHORTCUT_PATH" ] || return 0
+  current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+  [ "$current" = "$SCRIPT_PATH" ] && { rm -f "$SHORTCUT_PATH"; log "Removed shortcut command ${SHORTCUT_PATH}"; }
+  return 0
+}
 
 # --- Interrupt Handling ---
 cleanup_on_interrupt() {
@@ -272,6 +316,25 @@ select_account() {
   export VPN_GROUP=$(echo "$choice" | cut -d'|' -f5)
   log_info "Loaded: $VPN_DESC"
 }
+select_protocol() {
+  local p=""
+  echo
+  title "🔌 Please select the OpenConnect protocol:"
+  echo "  1) AnyConnect  - Cisco AnyConnect (default)"
+  echo "  2) Pulse       - Pulse Secure / Ivanti Secure Access"
+  echo "  3) NC          - Juniper Network Connect"
+  echo "  99) Back"
+  read -rp "Select [1-3, default 1]: " p
+  case "${p:-1}" in
+    1) export VPN_PROTOCOL="anyconnect"; export VPN_PROTOCOL_DESC="Cisco AnyConnect" ;;
+    2) export VPN_PROTOCOL="pulse";      export VPN_PROTOCOL_DESC="Pulse / Ivanti" ;;
+    3) export VPN_PROTOCOL="nc";         export VPN_PROTOCOL_DESC="Juniper NC" ;;
+    99) return 1 ;;
+    *) log_err "Invalid protocol selection"; return 1 ;;
+  esac
+  log_info "Protocol selected: ${VPN_PROTOCOL_DESC} (--protocol=${VPN_PROTOCOL})"
+}
+
 _load_account_by_index() {
   local idx="$1"; mapfile -t ACC < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE")
   [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -lt "${#ACC[@]}" ] || { log_err "Invalid account index: $idx"; exit 1; }
@@ -300,39 +363,41 @@ _execute_with_safety_net() {
   fi
 }
 
-start_default() { is_vpn_running && { log_err "VPN is already running"; return; }; ensure_pkg_openconnect; select_account || return; _execute_with_safety_net "_start_default_logic"; }
+start_default() { is_vpn_running && { log_err "VPN is already running"; return; }; ensure_pkg_openconnect; select_account || return; select_protocol || return; _execute_with_safety_net "_start_default_logic"; }
 _start_default_logic() {
   setup_ssh_protect_routes
-  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; } | tee -a "$STATE_FILE" >/dev/null
-  log_info "Connecting to VPN [Default Mode]: $VPN_HOST ..."
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol=anyconnect --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
+  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null
+  log_info "Connecting to VPN [Default Mode / Protocol: ${VPN_PROTOCOL:-anyconnect}]: $VPN_HOST ..."
+  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "${oc_cmd[@]}"
   log_info "Waiting for TUN interface to be ready..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | grep -q 'tun.*UP'; then log "VPN connected successfully (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
   log_err "VPN connection failed or timed out"; return 1
 }
 
-start_ocproxy_mode() { is_vpn_running && { log_err "VPN is already running"; return; }; ensure_pkg_ocproxy; select_account || return; _execute_with_safety_net "_start_ocproxy_logic"; }
+start_ocproxy_mode() { is_vpn_running && { log_err "VPN is already running"; return; }; ensure_pkg_openconnect; ensure_pkg_ocproxy; select_account || return; select_protocol || return; _execute_with_safety_net "_start_ocproxy_logic"; }
 _start_ocproxy_logic() {
   local socks_port
   local listen_addr="127.0.0.1" # [Final] Simplified: listen locally by default, remove remote option
   while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port"||{ log_err "Port is already in use";continue; }; break; done
   
-  log_info "Starting ocproxy mode (Listening on: $listen_addr)...";
+  log_info "Starting ocproxy mode (Protocol: ${VPN_PROTOCOL:-anyconnect}, listening on: $listen_addr)...";
   # [Final] Simplified: removed unused allow_arg variable
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol=anyconnect --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
+  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "${oc_cmd[@]}"
   
-  log_info "Waiting for ocproxy to start..."; for ((i=0;i<10;i++)); do if is_vpn_running; then log "ocproxy connected successfully (PID=$(cat "$PID_FILE"))"; echo "MODE=ocproxy">"$STATE_FILE";echo "ACCOUNT_INDEX=$ACCOUNT_INDEX" >> "$STATE_FILE";echo "SOCKS_PORT=$socks_port" >> "$STATE_FILE";echo "LISTEN_ADDR=$listen_addr" >> "$STATE_FILE"; return 0; fi; sleep 1; done
+  log_info "Waiting for ocproxy to start..."; for ((i=0;i<10;i++)); do if is_vpn_running; then log "ocproxy connected successfully (PID=$(cat "$PID_FILE"))"; echo "MODE=ocproxy">"$STATE_FILE";echo "ACCOUNT_INDEX=$ACCOUNT_INDEX" >> "$STATE_FILE";echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}" >> "$STATE_FILE";echo "SOCKS_PORT=$socks_port" >> "$STATE_FILE";echo "LISTEN_ADDR=$listen_addr" >> "$STATE_FILE"; return 0; fi; sleep 1; done
   log_err "ocproxy connection failed or timed out"; return 1
 }
 
 start_netns_mode() {
   is_vpn_running && { log_err "VPN is already running"; return; }
+  ensure_pkg_openconnect
   ensure_cmd_gost || return
   ensure_cmd_socat || true # Continue even if socat fails, use iptables
   select_account || return
+  select_protocol || return
   _execute_with_safety_net "_start_netns_logic"
 }
 _start_netns_logic() {
@@ -347,8 +412,8 @@ _start_netns_logic() {
   
   setup_netns
   
-  log_info "Starting OpenConnect in Netns...";
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol=anyconnect --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
+  log_info "Starting OpenConnect in Netns (Protocol: ${VPN_PROTOCOL:-anyconnect})...";
+  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "$IP_CMD" netns exec "${NETNS_NAME}" "${oc_cmd[@]}"
   
@@ -409,7 +474,7 @@ _start_netns_logic() {
   fi
   
   {
-    echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "SOCKS_PORT=$socks_port";
+    echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
     echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${forwarder_mode}";
     [ -n "$socat_pid_v4" ] && echo "SOCAT_PID=${socat_pid_v4}";
     [ -n "$socat_pid_v6" ] && echo "SOCAT_PID_V6=${socat_pid_v6}";
@@ -498,9 +563,10 @@ show_status() {
     echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "Query failed")"
     echo -e "    ${C_BOLD}Host Public IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "None/Query failed")"
   else
-    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
+    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
     title "  VPN Status: ${C_GREEN}🟢 Running${C_RESET} (OpenConnect PID: $(cat "$PID_FILE" 2>/dev/null || echo N/A))"
     if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && echo -e "    ${C_BOLD}Using Account:${C_RESET} $(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
+    echo -e "    ${C_BOLD}VPN Protocol:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
     
     case "${MODE:-}" in
       default)
@@ -612,6 +678,7 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "Account file deleted"
+  remove_shortcut
   log_info "Deleting script file: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "Uninstallation complete. Goodbye!"
 }
 
@@ -651,9 +718,10 @@ main_menu() {
   echo -e "  7) 📦 Check/Install Dependencies"
   echo -e "  8) 🧪 ${C_CYAN}Test Netns IPv6 Connectivity${C_RESET}"
   echo -e "  9) 🗑️  Uninstall"
+  echo -e "  ${C_CYAN}10) 🔗 Install ocm shortcut command (then just type ocm)${C_RESET}"
   echo -e "  0) 🚪 Exit"
   echo
-  read -rp "Please select [0-9]: " c
+  read -rp "Please select [0-9] or 10: " c
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -668,10 +736,11 @@ main_menu() {
          log_err "Netns mode is not running, cannot perform test"
        fi;;
     9) uninstall; exit 0;;
+    10) install_shortcut || true;;
     0) exit 0;;
     *) log_err "Invalid option '$c'";;
   esac
-  [[ "$c" =~ ^[1-4,7,8]$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
+  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
 }
 
 # --- Script Entrypoint ---

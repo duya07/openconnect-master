@@ -119,6 +119,18 @@ chmod +x oc_master_en.sh
    - VPN server address
    - Authentication group (optional)
 
+### Protocol Selection
+
+When starting any mode, you are asked which protocol to use right after choosing an account. **It must match your VPN gateway type** — choosing the wrong one fails at the authentication stage (the script cannot tell which type of gateway yours is):
+
+| Option | Value passed to `openconnect` | Applicable Gateways |
+|---|---|---|
+| 1 | `anyconnect` | Cisco AnyConnect, ocserv (default) |
+| 2 | `pulse` | Pulse Secure / Ivanti Secure Access |
+| 3 | `nc` | Juniper Network Connect |
+
+For example, some gateways require `3) NC`; with `anyconnect` it fails before the login page even appears.
+
 ### Mode Selection Guide
 
 #### 🛡️ Default Mode
@@ -230,7 +242,23 @@ This adds to crontab:
 
 # Method 2: Direct command line
 ./oc_master_en.sh stop
+
+# Method 3: After installing the shortcut command
+ocm stop
 ```
+
+### ocm Shortcut Command
+
+Select `10) 🔗 Install ocm shortcut command` in the main menu and the script creates a symlink at `/usr/local/bin/ocm` pointing to itself, so you no longer have to remember the script path:
+
+```bash
+ocm          # open the main menu
+ocm stop     # stop the VPN
+```
+
+- It only takes over a link that already points at this script; if that path is occupied by another real file, it refuses to overwrite and tells you.
+- If the script itself has no execute permission, it is added automatically (otherwise the symlink could not be run).
+- The shortcut command is removed along with the script when you uninstall.
 
 ### IPv6 Connectivity Test
 

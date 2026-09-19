@@ -119,6 +119,18 @@ chmod +x oc_master.sh
    - VPN 服务器地址
    - 认证组（可选）
 
+### 选择 OpenConnect 协议
+
+启动任意模式时，选完账户之后会询问使用哪种协议。**必须与你的 VPN 网关类型一致**，选错会在认证阶段就失败（脚本无法替你判断网关是哪一种）：
+
+| 选项 | 传给 `openconnect` 的值 | 适用网关 |
+|---|---|---|
+| 1 | `anyconnect` | Cisco AnyConnect、ocserv（默认） |
+| 2 | `pulse` | Pulse Secure / Ivanti Secure Access |
+| 3 | `nc` | Juniper Network Connect |
+
+例如某些网关必须选 `3) NC`；选 `anyconnect` 会在登录页面前就失败。
+
 ### 模式选择指南
 
 #### 🛡️ 默认模式
