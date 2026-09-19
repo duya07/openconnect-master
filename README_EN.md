@@ -342,8 +342,6 @@ ps aux | grep openconnect
    - Script automatically protects SSH connections
    - If still interrupted, check policy routing configuration
 
-For more issues, refer to [FAQ Documentation](docs/FAQ.md)
-
 ## 📊 Version History
 
 ### v7.7.7 (2025-10-25) - Final
