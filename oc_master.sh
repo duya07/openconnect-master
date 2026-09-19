@@ -140,14 +140,36 @@ ensure_cmd_socat() {
 }
 check_atd() { if ! command -v at &>/dev/null || ! systemctl is-active --quiet atd; then log_warn "at/atd 缺失或未运行, 尝试安装并启动..."; _pkg_install at; systemctl enable --now atd 2>/dev/null || log_err "自动启动 atd 失败"; fi; }
 
+# 用法与 `grep -q` 相同，但可以安全地放在 `set -o pipefail` 的管线末尾。
+# 坑：`cmd | grep -q PAT` 里 grep 一命中就退出，cmd 剩下的输出会撞上 SIGPIPE(退出码 141)，
+# pipefail 于是把整条管线判为失败——明明匹配上了却当成"没匹配"。
+# 实测 `ip netns exec NS ip link show | grep -q 'tun.*UP'` 非 0 率 262/1500 ≈ 17%：
+# Netns 模式因此偶发"TUN 已就绪"紧接着"启动失败"（隧道其实是好的）。
+# `grep -c` 必须读完全部输入才输出，不会打断上游，判定语义与 -q 一致。
+_gq() { grep -c "$@" >/dev/null; }
+
+# 等进程退出，最多 10 秒，仍未退出才 SIGKILL。
+# 用于 netns 模式：先 kill openconnect 再立刻 cleanup_netns 会拆掉它登出用的
+# veth→NAT 路径，openconnect 只能卡在 TLS 超时上（实测滞留 80 秒以上），
+# 上一会话没走干净，下一次连接就会与它打架。
+_wait_pid_gone() {
+  local pid="$1" i=0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  while [ "$i" -lt 20 ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5; i=$((i + 1))
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
 # --- IPv6 连通性测试 ---
 test_netns_ipv6() {
   local test_passed=0
   log_info "正在测试 Netns 内的 IPv6 连通性..."
-  if ! "$IP_CMD" netns list | grep -q "${NETNS_NAME}"; then log_err "Netns ${NETNS_NAME} 不存在，无法测试。"; return 1; fi
+  if ! "$IP_CMD" netns list | _gq "${NETNS_NAME}"; then log_err "Netns ${NETNS_NAME} 不存在，无法测试。"; return 1; fi
   
   # 测试1: 检查是否有 IPv6 地址
-  if "$IP_CMD" netns exec "${NETNS_NAME}" ip -6 addr show 2>/dev/null | grep -q "inet6.*scope global"; then
+  if "$IP_CMD" netns exec "${NETNS_NAME}" ip -6 addr show 2>/dev/null | _gq "inet6.*scope global"; then
     log "✓ Netns 内存在全局 IPv6 地址"
     test_passed=$((test_passed + 1))
   else
@@ -190,7 +212,7 @@ check_rt_conflict() {
   grep -qxF "$id $name" /etc/iproute2/rt_tables || echo "$id $name" >> /etc/iproute2/rt_tables
 }
 is_vpn_running() { [ -f "$PID_FILE" ] || return 1; local pid; pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"; [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f "$PID_FILE"; return 1; }; ps -p "$pid" -o comm= 2>/dev/null | grep -q "^openconnect$"; }
-_check_port_free() { local port="$1"; ensure_cmd_ss || true; if command -v ss &>/dev/null && ss -lntup 2>/dev/null | grep -q ":${port} "; then return 1; fi; return 0; }
+_check_port_free() { local port="$1"; ensure_cmd_ss || true; if command -v ss &>/dev/null && ss -lntup 2>/dev/null | _gq ":${port} "; then return 1; fi; return 0; }
 
 # --- SSH 保护路由 (默认模式使用) ---
 setup_ssh_protect_routes() {
@@ -294,7 +316,7 @@ EOT
          echo "$d|$u|$p|$h|$g" >> "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已添加 $d"; read -n1 -s -p "按任意键继续";;
       2) mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ ${#A[@]} -eq 0 ] && { log_info "无账户"; sleep 1; continue; }
          read -rp "输入要删除的序号: " i; [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#A[@]}" ] || { log_err "无效序号"; continue; }
-         grep -vF "${A[$((i-1))]}" "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp" && mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; log "已删除"; read -n1 -s -p "按任意键继续";;
+         grep -vF "${A[$((i-1))]}" "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp" && mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已删除"; read -n1 -s -p "按任意键继续";;
       3) break;;
       *) log_err "无效选项"; sleep 1;;
     esac
@@ -363,6 +385,10 @@ _execute_with_safety_net() {
     trap - SIGINT # 失败后解除陷阱
     log_err "启动过程失败，请检查日志。"
     stop_vpn # 确保在函数内部失败时也执行清理
+    # 清理已经做过了，必须把保底任务撤掉：否则它 2 分钟后会准时执行一次 stop，
+    # 而那时用户很可能已经重新连上了——于是"上一次失败"把"这一次成功"的连接杀掉
+    # （实测连续启动时就是这样互相打架的）。
+    [ "$job" != "none" ] && atrm "$job" 2>/dev/null || true
   fi
 }
 
@@ -374,7 +400,7 @@ _start_default_logic() {
   local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "${oc_cmd[@]}"
-  log_info "等待 TUN 接口就绪..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | grep -q 'tun.*UP'; then log "VPN 连接成功 (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
+  log_info "等待 TUN 接口就绪..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | _gq 'tun.*UP'; then log "VPN 连接成功 (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
   log_err "VPN 连接失败或超时"; return 1
 }
 
@@ -422,14 +448,14 @@ _start_netns_logic() {
   
   log_info "等待 OpenConnect 建立 TUN 接口...";
   for ((i=0; i<20; i++)); do
-    if [ -f "$PID_FILE" ] && "$IP_CMD" netns pids "${NETNS_NAME}" | grep -qF "$(cat "$PID_FILE")" && \
-       "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | grep -q 'tun.*UP'; then
+    if [ -f "$PID_FILE" ] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -F "$(cat "$PID_FILE")" && \
+       "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
       log "OpenConnect TUN 接口已就绪 (PID=$(cat "$PID_FILE"))"; sleep 2; break
     fi
     sleep 1
   done
   
-  if ! "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | grep -q 'tun.*UP'; then
+  if ! "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
     log_err "OpenConnect 在 Netns 中启动失败或 TUN 接口未能正常启动"; return 1
   fi
 
@@ -535,7 +561,13 @@ stop_vpn() {
         fi
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
-      [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+      if [ -f "$PID_FILE" ]; then
+        local oc_pid; oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+        kill "$oc_pid" 2>/dev/null || true
+        # 必须等 openconnect 自己退出再拆 netns/veth：它要先向网关登出，
+        # 而登出走的就是 veth→NAT 这条路（先拆掉就会卡在 TLS 超时上，见 _wait_pid_gone）。
+        _wait_pid_gone "$oc_pid"
+      fi
       cleanup_netns
       ;;
     default|ocproxy)
@@ -653,12 +685,15 @@ uninstall() {
   if command -v gost &>/dev/null; then
     read -rp "是否卸载 gost? (由 Netns 模式自动安装) [Y/n]: " yn_gost
     if [[ ! "$yn_gost" =~ ^[nN]$ ]]; then
-      log_info "正在尝试使用官方脚本卸载 gost..."
-      if command -v curl &>/dev/null; then
-         bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --remove || log_warn "gost 卸载脚本执行失败。"
-      else
-         log_warn "curl 命令不存在，尝试直接删除 gost 文件..."; rm -f /usr/local/bin/gost
-      fi; log "gost 已尝试卸载。"
+      # 官方 install.sh 只认 --install 一个参数，没有卸载分支：传 --remove 之类的参数
+      # 会掉进"选择版本"的安装菜单（交互选一次就真的把它装回去/升级），
+      # 而 select 在非交互下失败后旧代码仍打印"已尝试卸载"——是句假话。
+      # gost 是单个二进制、无包管理器记录，所以直接删文件。
+      log_info "正在卸载 gost..."
+      command -v pkill &>/dev/null && pkill -x gost 2>/dev/null || true
+      rm -f "$(command -v gost 2>/dev/null)" 2>/dev/null || true
+      if command -v gost &>/dev/null; then log_warn "gost 卸载失败，请手动删除。"
+      else log "gost 已卸载。"; fi
     fi
   fi
   

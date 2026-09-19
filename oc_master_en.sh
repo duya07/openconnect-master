@@ -142,14 +142,40 @@ ensure_cmd_socat() {
 }
 check_atd() { if ! command -v at &>/dev/null || ! systemctl is-active --quiet atd; then log_warn "at/atd is missing or not running, attempting to install and start..."; _pkg_install at; systemctl enable --now atd 2>/dev/null || log_err "Failed to start atd automatically"; fi; }
 
+# Same usage as `grep -q`, but safe at the end of a pipeline under `set -o pipefail`.
+# Trap: in `cmd | grep -q PAT` grep exits on its first match, so cmd gets SIGPIPE
+# (exit 141) while writing the rest of its output, and pipefail then reports the whole
+# pipeline as failed - a successful match is treated as "no match".
+# Measured: `ip netns exec NS ip link show | grep -q 'tun.*UP'` failed 262/1500 ~ 17%
+# of the time, which made Netns mode intermittently log "TUN ready" and then "start
+# failed" even though the tunnel was fine.
+# `grep -c` has to read all of its input before printing, so it never breaks the
+# producer, and it reports the same match/no-match status as -q.
+_gq() { grep -c "$@" >/dev/null; }
+
+# Wait for a process to exit, at most 10 seconds, then SIGKILL it.
+# Needed by netns mode: killing openconnect and immediately running cleanup_netns
+# tears down the veth->NAT path it logs out over, so openconnect just hangs on a TLS
+# timeout (observed lingering well over 80 seconds) and the leftover session fights
+# the next connection.
+_wait_pid_gone() {
+  local pid="$1" i=0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  while [ "$i" -lt 20 ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5; i=$((i + 1))
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
 # --- IPv6 Connectivity Test ---
 test_netns_ipv6() {
   local test_passed=0
   log_info "Testing IPv6 connectivity inside Netns..."
-  if ! "$IP_CMD" netns list | grep -q "${NETNS_NAME}"; then log_err "Netns ${NETNS_NAME} does not exist, cannot perform test."; return 1; fi
+  if ! "$IP_CMD" netns list | _gq "${NETNS_NAME}"; then log_err "Netns ${NETNS_NAME} does not exist, cannot perform test."; return 1; fi
   
   # Test 1: Check for IPv6 address
-  if "$IP_CMD" netns exec "${NETNS_NAME}" ip -6 addr show 2>/dev/null | grep -q "inet6.*scope global"; then
+  if "$IP_CMD" netns exec "${NETNS_NAME}" ip -6 addr show 2>/dev/null | _gq "inet6.*scope global"; then
     log "✓ Global IPv6 address exists in Netns"
     test_passed=$((test_passed + 1))
   else
@@ -192,7 +218,7 @@ check_rt_conflict() {
   grep -qxF "$id $name" /etc/iproute2/rt_tables || echo "$id $name" >> /etc/iproute2/rt_tables
 }
 is_vpn_running() { [ -f "$PID_FILE" ] || return 1; local pid; pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"; [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f "$PID_FILE"; return 1; }; ps -p "$pid" -o comm= 2>/dev/null | grep -q "^openconnect$"; }
-_check_port_free() { local port="$1"; ensure_cmd_ss || true; if command -v ss &>/dev/null && ss -lntup 2>/dev/null | grep -q ":${port} "; then return 1; fi; return 0; }
+_check_port_free() { local port="$1"; ensure_cmd_ss || true; if command -v ss &>/dev/null && ss -lntup 2>/dev/null | _gq ":${port} "; then return 1; fi; return 0; }
 
 # --- SSH Protection Routes (Used by Default Mode) ---
 setup_ssh_protect_routes() {
@@ -296,7 +322,7 @@ EOT
          echo "$d|$u|$p|$h|$g" >> "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "Added $d"; read -n1 -s -p "Press any key to continue";;
       2) mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ ${#A[@]} -eq 0 ] && { log_info "No accounts found"; sleep 1; continue; }
          read -rp "Enter the number to delete: " i; [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#A[@]}" ] || { log_err "Invalid number"; continue; }
-         grep -vF "${A[$((i-1))]}" "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp" && mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; log "Deleted"; read -n1 -s -p "Press any key to continue";;
+         grep -vF "${A[$((i-1))]}" "$ACCOUNTS_FILE" > "${ACCOUNTS_FILE}.tmp" && mv "${ACCOUNTS_FILE}.tmp" "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "Deleted"; read -n1 -s -p "Press any key to continue";;
       3) break;;
       *) log_err "Invalid option"; sleep 1;;
     esac
@@ -360,6 +386,11 @@ _execute_with_safety_net() {
     trap - SIGINT # Failure, remove the trap
     log_err "Startup process failed, please check the logs."
     stop_vpn # Ensure cleanup is also run on internal function failure
+    # Cleanup already happened above, so the failsafe job must be cancelled too:
+    # otherwise it runs its `stop` exactly 2 minutes later, when the user has very
+    # likely reconnected, and the previous failure kills the current session
+    # (observed as consecutive starts fighting each other).
+    [ "$job" != "none" ] && atrm "$job" 2>/dev/null || true
   fi
 }
 
@@ -371,7 +402,7 @@ _start_default_logic() {
   local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
   echo "$VPN_PASS" | "${oc_cmd[@]}"
-  log_info "Waiting for TUN interface to be ready..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | grep -q 'tun.*UP'; then log "VPN connected successfully (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
+  log_info "Waiting for TUN interface to be ready..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | _gq 'tun.*UP'; then log "VPN connected successfully (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
   log_err "VPN connection failed or timed out"; return 1
 }
 
@@ -419,14 +450,14 @@ _start_netns_logic() {
   
   log_info "Waiting for OpenConnect to establish TUN interface...";
   for ((i=0; i<20; i++)); do
-    if [ -f "$PID_FILE" ] && "$IP_CMD" netns pids "${NETNS_NAME}" | grep -qF "$(cat "$PID_FILE")" && \
-       "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | grep -q 'tun.*UP'; then
+    if [ -f "$PID_FILE" ] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -F "$(cat "$PID_FILE")" && \
+       "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
       log "OpenConnect TUN interface is ready (PID=$(cat "$PID_FILE"))"; sleep 2; break
     fi
     sleep 1
   done
   
-  if ! "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | grep -q 'tun.*UP'; then
+  if ! "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
     log_err "Failed to start OpenConnect in Netns or the TUN interface did not come up"; return 1
   fi
 
@@ -532,7 +563,14 @@ stop_vpn() {
         fi
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
-      [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+      if [ -f "$PID_FILE" ]; then
+        local oc_pid; oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+        kill "$oc_pid" 2>/dev/null || true
+        # Must wait for openconnect to exit before tearing down netns/veth: it has to
+        # log out to the gateway over that veth->NAT path (tearing it down first makes
+        # it hang on a TLS timeout - see _wait_pid_gone).
+        _wait_pid_gone "$oc_pid"
+      fi
       cleanup_netns
       ;;
     default|ocproxy)
@@ -650,12 +688,16 @@ uninstall() {
   if command -v gost &>/dev/null; then
     read -rp "Uninstall gost? (was auto-installed by Netns mode) [Y/n]: " yn_gost
     if [[ ! "$yn_gost" =~ ^[nN]$ ]]; then
-      log_info "Attempting to uninstall gost using the official script..."
-      if command -v curl &>/dev/null; then
-         bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --remove || log_warn "gost uninstallation script failed."
-      else
-         log_warn "curl command not found, attempting to remove gost file directly..."; rm -f /usr/local/bin/gost
-      fi; log "gost uninstallation attempted."
+      # The official install.sh only understands --install; it has no uninstall branch.
+      # Passing --remove (or anything else) drops it into the interactive "pick a
+      # version" installer, so the old code could actually reinstall/upgrade gost and
+      # then still print "uninstallation attempted" - a false success message.
+      # gost is a single binary with no package-manager record, so just delete it.
+      log_info "Uninstalling gost..."
+      command -v pkill &>/dev/null && pkill -x gost 2>/dev/null || true
+      rm -f "$(command -v gost 2>/dev/null)" 2>/dev/null || true
+      if command -v gost &>/dev/null; then log_warn "Failed to uninstall gost, please remove it manually."
+      else log "gost has been uninstalled."; fi
     fi
   fi
   
