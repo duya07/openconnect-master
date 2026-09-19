@@ -19,6 +19,7 @@ SOCAT_PID_FILE="/var/run/oc_socat.pid"
 SOCAT_PID_FILE_V6="${SOCAT_PID_FILE}.v6"
 STATE_FILE="/var/run/oc_manager.state"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
+SHORTCUT_PATH="/usr/local/bin/ocm"
 
 # --- 路由与网络配置 ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -45,6 +46,45 @@ log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
 sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "请用 root 运行"; exit 1; }; }
+
+# --- ocm 快捷命令 ---
+# 用符号链接而不是拷贝：脚本自身用 readlink -f "$0" 解析真实路径，所以从
+# /usr/local/bin/ocm 调用时行为完全一致（菜单、ocm stop、_internal_* 都照常）。
+# 只接管"已经指向本脚本"的链接；同名真实文件一律不覆盖。
+install_shortcut() {
+  local current=""
+  if [ -L "$SHORTCUT_PATH" ]; then
+    current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+    if [ "$current" = "$SCRIPT_PATH" ]; then
+      log "快捷命令已就绪：${SHORTCUT_PATH}"
+      return 0
+    fi
+    log_err "${SHORTCUT_PATH} 已是指向别处的符号链接（${current:-未知}），拒绝覆盖。"
+    return 1
+  fi
+  if [ -e "$SHORTCUT_PATH" ]; then
+    log_err "${SHORTCUT_PATH} 已存在且不是符号链接，拒绝覆盖。"
+    return 1
+  fi
+  # 符号链接要求目标本身可执行。正常安装流程里已经 chmod +x，但若脚本是被人用
+  # `bash oc_master.sh` 跑起来的，执行位可能还没加上，这里补一次。
+  [ -x "$SCRIPT_PATH" ] || chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+  if [ ! -x "$SCRIPT_PATH" ]; then
+    log_err "脚本没有执行权限，快捷命令不会生效：${SCRIPT_PATH}"
+    return 1
+  fi
+  ln -s "$SCRIPT_PATH" "$SHORTCUT_PATH" || { log_err "创建快捷命令失败：${SHORTCUT_PATH}"; return 1; }
+  log "已安装快捷命令：${SHORTCUT_PATH} -> ${SCRIPT_PATH}"
+  log_info "以后可直接使用： ocm   或   ocm stop"
+}
+
+remove_shortcut() {
+  local current=""
+  [ -L "$SHORTCUT_PATH" ] || return 0
+  current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+  [ "$current" = "$SCRIPT_PATH" ] && { rm -f "$SHORTCUT_PATH"; log "已移除快捷命令 ${SHORTCUT_PATH}"; }
+  return 0
+}
 
 # --- 中断处理 ---
 cleanup_on_interrupt() {
@@ -641,6 +681,7 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "账户文件已删除"
+  remove_shortcut
   log_info "正在删除脚本文件: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "卸载完成，再见！"
 }
 
@@ -680,9 +721,10 @@ main_menu() {
   echo -e "  7) 📦 检查/安装依赖"
   echo -e "  8) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
   echo -e "  9) 🗑️  卸载"
+  echo -e "  ${C_CYAN}10) 🔗 安装 ocm 快捷命令 (以后直接输 ocm)${C_RESET}"
   echo -e "  0) 🚪 退出"
   echo
-  read -rp "请选择 [0-9]: " c
+  read -rp "请选择 [0-9] 或 10: " c
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -697,10 +739,11 @@ main_menu() {
          log_err "Netns 模式未运行，无法测试"
        fi;;
     9) uninstall; exit 0;;
+    10) install_shortcut || true;;
     0) exit 0;;
     *) log_err "无效选项 '$c'";;
   esac
-  [[ "$c" =~ ^[1-4,7,8]$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
+  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
 }
 
 # --- 脚本入口 ---
