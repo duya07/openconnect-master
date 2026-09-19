@@ -342,6 +342,16 @@ ps aux | grep openconnect
    - Script automatically protects SSH connections
    - If still interrupted, check policy routing configuration
 
+### Known limitation: the iptables fallback forwarder does not work on NAT-style VPS
+
+When socat is missing, Netns mode falls back to iptables DNAT forwarding. That fallback works on servers whose **public IP sits directly on the NIC**, but its data plane is dead on **NAT-style VPS** (NIC has a private address; the public IP is NATed by an upstream gateway), for three measured reasons:
+
+- Connecting via `127.0.0.1`: after DNAT, packets with source `127.0.0.1` entering the veth are dropped as martian by the netns kernel (Linux forbids 127/8 sources on non-lo interfaces);
+- Connecting via the public IP: the public IP is not a local address, so the packet goes straight to the gateway and gets RST;
+- External clients: the gateway must forward the port to this machine (not configured by default).
+
+On such machines keep socat available (menu 7 or `apt install socat`) - socat is a process-level forwarder and is unaffected. The control plane of the iptables fallback (rule installation and stop-time cleanup) works correctly; only the forwarding itself is dead.
+
 ## 📊 Version History
 
 ### v7.7.7 (2025-10-25) - Final
