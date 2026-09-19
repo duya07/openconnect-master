@@ -505,7 +505,17 @@ start_ocproxy_mode() { is_vpn_running && { log_err "VPN is already running"; ret
 _start_ocproxy_logic() {
   local socks_port
   local listen_addr="127.0.0.1" # [Final] Simplified: listen locally by default, remove remote option
-  while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port"||{ log_err "Port is already in use";continue; }; break; done
+  # The daemon reconnect has no terminal (cron stdin is closed): read hits EOF and set -e
+  # kills the whole reconnect flow (measured rc=1, exits in 0s - so the ocproxy health
+  # daemon advertised by menu 6 never worked). When the caller passes reconnect, use the
+  # SOCKS_PORT saved in state instead: skip the prompt; if the port is taken, give up this
+  # round (the next cron cycle retries) rather than falling into the interactive loop.
+  if [ "${1:-}" = "reconnect" ] && [[ "${SOCKS_PORT:-}" =~ ^[0-9]+$ ]]; then
+    socks_port="$SOCKS_PORT"
+    _check_port_free "$socks_port" || { log_err "Reconnect port ${socks_port} is currently in use, giving up this round"; return 1; }
+  else
+    while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port"||{ log_err "Port is already in use";continue; }; break; done
+  fi
   
   log_info "Starting ocproxy mode (Protocol: ${VPN_PROTOCOL:-anyconnect}, listening on: $listen_addr)...";
   # [Final] Simplified: removed unused allow_arg variable
@@ -864,7 +874,7 @@ _internal_cron_handler() {
         . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"
         case "${MODE:-}" in
           default) _start_default_logic ;;
-          ocproxy) _start_ocproxy_logic ;;
+          ocproxy) _start_ocproxy_logic reconnect ;;
           netns) log_err "Daemon: Netns mode does not support auto-reconnect yet, skipping.";;
           *) log_err "Daemon: Unknown recovery mode, cannot reconnect";;
         esac

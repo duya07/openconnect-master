@@ -497,7 +497,16 @@ start_ocproxy_mode() { is_vpn_running && { log_err "VPN 已在运行"; return; }
 _start_ocproxy_logic() {
   local socks_port
   local listen_addr="127.0.0.1" # [Final] 简化: 默认且仅监听本地，移除远程选项
-  while true;do read -rp "请输入SOCKS5监听端口 (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port"||{ log_err "端口已被占用";continue; }; break; done
+  # 守护重连没有终端（cron 的 stdin 是关的）：read 会 EOF 并被 set -e 杀掉整个
+  # 重连流程（实测 rc=1、0 秒退出，菜单 6 声称的 ocproxy 守护因此完全不可用）。
+  # 调用方传 reconnect 时改用 state 里保存的 SOCKS_PORT：跳过交互；端口被占就
+  # 放弃本次（下个周期再试），不能掉进交互循环。
+  if [ "${1:-}" = "reconnect" ] && [[ "${SOCKS_PORT:-}" =~ ^[0-9]+$ ]]; then
+    socks_port="$SOCKS_PORT"
+    _check_port_free "$socks_port" || { log_err "重连端口 ${socks_port} 当前被占用，本次放弃重连"; return 1; }
+  else
+    while true;do read -rp "请输入SOCKS5监听端口 (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port"||{ log_err "端口已被占用";continue; }; break; done
+  fi
   
   log_info "正在启动 ocproxy 模式 (协议: ${VPN_PROTOCOL:-anyconnect}, 监听地址: $listen_addr)...";
   # [Final] 简化: 移除了无效的 allow_arg 变量
@@ -850,7 +859,7 @@ _internal_cron_handler() {
         . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"
         case "${MODE:-}" in
           default) _start_default_logic ;;
-          ocproxy) _start_ocproxy_logic ;;
+          ocproxy) _start_ocproxy_logic reconnect ;;
           netns) log_err "守护进程: Netns 模式尚不支持自动重连，已跳过。";;
           *) log_err "守护进程: 未知的恢复模式, 无法重连";;
         esac
