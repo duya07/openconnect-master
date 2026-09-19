@@ -365,6 +365,9 @@ ps aux | grep openconnect
 - 🔧 **Fix**: The account and cron submenus reused the main menu's option variable (no `local`), so the "press any key" decision after returning used the submenu's value - after choosing 5/6 that produced a spurious extra "press any key to return to the main menu" that also swallowed the next input character
 - 🔧 **Fix**: `stop` aborted halfway when the state file existed but lacked `MODE=`/`VPS4=`/`VPS6=` (the assignment is the last command of an `[ -f ] && ...` list, and `grep` returning 1 made `set -e` end the whole stop path: no process killed, no temp file removed, no safety-net job cancelled)
 - 🔧 **Fix**: Account deletion now removes exactly the row at the given index of the filtered list. The old `grep -vF ... && mv` printed "Deleted" without changing the file when the last entry was removed (`grep` produced no output, returned 1, so `mv` never ran) and also removed two identical accounts at once
+- 🔧 **Fix**: In the Netns stop path, a failing `eval iptables -D` (rule already removed elsewhere) aborted the whole stop flow via `set -e`, leaving processes and the netns behind
+- 🔧 **Fix**: After a failed start, `stop_vpn` took the "not running" early exit and left the state file plus the policy routes (ip rule) behind; machines with the health cron installed would retry the bad account every 5 minutes
+- 🔧 **Fix**: The ocproxy health reconnect never worked under cron - the reconnect logic starts with an interactive port prompt, and without a terminal `read` hits EOF and `set -e` kills the flow instantly. Reconnects now reuse the port saved in the state file; also removed the dead link to the deleted docs/FAQ.md
 
 ### v7.7.6 (2025-01-10)
 
