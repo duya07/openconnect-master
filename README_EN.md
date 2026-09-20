@@ -344,11 +344,13 @@ ps aux | grep openconnect
 
 ### Known limitation: the iptables fallback forwarder does not work on NAT-style VPS
 
-When socat is missing, Netns mode falls back to iptables DNAT forwarding. That fallback works on servers whose **public IP sits directly on the NIC**, but its data plane is dead on **NAT-style VPS** (NIC has a private address; the public IP is NATed by an upstream gateway), for three measured reasons:
+When socat is missing, Netns mode falls back to iptables DNAT forwarding. That fallback has a dead data plane on **NAT-style VPS** (NIC has a private address; the public IP is NATed by an upstream gateway), for three measured reasons:
 
 - Connecting via `127.0.0.1`: after DNAT, packets with source `127.0.0.1` entering the veth are dropped as martian by the netns kernel (Linux forbids 127/8 sources on non-lo interfaces);
 - Connecting via the public IP: the public IP is not a local address, so the packet goes straight to the gateway and gets RST;
 - External clients: the gateway must forward the port to this machine (not configured by default).
+
+The first reason is NAT-independent - dropping 127/8 sources on non-lo interfaces is a hard kernel constraint, so local 127 access is dead on **any** machine, including ones with the public IP directly on the NIC. On such machines the "external client" and "local via public IP" paths should theoretically work (the DNAT rules and the return-path MASQUERADE have the right shape), but this has not been tested on real hardware. There, use the public IP rather than 127.0.0.1 for local access.
 
 On such machines keep socat available (menu 7 or `apt install socat`) - socat is a process-level forwarder and is unaffected. The control plane of the iptables fallback (rule installation and stop-time cleanup) works correctly; only the forwarding itself is dead.
 
