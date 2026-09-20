@@ -31,6 +31,8 @@ SHORTCUT_PATH="/usr/local/bin/ocm"
 # no marker file, so every dependency counts as "already there" (the safe direction).
 DEPS_STATE_DIR="/var/lib/oc-master"
 DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
+# Port-forwarding backend preference (set from menu 10): auto | socat | iptables
+FWD_PREF_FILE="${DEPS_STATE_DIR}/forwarder"
 
 # --- Routing & Network Config ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -603,6 +605,9 @@ _start_ocproxy_logic() {
   fi
   
   log_info "Starting ocproxy mode (Protocol: ${VPN_PROTOCOL:-anyconnect}, listening on: $listen_addr)...";
+  # ocproxy's -D takes a port only and has no auth option, so this mode cannot carry
+  # a username/password at all.
+  log_info "Note: ocproxy mode does not support username/password auth; use Netns mode if you need it.";
   # [Final] Simplified: removed unused allow_arg variable
   local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
@@ -626,11 +631,39 @@ _start_netns_logic() {
   while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 8585): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port" || { log_err "Port is already in use"; continue; }; break; done
   
   local listen_addr="127.0.0.1"
-  read -rp "Allow remote connections (listen on 0.0.0.0)? [y/N]: " yn
+  # || yn="": in non-interactive use (pipe / no terminal) read hits EOF and returns
+  # non-zero; a bare read would let set -e kill the whole start flow. Treat it as
+  # "keep the default".
+  local yn=""
+  read -rp "Allow remote connections (listen on 0.0.0.0)? [y/N]: " yn || yn=""
   if [[ "$yn" =~ ^[yY]$ ]]; then
     listen_addr="0.0.0.0"
   fi
-  
+
+  # Optional SOCKS5 username/password. gost takes socks5://user:pass@host:port; empty
+  # means anonymous. The password is read hidden (same as the VPN account password) but
+  # is written to the state file in clear and shown in the main menu - that is the
+  # behaviour the operator explicitly asked for.
+  local socks_user="" socks_pass="" need_auth=""
+  read -rp "Set a SOCKS5 username/password? [y/N]: " need_auth || need_auth=""
+  if [[ "$need_auth" =~ ^[yY]$ ]]; then
+    # gost parses socks5://user:pass@host:port, so @ : / in either field splits the URL
+    # the wrong way (measured: gost then fails to start, or auth is silently a no-op).
+    while true; do
+      read -rp "  Username: " socks_user || socks_user=""
+      [ -n "$socks_user" ] || { log_err "  Username cannot be empty (press Enter on the previous question to skip auth)"; continue; }
+      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  Username must not contain @ : / quotes backslash or blanks (it breaks gost's URL)"; continue ;; esac
+      break
+    done
+    while true; do
+      read -rsp "  Password: " socks_pass || socks_pass=""; echo
+      [ -n "$socks_pass" ] || { log_warn "  Empty password, auth stays disabled for this session."; socks_user=""; break; }
+      case "$socks_pass" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  Password must not contain @ : / quotes backslash or blanks (it breaks gost's URL)"; continue ;; esac
+      log_info "  SOCKS5 auth enabled (username: ${socks_user})"
+      break
+    done
+  fi
+
   setup_netns
   
   log_info "Starting OpenConnect in Netns (Protocol: ${VPN_PROTOCOL:-anyconnect})...";
@@ -661,7 +694,9 @@ _start_netns_logic() {
   test_netns_ipv6 || true
 
   log_info "Starting SOCKS5 service (gost) in Netns..."
-  "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="socks5://0.0.0.0:${socks_port}" >/dev/null 2>&1 &
+  local gost_listen="socks5://0.0.0.0:${socks_port}"
+  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@0.0.0.0:${socks_port}"
+  "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="${gost_listen}" >/dev/null 2>&1 &
   local gost_pid=$!; echo "$gost_pid" > "$GOST_PID_FILE"
   sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost failed to start in Netns"; return 1; fi
   log "SOCKS5 service (gost) started in Netns (PID: $gost_pid)"
@@ -677,8 +712,14 @@ _start_netns_logic() {
   {
     echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
     echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${_FWD_DESC}";
+    # %q escaping: these lines are read back with . "$STATE_FILE"; unescaped, a value
+    # containing blanks/quotes gets executed as a command on source (measured:
+    # `SOCKS_PASS=p@ss word` produced "word: command not found" and a broken password).
+    if [ -n "$socks_user" ]; then printf 'SOCKS_USER=%q\nSOCKS_PASS=%q\n' "$socks_user" "$socks_pass"; fi
     if [ -n "$_FWD_STATE" ]; then printf '%s\n' "$_FWD_STATE"; fi
   } > "$STATE_FILE"
+  # The state file may now hold the SOCKS password; the default umask would make it 644
+  if [ -n "$socks_user" ]; then chmod 600 "$STATE_FILE" 2>/dev/null || true; fi
   
   return 0
 }
@@ -736,6 +777,31 @@ cleanup_ssh_protect_routes() {
 _FWD_DESC=""    # backend actually used (written to state as FORWARDER)
 _FWD_STATE=""   # extra lines to append to the state file
 
+# Forwarding-backend preference (menu 10). The file holds a single word:
+# auto | socat | iptables. A missing file or garbage content means auto, so machines
+# upgraded from older versions keep behaving exactly as before.
+_fwd_pref_get() {
+  local v="auto"
+  [ -f "$FWD_PREF_FILE" ] && v="$(head -n1 "$FWD_PREF_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+  case "$v" in socat|iptables|auto) printf '%s' "$v" ;; *) printf 'auto' ;; esac
+  return 0
+}
+_fwd_pref_set() {
+  case "$1" in socat|iptables|auto) ;; *) return 1 ;; esac
+  mkdir -p "$DEPS_STATE_DIR" 2>/dev/null || return 1
+  printf '%s\n' "$1" > "$FWD_PREF_FILE" 2>/dev/null || return 1
+  return 0
+}
+# One-line description for the menu / status area
+_fwd_pref_label() {
+  case "$(_fwd_pref_get)" in
+    socat)    printf 'socat (process relay)' ;;
+    iptables) printf 'iptables double NAT (kernel forwarding)' ;;
+    *)        printf 'auto (socat preferred)' ;;
+  esac
+  return 0
+}
+
 _fwd_avail() {
   case "$1" in
     socat)    command -v socat &>/dev/null ;;
@@ -745,11 +811,21 @@ _fwd_avail() {
 }
 
 _fwd_pick() {
-  local want="${OCM_FORWARDER:-}" b
+  local want="${OCM_FORWARDER:-}" b pref
+  # 1) Environment variable wins (scripted calls / one-off override)
   if [ -n "$want" ]; then
     if _fwd_avail "$want"; then echo "$want"; return 0; fi
     log_warn "Requested forwarding backend '$want' is unavailable, falling back to auto." >&2
   fi
+  # 2) Preference from menu 10; fall back to auto when it is currently unavailable
+  pref="$(_fwd_pref_get)"
+  case "$pref" in
+    socat|iptables)
+      if _fwd_avail "$pref"; then echo "$pref"; return 0; fi
+      log_warn "Preferred backend '$pref' is currently unavailable, falling back to auto." >&2
+      ;;
+  esac
+  # 3) Auto: socat first, iptables double NAT when socat is missing
   for b in socat iptables; do
     if _fwd_avail "$b"; then echo "$b"; return 0; fi
   done
@@ -799,7 +875,12 @@ _fwd_teardown_socat() {
 
 # --- Backend 2: iptables double NAT (fallback when socat is absent) ---
 _fwd_setup_iptables() {
-  local socks_port="$1" listen_addr="$2" dst="${VETH_NS_IP}:${socks_port}"
+  # Must be two separate 'local' statements: ${socks_port} inside the same local line is
+  # not in effect yet, and bash resolves it from the caller chain instead (dynamic scope).
+  # It works today only because _start_netns_logic happens to have a variable of that
+  # name; called from anywhere else, dst silently loses its port.
+  local socks_port="$1" listen_addr="$2"
+  local dst="${VETH_NS_IP}:${socks_port}"
   local R_OUT R_PRE="" R_SNAT
   R_SNAT="-p tcp -d ${VETH_NS_IP} --dport ${socks_port} -j SNAT --to-source ${VETH_HOST_IP}"
   if [ "$listen_addr" = "0.0.0.0" ] || [ "$listen_addr" = "::" ]; then
@@ -843,6 +924,35 @@ _fwd_teardown_iptables() {
     esac
   done
   return 0
+}
+
+# Menu 10: pick the port-forwarding backend. Stored in FWD_PREF_FILE and applied the
+# next time Netns mode starts.
+manage_forwarder() {
+  local c
+  while true; do
+    clear; title "🔀 Port forwarding backend (Netns mode)"; sep
+    echo -e "  Current: ${C_CYAN}$(_fwd_pref_label)${C_RESET}"
+    echo
+    echo -e "  ${C_GREEN}1)${C_RESET} auto      ${C_GREY}socat first; falls back to iptables when socat is missing${C_RESET}"
+    echo -e "  ${C_GREEN}2)${C_RESET} socat     ${C_GREY}process relay: client↔socat↔gost, two independent connections${C_RESET}"
+    echo -e "  ${C_GREEN}3)${C_RESET} iptables  ${C_GREY}double NAT: DNAT into the netns + SNAT so the reply gets back${C_RESET}"
+    echo -e "  ${C_GREY}4) Back${C_RESET}"
+    echo
+    sep
+    echo -e "  ${C_GREY}Available here: socat $(_fwd_avail socat && echo OK || echo missing) · iptables $(_fwd_avail iptables && echo OK || echo missing)${C_RESET}"
+    echo -e "  ${C_GREY}Applies to Netns sessions started afterwards; running ones are unaffected.${C_RESET}"
+    echo
+    read -rp "Select [1-4]: " c || { echo; log_info "Standard input ended."; return 0; }
+    case "$c" in
+      1) _fwd_pref_set auto     && log "Set to: auto (socat preferred)" ;;
+      2) _fwd_pref_set socat    && log "Set to: socat" ;;
+      3) _fwd_pref_set iptables && log "Set to: iptables double NAT" ;;
+      4) return 0 ;;
+      *) log_err "Invalid option"; sleep 1; continue ;;
+    esac
+    sleep 1
+  done
 }
 
 stop_vpn() {
@@ -909,7 +1019,7 @@ show_status() {
     echo -e "  ${C_GREY}$(_pad "Public IPv6" $L)${C_RESET} $(_pub_ip -6 || echo "None / Query failed")"
     echo -e "  ${C_GREY}$(_pad "Shortcut" $L)${C_RESET} ${scc}${sc}${C_RESET}"
   else
-    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
+    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL SOCKS_USER SOCKS_PASS; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
     local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
     local mname="${MODE:-unknown}"; case "${MODE:-}" in default) mname="Default";; ocproxy) mname="ocproxy";; netns) mname="Netns";; esac
     echo -e "  ${C_GREY}$(_pad "Status" $L)${C_RESET} ${C_GREEN}🟢 Running${C_RESET}  ${C_GREY}·${C_RESET}  ${C_BOLD}${mname}${C_RESET} Mode  ${C_GREY}·${C_RESET}  Protocol ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
@@ -925,9 +1035,12 @@ show_status() {
       ;;
       netns)
         local f_info; f_info="${FORWARDER:-socat}"
-        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
+        local auth_txt=""
+        [ -n "${SOCKS_USER:-}" ] && auth_txt="  ${C_YELLOW}auth ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
+        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}${auth_txt}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
+        [ -n "${SOCKS_USER:-}" ] && socks_proxy="socks5h://${SOCKS_USER}:${SOCKS_PASS:-}@127.0.0.1:${SOCKS_PORT}"
         
         local sip4; sip4=$(_pub_ip -4 "$socks_proxy" || echo "Query failed")
         echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
@@ -1042,7 +1155,7 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "Account file deleted"
-  rm -f "$DEPS_MARK_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
+  rm -f "$DEPS_MARK_FILE" "$FWD_PREF_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
   remove_shortcut
   log_info "Deleting script file: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "Uninstallation complete. Goodbye!"
 }
@@ -1085,11 +1198,12 @@ main_menu() {
   echo -e "  ${C_CYAN}7)${C_RESET} 📦 Check / Install Dependencies"
   echo -e "  ${C_CYAN}8)${C_RESET} 🧪 Test Netns IPv6"
   echo -e "  ${C_CYAN}9)${C_RESET} 🗑️  Uninstall"
+  echo -e "  ${C_CYAN}10)${C_RESET} 🔀 Port forwarding backend${C_GREY} (now: $(_fwd_pref_label))${C_RESET}"
   echo -e "  ${C_GREY}0)${C_RESET} 🚪 Exit"
   echo
   # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
   # menu loop forever, issuing two public-IP lookups per iteration. read fails on EOF.
-  read -rp "Please select [0-9]: " c || { echo; log_info "Standard input closed, exiting."; exit 0; }
+  read -rp "Please select [0-9] or 10: " c || { echo; log_info "Standard input closed, exiting."; exit 0; }
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -1104,13 +1218,14 @@ main_menu() {
          log_err "Netns mode is not running, cannot perform test"
        fi;;
     9) uninstall; exit 0;;
+    10) manage_forwarder;;
     0) exit 0;;
     *) log_err "Invalid option '$c'";;
   esac
   # For options 5/6, a bare Enter or a wrong key, the AND list above returns 1; and a
   # function whose last statement returns non-zero makes set -e terminate the whole script
   # (measured: pressing Enter at the main menu quit the program). Return explicitly.
-  [[ "$c" =~ ^([1-4]|7|8)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
+  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
   return 0
 }
 

@@ -29,6 +29,8 @@ SHORTCUT_PATH="/usr/local/bin/ocm"
 # 老版本升上来的机器没有这个文件，于是所有依赖都算"用户自己的"（偏保守）。
 DEPS_STATE_DIR="/var/lib/oc-master"
 DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
+# 端口转发方式偏好（菜单 10 里设置）：auto | socat | iptables
+FWD_PREF_FILE="${DEPS_STATE_DIR}/forwarder"
 
 # --- 路由与网络配置 ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -589,6 +591,8 @@ _start_ocproxy_logic() {
   fi
   
   log_info "正在启动 ocproxy 模式 (协议: ${VPN_PROTOCOL:-anyconnect}, 监听地址: $listen_addr)...";
+  # ocproxy 的 -D 只接受端口，本身没有认证选项，所以这个模式加不了用户名/密码
+  log_info "提示: ocproxy 模式不支持用户名/密码认证，需要认证请用 Netns 模式。";
   # [Final] 简化: 移除了无效的 allow_arg 变量
   local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
@@ -612,11 +616,37 @@ _start_netns_logic() {
   while true;do read -rp "请输入SOCKS5监听端口 (e.g. 8585): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port" || { log_err "端口已被占用"; continue; }; break; done
   
   local listen_addr="127.0.0.1"
-  read -rp "是否允许远程连接 (监听 0.0.0.0)? [y/N]: " yn
+  # || yn=""：非交互调用（管道/无终端）时 read 会 EOF 并返回非 0，裸 read 会被 set -e
+  # 直接杀掉整个启动流程；统一按"不住默认值"处理。
+  local yn=""
+  read -rp "是否允许远程连接 (监听 0.0.0.0)? [y/N]: " yn || yn=""
   if [[ "$yn" =~ ^[yY]$ ]]; then
     listen_addr="0.0.0.0"
   fi
-  
+
+  # SOCKS5 用户名/密码（可选）。gost 的形式是 socks5://user:pass@host:port；
+  # 留空即匿名。密码用隐藏输入（与 VPN 账户密码一致），但会明文写进 state
+  # 文件并按设置在主菜单里显示——这是使用方明确要求的行为。
+  local socks_user="" socks_pass="" need_auth=""
+  read -rp "是否为 SOCKS5 设置用户名/密码? [y/N]: " need_auth || need_auth=""
+  if [[ "$need_auth" =~ ^[yY]$ ]]; then
+    # gost 是按 socks5://user:pass@host:port 解析的，用户名/密码里出现 @ : / 会把
+    # URL 拆错（实测这类写法直接导致 gost 起不来或认证形同虚设），所以这里先拦住。
+    while true; do
+      read -rp "  用户名: " socks_user || socks_user=""
+      [ -n "$socks_user" ] || { log_err "  用户名不能为空（不启用认证就直接回车跳过上一个问题）"; continue; }
+      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  用户名不能含 @ : / 引号 反斜杠 空白（会破坏 gost 的 URL），换个写法"; continue ;; esac
+      break
+    done
+    while true; do
+      read -rsp "  密码: " socks_pass || socks_pass=""; echo
+      [ -n "$socks_pass" ] || { log_warn "  密码为空，本次不启用认证。"; socks_user=""; break; }
+      case "$socks_pass" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  密码不能含 @ : / 引号 反斜杠 空白（会破坏 gost 的 URL），换个写法"; continue ;; esac
+      log_info "  已启用 SOCKS5 认证（用户名: ${socks_user}）"
+      break
+    done
+  fi
+
   setup_netns
   
   log_info "正在 Netns 中启动 OpenConnect (协议: ${VPN_PROTOCOL:-anyconnect})...";
@@ -647,7 +677,9 @@ _start_netns_logic() {
   test_netns_ipv6 || true
 
   log_info "正在 Netns 中启动 SOCKS5 服务 (gost)..."
-  "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="socks5://0.0.0.0:${socks_port}" >/dev/null 2>&1 &
+  local gost_listen="socks5://0.0.0.0:${socks_port}"
+  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@0.0.0.0:${socks_port}"
+  "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="${gost_listen}" >/dev/null 2>&1 &
   local gost_pid=$!; echo "$gost_pid" > "$GOST_PID_FILE"
   sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost 在 Netns 中启动失败"; return 1; fi
   log "SOCKS5 服务 (gost) 已在 Netns 中启动 (PID: $gost_pid)"
@@ -662,8 +694,14 @@ _start_netns_logic() {
   {
     echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
     echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${_FWD_DESC}";
+    # %q 转义：这两行会被 . "$STATE_FILE" 读回来，值里若含空格/引号，不转义的话
+    # source 会把它当命令执行（实测 state 里出现 `SOCKS_PASS=p@ss word` 就报
+    # "word: command not found"，密码直接读坏）。
+    if [ -n "$socks_user" ]; then printf 'SOCKS_USER=%q\nSOCKS_PASS=%q\n' "$socks_user" "$socks_pass"; fi
     if [ -n "$_FWD_STATE" ]; then printf '%s\n' "$_FWD_STATE"; fi
   } > "$STATE_FILE"
+  # state 里现在可能含 SOCKS 密码，默认 umask 会落成 644，收紧一次
+  if [ -n "$socks_user" ]; then chmod 600 "$STATE_FILE" 2>/dev/null || true; fi
   
   return 0
 }
@@ -716,6 +754,30 @@ cleanup_ssh_protect_routes() {
 _FWD_DESC=""    # 实际使用的后端名（写进 state 的 FORWARDER）
 _FWD_STATE=""   # 需要额外写进 state 文件的行
 
+# 转发方式偏好（菜单 10）。文件里只存一个词：auto | socat | iptables。
+# 文件不存在或内容异常一律按 auto 处理，所以老版本升级上来行为不变。
+_fwd_pref_get() {
+  local v="auto"
+  [ -f "$FWD_PREF_FILE" ] && v="$(head -n1 "$FWD_PREF_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+  case "$v" in socat|iptables|auto) printf '%s' "$v" ;; *) printf 'auto' ;; esac
+  return 0
+}
+_fwd_pref_set() {
+  case "$1" in socat|iptables|auto) ;; *) return 1 ;; esac
+  mkdir -p "$DEPS_STATE_DIR" 2>/dev/null || return 1
+  printf '%s\n' "$1" > "$FWD_PREF_FILE" 2>/dev/null || return 1
+  return 0
+}
+# 菜单/状态区显示用的一句话描述
+_fwd_pref_label() {
+  case "$(_fwd_pref_get)" in
+    socat)    printf 'socat（进程转发）' ;;
+    iptables) printf 'iptables 双 NAT（内核转发）' ;;
+    *)        printf '自动（socat 优先）' ;;
+  esac
+  return 0
+}
+
 _fwd_avail() {
   case "$1" in
     socat)    command -v socat &>/dev/null ;;
@@ -725,11 +787,21 @@ _fwd_avail() {
 }
 
 _fwd_pick() {
-  local want="${OCM_FORWARDER:-}" b
+  local want="${OCM_FORWARDER:-}" b pref
+  # 1) 环境变量优先级最高（脚本化调用/一次性覆盖）
   if [ -n "$want" ]; then
     if _fwd_avail "$want"; then echo "$want"; return 0; fi
     log_warn "指定的转发后端 '$want' 不可用，改为自动选择。" >&2
   fi
+  # 2) 菜单 10 里设置的偏好；它当前不可用就退回自动，并说明原因
+  pref="$(_fwd_pref_get)"
+  case "$pref" in
+    socat|iptables)
+      if _fwd_avail "$pref"; then echo "$pref"; return 0; fi
+      log_warn "偏好后端 '$pref' 当前不可用，改为自动选择。" >&2
+      ;;
+  esac
+  # 3) 自动：socat 优先，缺失时用 iptables 双 NAT
   for b in socat iptables; do
     if _fwd_avail "$b"; then echo "$b"; return 0; fi
   done
@@ -779,7 +851,11 @@ _fwd_teardown_socat() {
 
 # --- 后端 2: iptables 双 NAT（没有 socat 时的兜底）---
 _fwd_setup_iptables() {
-  local socks_port="$1" listen_addr="$2" dst="${VETH_NS_IP}:${socks_port}"
+  # 必须拆成两条 local：同一条 local 语句里的 ${socks_port} 在展开时还没生效，
+  # bash 会去调用链上层找同名变量（动态作用域）。现在恰好因为 _start_netns_logic
+  # 里有同名局部变量才碰巧正确，换一处调用 dst 就会变成 "192.168.200.2:"（端口空）。
+  local socks_port="$1" listen_addr="$2"
+  local dst="${VETH_NS_IP}:${socks_port}"
   local R_OUT R_PRE="" R_SNAT
   R_SNAT="-p tcp -d ${VETH_NS_IP} --dport ${socks_port} -j SNAT --to-source ${VETH_HOST_IP}"
   if [ "$listen_addr" = "0.0.0.0" ] || [ "$listen_addr" = "::" ]; then
@@ -822,6 +898,34 @@ _fwd_teardown_iptables() {
     esac
   done
   return 0
+}
+
+# 菜单 10：选择端口转发方式。设置写进 FWD_PREF_FILE，下次启动 Netns 生效。
+manage_forwarder() {
+  local c
+  while true; do
+    clear; title "🔀 端口转发方式（Netns 模式）"; sep
+    echo -e "  当前设置: ${C_CYAN}$(_fwd_pref_label)${C_RESET}"
+    echo
+    echo -e "  ${C_GREEN}1)${C_RESET} 自动      ${C_GREY}socat 优先，没有 socat 时自动退回 iptables${C_RESET}"
+    echo -e "  ${C_GREEN}2)${C_RESET} socat     ${C_GREY}进程级中继：客户端↔socat↔gost 两段独立连接${C_RESET}"
+    echo -e "  ${C_GREEN}3)${C_RESET} iptables  ${C_GREY}双 NAT：内核直接转发（DNAT 进 netns + SNAT 保证回程）${C_RESET}"
+    echo -e "  ${C_GREY}4) 返回${C_RESET}"
+    echo
+    sep
+    echo -e "  ${C_GREY}本机可用性: socat $(_fwd_avail socat && echo 可用 || echo 缺失) · iptables $(_fwd_avail iptables && echo 可用 || echo 缺失)${C_RESET}"
+    echo -e "  ${C_GREY}只影响之后启动的 Netns 会话；已经连上的不受影响。${C_RESET}"
+    echo
+    read -rp "请选择 [1-4]: " c || { echo; log_info "标准输入已结束。"; return 0; }
+    case "$c" in
+      1) _fwd_pref_set auto     && log "已设为：自动（socat 优先）" ;;
+      2) _fwd_pref_set socat    && log "已设为：socat" ;;
+      3) _fwd_pref_set iptables && log "已设为：iptables 双 NAT" ;;
+      4) return 0 ;;
+      *) log_err "无效选项"; sleep 1; continue ;;
+    esac
+    sleep 1
+  done
 }
 
 stop_vpn() {
@@ -883,7 +987,7 @@ show_status() {
     echo -e "  ${C_GREY}$(_pad "公网 IPv6" $L)${C_RESET} $(_pub_ip -6 || echo "无 / 查询失败")"
     echo -e "  ${C_GREY}$(_pad "快捷命令" $L)${C_RESET} ${scc}${sc}${C_RESET}"
   else
-    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
+    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL SOCKS_USER SOCKS_PASS; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
     local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
     local mname="${MODE:-未知}"; case "${MODE:-}" in default) mname="默认全局";; ocproxy) mname="ocproxy";; netns) mname="Netns";; esac
     echo -e "  ${C_GREY}$(_pad "状态" $L)${C_RESET} ${C_GREEN}🟢 运行中${C_RESET}  ${C_GREY}·${C_RESET}  ${C_BOLD}${mname}${C_RESET} 模式  ${C_GREY}·${C_RESET}  协议 ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
@@ -899,9 +1003,12 @@ show_status() {
       ;;
       netns)
         local f_info; f_info="${FORWARDER:-socat}"
-        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
+        local auth_txt=""
+        [ -n "${SOCKS_USER:-}" ] && auth_txt="  ${C_YELLOW}认证 ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
+        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}${auth_txt}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
+        [ -n "${SOCKS_USER:-}" ] && socks_proxy="socks5h://${SOCKS_USER}:${SOCKS_PASS:-}@127.0.0.1:${SOCKS_PORT}"
         
         local sip4; sip4=$(_pub_ip -4 "$socks_proxy" || echo "查询失败")
         echo -e "  ${C_GREY}$(_pad "出口" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
@@ -1015,7 +1122,7 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "账户文件已删除"
-  rm -f "$DEPS_MARK_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
+  rm -f "$DEPS_MARK_FILE" "$FWD_PREF_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
   remove_shortcut
   log_info "正在删除脚本文件: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "卸载完成，再见！"
 }
@@ -1058,11 +1165,12 @@ main_menu() {
   echo -e "  ${C_CYAN}7)${C_RESET} 📦 检查 / 安装依赖"
   echo -e "  ${C_CYAN}8)${C_RESET} 🧪 Netns IPv6 连通性测试"
   echo -e "  ${C_CYAN}9)${C_RESET} 🗑️  卸载"
+  echo -e "  ${C_CYAN}10)${C_RESET} 🔀 端口转发方式${C_GREY}（当前: $(_fwd_pref_label)）${C_RESET}"
   echo -e "  ${C_GREY}0)${C_RESET} 🚪 退出"
   echo
   # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，
   # 每轮还会发两次公网 IP 查询。read 失败正是 EOF 的情形。
-  read -rp "请选择 [0-9]: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
+  read -rp "请选择 [0-9] 或 10: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -1077,13 +1185,14 @@ main_menu() {
          log_err "Netns 模式未运行，无法测试"
        fi;;
     9) uninstall; exit 0;;
+    10) manage_forwarder;;
     0) exit 0;;
     *) log_err "无效选项 '$c'";;
   esac
   # 选项 5/6、直接回车或输错键时，上面那条 AND 列表返回 1；而"函数最后一条语句返回
   # 非 0"会让 set -e 结束整个脚本（实测：在主菜单按一下回车程序就退出了）。
   # 显式 return 0，保证任何输入都回到菜单循环里。
-  [[ "$c" =~ ^([1-4]|7|8)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
+  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
   return 0
 }
 
