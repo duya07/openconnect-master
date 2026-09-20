@@ -180,7 +180,7 @@ _DEPS_LIST=(
   "openconnect|openconnect|VPN client (needed by all three modes)"
   "ocproxy|ocproxy|ocproxy mode"
   "gost|gost|SOCKS5 server for Netns mode"
-  "socat|socat|Port forwarding for Netns mode (required)"
+  "socat|socat|Port forwarding for Netns mode (preferred; falls back to iptables double NAT)"
 )
 
 # Menu 7: scan the current state first, then decide what to install
@@ -269,12 +269,12 @@ ensure_cmd_gost() {
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
-  log_warn "Netns mode requires 'socat' for port forwarding (the only forwarder)."
+  log_warn "Netns mode prefers 'socat' for port forwarding (iptables double NAT is the fallback)."
   local yn=""
   read -rp "Do you want to install socat now? [Y/n]: " yn || yn=""
-  [[ "$yn" =~ ^[nN]$ ]] && { log_err "socat is missing, Netns mode cannot start."; return 1; }
+  [[ "$yn" =~ ^[nN]$ ]] && { log_info "Falling back to iptables double NAT for port forwarding."; return 1; }
   _pkg_install socat
-  command -v socat &>/dev/null || { log_err "socat installation failed, Netns mode cannot start."; return 1; }
+  command -v socat &>/dev/null || { log_warn "socat installation failed, falling back to iptables double NAT."; return 1; }
   _mark_dep_installed socat
   log "socat has been installed."
   return 0
@@ -616,7 +616,7 @@ start_netns_mode() {
   is_vpn_running && { log_err "VPN is already running"; return; }
   ensure_pkg_openconnect
   ensure_cmd_gost || return
-  ensure_cmd_socat || return # socat is the only port forwarder for Netns mode; without it nothing can start
+  ensure_cmd_socat || true  # missing socat is not fatal: the backend falls back to iptables double NAT
   select_account || return
   select_protocol || return
   _execute_with_safety_net "_start_netns_logic"
@@ -667,32 +667,17 @@ _start_netns_logic() {
   log "SOCKS5 service (gost) started in Netns (PID: $gost_pid)"
   
   log_info "Configuring port forwarding from host to Netns..."
-  local socat_pid_v4="" socat_pid_v6=""
-  # Port forwarding uses socat only. The old iptables DNAT fallback was removed: with a
-  # global VPN inside the netns (default dev tun0), gost's reply packets have a destination
-  # outside the veth directly-connected subnet, so the netns default route pushes them into
-  # tun and out through the VPN exit - the client never receives a reply (measured with
-  # tcpdump); the data plane simply does not work. socat is a process-level forwarder:
-  # client<->host socat and socat<->netns gost are two independent connections, and both
-  # ends of the host<->netns leg live inside the veth directly-connected subnet, so it does
-  # not depend on reply routing.
-  socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-  socat_pid_v4=$!; echo "$socat_pid_v4" > "$SOCAT_PID_FILE"
-  sleep 1; if ! kill -0 "$socat_pid_v4" 2>/dev/null; then log_err "socat port forwarding failed to start"; return 1; fi
-
-  if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
-    socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-    socat_pid_v6=$!; echo "$socat_pid_v6" > "$SOCAT_PID_FILE_V6"
-    log "Using socat for port forwarding (IPv4 PID: $socat_pid_v4, IPv6 PID: $socat_pid_v6)"
-  else
-    log "Using socat for port forwarding (PID: $socat_pid_v4)"
-  fi
+  # The backend comes from the module area (socat preferred, iptables as fallback;
+  # OCM_FORWARDER can force one).
+  local fwd=""
+  fwd="$(_fwd_pick)" || { log_err "Neither socat nor iptables is available; Netns mode cannot start."; return 1; }
+  _FWD_DESC=""; _FWD_STATE=""
+  _fwd_setup "$fwd" "$socks_port" "$listen_addr" || return 1
 
   {
     echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
-    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=socat";
-    [ -n "$socat_pid_v4" ] && echo "SOCAT_PID=${socat_pid_v4}";
-    [ -n "$socat_pid_v6" ] && echo "SOCAT_PID_V6=${socat_pid_v6}";
+    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${_FWD_DESC}";
+    if [ -n "$_FWD_STATE" ]; then printf '%s\n' "$_FWD_STATE"; fi
   } > "$STATE_FILE"
   
   return 0
@@ -723,6 +708,143 @@ cleanup_ssh_protect_routes() {
   log "✅ Policy routing has been thoroughly cleaned up"
 }
 
+# ============================================================================
+#  Port-forwarding backends (isolated module area - add new schemes here only)
+# ----------------------------------------------------------------------------
+#  The netns runs a global VPN (default route is "default dev tun0"), so there are only
+#  two viable ways to forward a host port to gost inside the netns. Each is implemented
+#  as a self-contained backend; the main flow only refers to them by name:
+#
+#    socat    - process-level relay (preferred). client<->socat and socat<->gost are two
+#               independent connections, and both ends of the host<->netns leg sit inside
+#               the veth directly-connected subnet, so reply routing is irrelevant.
+#    iptables - double NAT (fallback). DNAT sends the packet into the netns; SNAT rewrites
+#               the source to the host veth address. Without SNAT it is dead: when gost's
+#               reply destination is not inside the veth subnet, 127.0.0.1 goes out via lo
+#               and never leaves the netns, and any other address is swallowed by tun0, so
+#               the client never gets a reply. Measured on this host: DNAT alone failed on
+#               all four access paths; adding one SNAT rule made every one of them work.
+#
+#  Entry points (the main flow knows only these):
+#     _fwd_pick                          -> pick a backend (OCM_FORWARDER forces one)
+#     _fwd_setup <backend> <port> <bind> -> 0 = ok; fills _FWD_DESC / _FWD_STATE
+#     _fwd_teardown <backend>            -> remove per the rule strings in state; repeatable
+#  Adding a backend: write _fwd_setup_<name> and _fwd_teardown_<name>, then add one line to
+#  _fwd_avail, to the candidate list in _fwd_pick and to each dispatch below. Nothing in the
+#  main flow, the stop flow or the status display needs to change.
+# ============================================================================
+_FWD_DESC=""    # backend actually used (written to state as FORWARDER)
+_FWD_STATE=""   # extra lines to append to the state file
+
+_fwd_avail() {
+  case "$1" in
+    socat)    command -v socat &>/dev/null ;;
+    iptables) command -v iptables &>/dev/null || [ -x "$IPTABLES_CMD" ] ;;
+    *)        return 1 ;;
+  esac
+}
+
+_fwd_pick() {
+  local want="${OCM_FORWARDER:-}" b
+  if [ -n "$want" ]; then
+    if _fwd_avail "$want"; then echo "$want"; return 0; fi
+    log_warn "Requested forwarding backend '$want' is unavailable, falling back to auto." >&2
+  fi
+  for b in socat iptables; do
+    if _fwd_avail "$b"; then echo "$b"; return 0; fi
+  done
+  return 1
+}
+
+_fwd_setup() {
+  case "$1" in
+    socat|iptables) "_fwd_setup_$1" "$2" "$3" ;;
+    *) log_err "Unknown forwarding backend: $1"; return 1 ;;
+  esac
+}
+_fwd_teardown() {
+  case "${1:-}" in
+    socat|iptables) "_fwd_teardown_$1" ;;
+    *)
+      # Older state files may lack the FORWARDER key yet still hold RULE_* strings
+      if [ -n "${RULE_DNAT_OUTPUT:-}" ] || [ -n "${RULE_DNAT_PREROUTING:-}" ] || [ -n "${RULE_SNAT:-}" ] || [ -n "${RULE_FORWARD:-}" ]; then
+        _fwd_teardown_iptables
+      fi
+      return 0 ;;
+  esac
+}
+
+# --- Backend 1: socat (process-level relay, default preference) ---
+_fwd_setup_socat() {
+  local socks_port="$1" listen_addr="$2" pid_v4="" pid_v6=""
+  socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+  pid_v4=$!; echo "$pid_v4" > "$SOCAT_PID_FILE"
+  sleep 1; if ! kill -0 "$pid_v4" 2>/dev/null; then log_err "socat port forwarding failed to start"; return 1; fi
+  if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
+    socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+    pid_v6=$!; echo "$pid_v6" > "$SOCAT_PID_FILE_V6"
+    log "Using socat for port forwarding (IPv4 PID: $pid_v4, IPv6 PID: $pid_v6)"
+  else
+    log "Using socat for port forwarding (PID: $pid_v4)"
+  fi
+  _FWD_DESC="socat"; _FWD_STATE="SOCAT_PID=${pid_v4}"
+  [ -n "$pid_v6" ] && _FWD_STATE="${_FWD_STATE}"$'\n'"SOCAT_PID_V6=${pid_v6}"
+  return 0
+}
+_fwd_teardown_socat() {
+  [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
+  [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
+  return 0
+}
+
+# --- Backend 2: iptables double NAT (fallback when socat is absent) ---
+_fwd_setup_iptables() {
+  local socks_port="$1" listen_addr="$2" dst="${VETH_NS_IP}:${socks_port}"
+  local R_OUT R_PRE="" R_SNAT
+  R_SNAT="-p tcp -d ${VETH_NS_IP} --dport ${socks_port} -j SNAT --to-source ${VETH_HOST_IP}"
+  if [ "$listen_addr" = "0.0.0.0" ] || [ "$listen_addr" = "::" ]; then
+    # Public bind: traffic generated locally goes through OUTPUT and external traffic through
+    # PREROUTING, so both rules are needed. The OUTPUT rule deliberately does not restrict the
+    # destination: the host may connect to 127.0.0.1 or to its own LAN address, and the latter
+    # does not work with PREROUTING alone (locally generated traffic never traverses it).
+    R_OUT="-p tcp --dport ${socks_port} -j DNAT --to-destination ${dst}"
+    R_PRE="$R_OUT"
+  else
+    # Local-only bind: restrict to 127.0.0.1 and skip PREROUTING, matching "socat bind 127.0.0.1"
+    R_OUT="-p tcp -d 127.0.0.1 --dport ${socks_port} -j DNAT --to-destination ${dst}"
+  fi
+  # -C before -A so repeated runs do not stack duplicate rules
+  "$IPTABLES_CMD" -t nat -C OUTPUT $R_OUT 2>/dev/null || "$IPTABLES_CMD" -t nat -A OUTPUT $R_OUT \
+    || { log_err "Failed to add iptables DNAT (local)"; return 1; }
+  "$IPTABLES_CMD" -t nat -C POSTROUTING $R_SNAT 2>/dev/null || "$IPTABLES_CMD" -t nat -A POSTROUTING $R_SNAT \
+    || { log_err "Failed to add iptables SNAT"; return 1; }
+  if [ -n "$R_PRE" ]; then
+    "$IPTABLES_CMD" -t nat -C PREROUTING $R_PRE 2>/dev/null || "$IPTABLES_CMD" -t nat -A PREROUTING $R_PRE \
+      || { log_err "Failed to add iptables DNAT (external)"; return 1; }
+  fi
+  _FWD_DESC="iptables"
+  _FWD_STATE="RULE_DNAT_OUTPUT='${R_OUT}'"
+  [ -n "$R_PRE" ] && _FWD_STATE="${_FWD_STATE}"$'\n'"RULE_DNAT_PREROUTING='${R_PRE}'"
+  _FWD_STATE="${_FWD_STATE}"$'\n'"RULE_SNAT='${R_SNAT}'"
+  log "Using iptables double NAT for port forwarding (DNAT -> ${dst}, SNAT -> ${VETH_HOST_IP})"
+  return 0
+}
+_fwd_teardown_iptables() {
+  # Covers both this version (RULE_DNAT_*/RULE_SNAT) and RULE_FORWARD left by older ones
+  local k="" r=""
+  for k in RULE_DNAT_OUTPUT RULE_DNAT_PREROUTING RULE_SNAT RULE_FORWARD; do
+    r="${!k:-}"
+    [ -n "$r" ] || continue
+    case "$k" in
+      RULE_DNAT_OUTPUT)     eval "\$IPTABLES_CMD -t nat -D OUTPUT ${r}" 2>/dev/null || true ;;
+      RULE_DNAT_PREROUTING) eval "\$IPTABLES_CMD -t nat -D PREROUTING ${r}" 2>/dev/null || true ;;
+      RULE_SNAT)            eval "\$IPTABLES_CMD -t nat -D POSTROUTING ${r}" 2>/dev/null || true ;;
+      RULE_FORWARD)         eval "\$IPTABLES_CMD -D FORWARD ${r}" 2>/dev/null || true ;;
+    esac
+  done
+  return 0
+}
+
 stop_vpn() {
   # Do not take the early exit while the state file exists: a failed start has already
   # written state and installed policy routes; the early exit skips
@@ -741,20 +863,10 @@ stop_vpn() {
       log_info "Stopping netns mode..."
       if [ -f "$STATE_FILE" ]; then
         . "$STATE_FILE" 2>/dev/null || true
-        if [ "${FORWARDER:-}" = "socat" ]; then
-          [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
-          [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
-        elif [ "${FORWARDER:-}" = "iptables" ]; then
-          # Only to clean up sessions left by older versions (new versions no longer create
-          # iptables forwarding), so a machine upgraded from an older release - or one that
-          # rolled back - does not keep these three rules around.
-          log_info "Cleaning up legacy iptables forwarding rules..."
-          # || true: iptables -D returns non-zero for a rule already removed elsewhere; eval is the
-          # final command of an && list, and that failure makes set -e abort stop_vpn entirely.
-          [ -n "${RULE_DNAT_PREROUTING:-}" ] && eval "\$IPTABLES_CMD -t nat -D PREROUTING ${RULE_DNAT_PREROUTING}" 2>/dev/null || true
-          [ -n "${RULE_DNAT_OUTPUT:-}" ]   && eval "\$IPTABLES_CMD -t nat -D OUTPUT ${RULE_DNAT_OUTPUT}" 2>/dev/null || true
-          [ -n "${RULE_FORWARD:-}" ]       && eval "\$IPTABLES_CMD -D FORWARD ${RULE_FORWARD}" 2>/dev/null || true
-        fi
+        # Teardown is delegated to the backend module: socat kills processes, iptables
+        # removes rules; the main flow does not know rule shapes. Legacy
+        # FORWARDER=iptables state (RULE_DNAT_*/RULE_FORWARD only) goes through here too.
+        _fwd_teardown "${FORWARDER:-}"
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
       if [ -f "$PID_FILE" ]; then

@@ -353,6 +353,10 @@ ps aux | grep openconnect
 **Follow-up fixes (still v7.7.7)**
 
 - 🔧 **Fix**: Netns mode intermittently reported a startup failure right after "TUN interface is ready" - under `set -o pipefail`, `grep -q` exits early and `ip` dies from SIGPIPE, so a successful match was treated as a failure (measured ~17% of runs)
+- ✨ **New**: Netns mode gained an **iptables double NAT** port-forwarding backend (DNAT into the netns + SNAT rewriting the source to the veth address). With DNAT alone all four access paths failed (gost replies never leave the netns); without socat it is now used automatically, and `OCM_FORWARDER=iptables` forces it
+- 🔧 **Improved**: port forwarding is now a pluggable backend module (`_fwd_setup_<name>` / `_fwd_teardown_<name>`; the main flow only calls `_fwd_pick` / `_fwd_setup` / `_fwd_teardown`), so a new scheme touches only the module area
+- 🔧 **Fix**: a missing or failed socat no longer aborts startup (the caller used `|| return`; it now falls back to the iptables backend)
+- 🔧 **Fix**: with a `0.0.0.0` bind, reaching the port through the host's own LAN address failed - locally generated traffic never traverses PREROUTING, so the OUTPUT chain now matches it too
 - 🔧 **Fix**: Uninstalling gost used `--remove`, which the official script does not support - it actually opened the interactive "pick a version" installer and aborted the uninstall; it now deletes the binary directly
 - 🔧 **Fix**: Deleting a VPN account left the account file with mode 644 instead of 600
 - 🔧 **Fix**: Stopping Netns mode left openconnect running for a long time (its logout path was torn down first, and the leftover process fought the next connection)

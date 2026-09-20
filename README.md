@@ -69,8 +69,8 @@
 - `openconnect` - OpenConnect VPN 客户端
 - `ocproxy` - ocproxy 模式所需
 - `gost` - Netns 模式的 SOCKS5 服务器
-- `socat` - Netns 模式的端口转发（必需）
-- `iptables` - 防火墙和 NAT 规则
+- `socat` - Netns 模式的端口转发（**首选**）
+- `iptables` - 端口转发兜底方案（双 NAT）与 NAT 规则
 - `iproute2` - 网络配置工具
 
 ## 🚀 快速开始
@@ -181,6 +181,7 @@ chmod +x oc_master.sh
 - 支持 IPv4 和 IPv6 双栈
 - 通过 SOCKS5 代理访问
 - 可选择本地或远程监听
+- 端口转发有两条后端：`socat`（默认）与 `iptables` 双 NAT（没有 socat 时自动启用）
 
 **使用方法**：
 ```bash
@@ -353,6 +354,10 @@ ps aux | grep openconnect
 **后续修复（仍是 v7.7.7）**
 
 - 🔧 **修复**：Netns 模式偶发"TUN 已就绪"后立刻报启动失败——`set -o pipefail` 下 `grep -q` 提前退出会让 `ip` 吃到 SIGPIPE，匹配成功却被判成失败（实测非 0 率约 17%）
+- ✨ **新增**：Netns 模式新增 **iptables 双 NAT** 端口转发后端（DNAT 进 netns + SNAT 把源改成 veth 地址）。此前只有 DNAT 时四种访问方式全部不通（gost 的回包源不在 veth 直连段，出不了 netns）；现在没有 socat 时自动降级到它，也可用 `OCM_FORWARDER=iptables` 强制指定
+- 🔧 **优化**：端口转发改为可插拔后端模块（`_fwd_setup_<名>` / `_fwd_teardown_<名>`，主流程只调用 `_fwd_pick` / `_fwd_setup` / `_fwd_teardown`），以后新增转发方案只动模块区、不碰主流程
+- 🔧 **修复**：socat 缺失或安装失败时不再直接放弃启动（原来调用方是 `|| return`，改成了降级到 iptables 后端）
+- 🔧 **修复**：`0.0.0.0` 监听时本机经内网 IP 访问不通——本机产生的流量不经过 PREROUTING，改为 OUTPUT 链也放行
 - 🔧 **修复**：卸载 gost 时调用了官方脚本根本不存在的 `--remove`，实际会弹出"选择版本"的安装菜单并中断卸载；改为直接删除二进制
 - 🔧 **修复**：删除 VPN 账户后账户文件权限由 600 变成 644
 - 🔧 **修复**：停止 Netns 模式时 openconnect 长时间不退出（登出路径被提前拆掉，残留进程会与下一次连接打架）

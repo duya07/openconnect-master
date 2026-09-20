@@ -171,7 +171,7 @@ _DEPS_LIST=(
   "openconnect|openconnect|VPN 客户端（三种模式都要）"
   "ocproxy|ocproxy|ocproxy 模式"
   "gost|gost|Netns 模式的 SOCKS5 服务端"
-  "socat|socat|Netns 模式的端口转发（必需）"
+  "socat|socat|Netns 模式的端口转发（首选；缺失时自动改用 iptables 双 NAT）"
 )
 
 # 菜单 7：先扫描现状，再决定装什么
@@ -259,12 +259,12 @@ ensure_cmd_gost() {
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
-  log_warn "Netns 模式需要 'socat' 进行端口转发（唯一的转发方式）。"
+  log_warn "Netns 模式推荐用 'socat' 做端口转发（若没有，会自动改用 iptables 双 NAT）。"
   local yn=""
   read -rp "是否立即安装 socat? [Y/n]: " yn || yn=""
-  [[ "$yn" =~ ^[nN]$ ]] && { log_err "缺少 socat，Netns 模式无法启动。"; return 1; }
+  [[ "$yn" =~ ^[nN]$ ]] && { log_info "将改用 iptables 双 NAT 作为端口转发后端。"; return 1; }
   _pkg_install socat
-  command -v socat &>/dev/null || { log_err "socat 安装失败，Netns 模式无法启动。"; return 1; }
+  command -v socat &>/dev/null || { log_warn "socat 安装失败，将改用 iptables 双 NAT。"; return 1; }
   _mark_dep_installed socat
   log "socat 已安装。"
   return 0
@@ -602,7 +602,7 @@ start_netns_mode() {
   is_vpn_running && { log_err "VPN 已在运行"; return; }
   ensure_pkg_openconnect
   ensure_cmd_gost || return
-  ensure_cmd_socat || return # socat 是 Netns 模式唯一的端口转发方式，缺失即无法启动
+  ensure_cmd_socat || true  # 没有 socat 不阻断：转发后端会退到 iptables 双 NAT
   select_account || return
   select_protocol || return
   _execute_with_safety_net "_start_netns_logic"
@@ -653,29 +653,16 @@ _start_netns_logic() {
   log "SOCKS5 服务 (gost) 已在 Netns 中启动 (PID: $gost_pid)"
   
   log_info "配置主机到 Netns 的端口转发..."
-  local socat_pid_v4="" socat_pid_v6=""
-  # 端口转发只用 socat。旧版本的 iptables DNAT 备用方案已移除：netns 内是全局 VPN
-  # （default dev tun0），gost 的回包目标不在 veth 直连网段内，会被默认路由吸进 tun、
-  # 从 VPN 出口离开，客户端永远收不到回包（tcpdump 实测），数据面根本不通。
-  # socat 是进程级转发：客户端↔主机 socat、socat↔netns gost 两段各自成连接，
-  # 主机↔netns 那段两端地址都在 veth 直连段内，不依赖回包路由。
-  socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-  socat_pid_v4=$!; echo "$socat_pid_v4" > "$SOCAT_PID_FILE"
-  sleep 1; if ! kill -0 "$socat_pid_v4" 2>/dev/null; then log_err "socat 端口转发启动失败"; return 1; fi
-
-  if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
-    socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-    socat_pid_v6=$!; echo "$socat_pid_v6" > "$SOCAT_PID_FILE_V6"
-    log "使用 socat 完成端口转发 (IPv4 PID: $socat_pid_v4, IPv6 PID: $socat_pid_v6)"
-  else
-    log "使用 socat 完成端口转发 (PID: $socat_pid_v4)"
-  fi
+  # 后端由模块区决定（socat 优先，iptables 兜底，可用 OCM_FORWARDER 强制指定）
+  local fwd=""
+  fwd="$(_fwd_pick)" || { log_err "socat 与 iptables 都不可用，Netns 模式无法启动。"; return 1; }
+  _FWD_DESC=""; _FWD_STATE=""
+  _fwd_setup "$fwd" "$socks_port" "$listen_addr" || return 1
 
   {
     echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
-    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=socat";
-    [ -n "$socat_pid_v4" ] && echo "SOCAT_PID=${socat_pid_v4}";
-    [ -n "$socat_pid_v6" ] && echo "SOCAT_PID_V6=${socat_pid_v6}";
+    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${_FWD_DESC}";
+    if [ -n "$_FWD_STATE" ]; then printf '%s\n' "$_FWD_STATE"; fi
   } > "$STATE_FILE"
   
   return 0
@@ -706,6 +693,137 @@ cleanup_ssh_protect_routes() {
   log "✅ 策略路由已彻底清理"
 }
 
+# ============================================================================
+#  端口转发后端（独立模块区 —— 新增方案只需动这一段）
+# ----------------------------------------------------------------------------
+#  netns 内是全局 VPN（默认路由 default dev tun0），所以"把主机端口转发进 netns
+#  的 gost"只有两条可行路线，各自实现成自包含后端，主流程只按名字调用：
+#
+#    socat    —— 进程级中继（首选）。客户端↔socat、socat↔gost 是两段独立连接，
+#                主机↔netns 那段两端地址都在 veth 直连网段内，不依赖回包路由。
+#    iptables —— 双 NAT（兜底）。DNAT 把包送进 netns，SNAT 把源改成主机 veth 地址。
+#                缺 SNAT 就是死的：gost 回包的目标地址若不在 veth 直连段，127.0.0.1
+#                会走 lo 出不了 netns、其它地址会被 tun0 吞掉，客户端永远收不到回包。
+#                本机实测：仅 DNAT 时四种访问方式全灭；补一条 SNAT 后立即全通。
+#
+#  统一入口（主流程只认这两个）：
+#     _fwd_pick                        → 选后端（OCM_FORWARDER 可强制指定）
+#     _fwd_setup <后端> <端口> <监听地址> → 0=成功，并填好 _FWD_DESC / _FWD_STATE
+#     _fwd_teardown <后端>             → 按 state 里的规则串拆除，可重复调用
+#  新增后端：写 _fwd_setup_<名> 与 _fwd_teardown_<名>，在 _fwd_avail、_fwd_pick 的
+#            候选列表和各分发处各加一行即可；主流程、停止流程、状态显示都不用改。
+# ============================================================================
+_FWD_DESC=""    # 实际使用的后端名（写进 state 的 FORWARDER）
+_FWD_STATE=""   # 需要额外写进 state 文件的行
+
+_fwd_avail() {
+  case "$1" in
+    socat)    command -v socat &>/dev/null ;;
+    iptables) command -v iptables &>/dev/null || [ -x "$IPTABLES_CMD" ] ;;
+    *)        return 1 ;;
+  esac
+}
+
+_fwd_pick() {
+  local want="${OCM_FORWARDER:-}" b
+  if [ -n "$want" ]; then
+    if _fwd_avail "$want"; then echo "$want"; return 0; fi
+    log_warn "指定的转发后端 '$want' 不可用，改为自动选择。" >&2
+  fi
+  for b in socat iptables; do
+    if _fwd_avail "$b"; then echo "$b"; return 0; fi
+  done
+  return 1
+}
+
+_fwd_setup() {
+  case "$1" in
+    socat|iptables) "_fwd_setup_$1" "$2" "$3" ;;
+    *) log_err "未知的转发后端: $1"; return 1 ;;
+  esac
+}
+_fwd_teardown() {
+  case "${1:-}" in
+    socat|iptables) "_fwd_teardown_$1" ;;
+    *)
+      # 更早版本的 state 可能没有 FORWARDER 键、却留下 RULE_* 规则串，兜底清一次
+      if [ -n "${RULE_DNAT_OUTPUT:-}" ] || [ -n "${RULE_DNAT_PREROUTING:-}" ] || [ -n "${RULE_SNAT:-}" ] || [ -n "${RULE_FORWARD:-}" ]; then
+        _fwd_teardown_iptables
+      fi
+      return 0 ;;
+  esac
+}
+
+# --- 后端 1: socat（进程级中继，默认首选）---
+_fwd_setup_socat() {
+  local socks_port="$1" listen_addr="$2" pid_v4="" pid_v6=""
+  socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+  pid_v4=$!; echo "$pid_v4" > "$SOCAT_PID_FILE"
+  sleep 1; if ! kill -0 "$pid_v4" 2>/dev/null; then log_err "socat 端口转发启动失败"; return 1; fi
+  if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
+    socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+    pid_v6=$!; echo "$pid_v6" > "$SOCAT_PID_FILE_V6"
+    log "使用 socat 完成端口转发 (IPv4 PID: $pid_v4, IPv6 PID: $pid_v6)"
+  else
+    log "使用 socat 完成端口转发 (PID: $pid_v4)"
+  fi
+  _FWD_DESC="socat"; _FWD_STATE="SOCAT_PID=${pid_v4}"
+  [ -n "$pid_v6" ] && _FWD_STATE="${_FWD_STATE}"$'\n'"SOCAT_PID_V6=${pid_v6}"
+  return 0
+}
+_fwd_teardown_socat() {
+  [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
+  [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
+  return 0
+}
+
+# --- 后端 2: iptables 双 NAT（没有 socat 时的兜底）---
+_fwd_setup_iptables() {
+  local socks_port="$1" listen_addr="$2" dst="${VETH_NS_IP}:${socks_port}"
+  local R_OUT R_PRE="" R_SNAT
+  R_SNAT="-p tcp -d ${VETH_NS_IP} --dport ${socks_port} -j SNAT --to-source ${VETH_HOST_IP}"
+  if [ "$listen_addr" = "0.0.0.0" ] || [ "$listen_addr" = "::" ]; then
+    # 对全网开放：本机产生的流量走 OUTPUT、外部来的走 PREROUTING，两条都要有。
+    # OUTPUT 这里不限定目标地址：本机既可能连 127.0.0.1，也可能连自己的内网 IP
+    # （后者实测只加 PREROUTING 是连不上的——本机流量根本不经过 PREROUTING）。
+    R_OUT="-p tcp --dport ${socks_port} -j DNAT --to-destination ${dst}"
+    R_PRE="$R_OUT"
+  else
+    # 只监听本地：限定目标为 127.0.0.1，且不加 PREROUTING —— 语义与 socat bind 127.0.0.1 一致
+    R_OUT="-p tcp -d 127.0.0.1 --dport ${socks_port} -j DNAT --to-destination ${dst}"
+  fi
+  # 先 -C 再 -A：重复运行不会叠加规则
+  "$IPTABLES_CMD" -t nat -C OUTPUT $R_OUT 2>/dev/null || "$IPTABLES_CMD" -t nat -A OUTPUT $R_OUT \
+    || { log_err "iptables DNAT(本机) 添加失败"; return 1; }
+  "$IPTABLES_CMD" -t nat -C POSTROUTING $R_SNAT 2>/dev/null || "$IPTABLES_CMD" -t nat -A POSTROUTING $R_SNAT \
+    || { log_err "iptables SNAT 添加失败"; return 1; }
+  if [ -n "$R_PRE" ]; then
+    "$IPTABLES_CMD" -t nat -C PREROUTING $R_PRE 2>/dev/null || "$IPTABLES_CMD" -t nat -A PREROUTING $R_PRE \
+      || { log_err "iptables DNAT(外部) 添加失败"; return 1; }
+  fi
+  _FWD_DESC="iptables"
+  _FWD_STATE="RULE_DNAT_OUTPUT='${R_OUT}'"
+  [ -n "$R_PRE" ] && _FWD_STATE="${_FWD_STATE}"$'\n'"RULE_DNAT_PREROUTING='${R_PRE}'"
+  _FWD_STATE="${_FWD_STATE}"$'\n'"RULE_SNAT='${R_SNAT}'"
+  log "已用 iptables 双 NAT 完成端口转发 (DNAT → ${dst}，SNAT → ${VETH_HOST_IP})"
+  return 0
+}
+_fwd_teardown_iptables() {
+  # 同时覆盖本版本(RULE_DNAT_*/RULE_SNAT)与更早版本留下的 RULE_FORWARD
+  local k="" r=""
+  for k in RULE_DNAT_OUTPUT RULE_DNAT_PREROUTING RULE_SNAT RULE_FORWARD; do
+    r="${!k:-}"
+    [ -n "$r" ] || continue
+    case "$k" in
+      RULE_DNAT_OUTPUT)     eval "\$IPTABLES_CMD -t nat -D OUTPUT ${r}" 2>/dev/null || true ;;
+      RULE_DNAT_PREROUTING) eval "\$IPTABLES_CMD -t nat -D PREROUTING ${r}" 2>/dev/null || true ;;
+      RULE_SNAT)            eval "\$IPTABLES_CMD -t nat -D POSTROUTING ${r}" 2>/dev/null || true ;;
+      RULE_FORWARD)         eval "\$IPTABLES_CMD -D FORWARD ${r}" 2>/dev/null || true ;;
+    esac
+  done
+  return 0
+}
+
 stop_vpn() {
   # state 文件在时不能早退：失败的启动已写 state 并配好策略路由，早退会跳过
   # cleanup_ssh_protect_routes 和 rm —— 残留 ip rule 和 state（实测 iprule 4 行残留；
@@ -721,19 +839,9 @@ stop_vpn() {
       log_info "正在停止 netns 模式..."
       if [ -f "$STATE_FILE" ]; then
         . "$STATE_FILE" 2>/dev/null || true
-        if [ "${FORWARDER:-}" = "socat" ]; then
-          [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
-          [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
-        elif [ "${FORWARDER:-}" = "iptables" ]; then
-          # 只为清理旧版本留下的会话（新版启动侧已不再产生 iptables 转发），
-          # 保证从旧版升上来、或回滚过版本的机器上不会残留这三条规则。
-          log_info "清理旧版遗留的 iptables 转发规则..."
-          # || true：iptables -D 对"已被外部清掉的规则"返回非 0，eval 是 && 列表最后的命令，
-          # 失败会被 set -e 当成错误直接终止 stop_vpn（gost/openconnect 不杀、netns 不清）。
-          [ -n "${RULE_DNAT_PREROUTING:-}" ] && eval "\$IPTABLES_CMD -t nat -D PREROUTING ${RULE_DNAT_PREROUTING}" 2>/dev/null || true
-          [ -n "${RULE_DNAT_OUTPUT:-}" ]   && eval "\$IPTABLES_CMD -t nat -D OUTPUT ${RULE_DNAT_OUTPUT}" 2>/dev/null || true
-          [ -n "${RULE_FORWARD:-}" ]       && eval "\$IPTABLES_CMD -D FORWARD ${RULE_FORWARD}" 2>/dev/null || true
-        fi
+        # 拆除交给后端模块自己处理：socat 杀进程、iptables 删规则，主流程不认规则形状。
+        # 旧版本留下的 FORWARDER=iptables（只存 RULE_DNAT_*/RULE_FORWARD）同样走这里。
+        _fwd_teardown "${FORWARDER:-}"
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
       if [ -f "$PID_FILE" ]; then
