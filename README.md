@@ -181,13 +181,14 @@ chmod +x oc_master.sh
 - 支持 IPv4 和 IPv6 双栈
 - 通过 SOCKS5 代理访问
 - 可选择本地或远程监听
-- 端口转发有两条后端：`socat`（默认）与 `iptables` 双 NAT（没有 socat 时自动启用）；主菜单 `10) 端口转发方式` 可在 **自动 / socat / iptables** 之间切换
+- 端口转发有两条后端，各对应一个菜单项：**3) Netns 模式 (socat 转发)** 与 **4) Netns 模式 (iptables 双 NAT)**；前者是进程级中继（推荐），后者用内核 DNAT + SNAT
 - 可选 **SOCKS5 用户名/密码**：启动时询问，留空即匿名；启用后主菜单会显示认证信息
 
 **使用方法**：
 ```bash
 # 运行脚本后选择
-3) 启动: 🌐 Netns 模式 (SOCKS5, IPv4+IPv6 全功能)
+3) 启动: 🌐 Netns 模式 (SOCKS5, socat 转发)
+# 想用内核转发就选 4) 启动: 🌐 Netns 模式 (SOCKS5, iptables 双 NAT)
 # 输入监听端口（例如 8585）
 # 选择是否允许远程连接
 ```
@@ -238,7 +239,7 @@ chmod +x oc_master.sh
 
 ```bash
 # 方法1: 在脚本菜单中
-4) 停止 VPN
+5) 停止 VPN
 
 # 方法2: 直接命令行
 ./oc_master.sh stop
@@ -372,7 +373,7 @@ ps aux | grep openconnect
 - 🔧 **修复**：停止 Netns 时 iptables 清理分支的 `eval iptables -D` 失败（规则已被外部清掉）会被 `set -e` 中断整个停止流程，进程与 netns 不再清理
 - 🔧 **修复**：启动失败后 `stop_vpn` 因"无 pid 文件"早退，状态文件与已配置的策略路由（ip rule）残留；装了守护任务的机器会每 5 分钟拿失败账户重连一次
 - 🔧 **修复**：ocproxy 模式的守护重连在 cron 环境下完全不可用——重连逻辑第一步是交互式端口输入，无终端时 `read` 立即 EOF 并被 `set -e` 终止。守护重连现复用状态文件里保存的端口；移除了指向已删除的 docs/FAQ.md 的失效链接
-- ✨ **新增**：主菜单 `10) 端口转发方式`，可在 **自动 / socat / iptables 双 NAT** 之间切换。偏好存在 `/var/lib/oc-master/forwarder`，下次启动 Netns 时生效；优先级为 `OCM_FORWARDER` 环境变量 > 菜单设置 > 自动（socat 优先）
+- ✨ **新增**：Netns 模式按转发后端拆成两个启动项——`3) Netns 模式 (socat 转发)` 与 `4) Netns 模式 (iptables 双 NAT)`，直接选，不再需要先切"偏好"。选 socat 时若 socat 装不上会明确拒绝启动，不会悄悄降级；`OCM_FORWARDER` 环境变量仍可一次性覆盖，供脚本化调用
 - ✨ **新增**：Netns 模式支持可选 **SOCKS5 用户名/密码**。启动时询问（留空即匿名），gost 以 `socks5://user:pass@host:port` 启动；用户名/密码拒绝含 `@ : /` 引号 反斜杠 空白（这些会破坏 gost 的 URL 解析）；状态文件用 `%q` 转义写入并收紧为 600；主菜单会在 SOCKS 行显示监听地址与认证信息
 - 🔧 **修复**：`_fwd_setup_iptables` 里 `dst` 与 `socks_port` 写在同一条 `local` 语句上，导致端口取不到值（靠 bash 动态作用域偶然拿到调用方的同名变量才没出错），拆成两条 `local`
 

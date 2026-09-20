@@ -181,13 +181,14 @@ When starting any mode, you are asked which protocol to use right after choosing
 - IPv4 and IPv6 dual-stack support
 - Access via SOCKS5 proxy
 - Option for local or remote listening
-- Two port-forwarding backends: `socat` (default) and `iptables` double NAT (used automatically when socat is missing); menu `10) Port forwarding backend` switches between **auto / socat / iptables**
+- Two port-forwarding backends, one menu entry each: **3) Netns Mode (SOCKS5, socat forwarding)** and **4) Netns Mode (SOCKS5, iptables double NAT)**; the former is a process-level relay (recommended), the latter uses kernel DNAT + SNAT
 - Optional **SOCKS5 username/password**: asked at startup, empty means anonymous; once enabled the main menu shows the auth info
 
 **Usage**:
 ```bash
 # Select after running the script
-3) Start: 🌐 Netns Mode (SOCKS5, IPv4+IPv6 Full Features)
+3) Start: 🌐 Netns Mode (SOCKS5, socat forwarding)
+# For kernel forwarding choose 4) Start: 🌐 Netns Mode (SOCKS5, iptables double NAT)
 # Enter listening port (e.g. 8585)
 # Choose whether to allow remote connections
 ```
@@ -238,7 +239,7 @@ This adds to crontab:
 
 ```bash
 # Method 1: In script menu
-4) Stop VPN
+5) Stop VPN
 
 # Method 2: Direct command line
 ./oc_master_en.sh stop
