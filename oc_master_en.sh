@@ -307,6 +307,31 @@ _wait_pid_gone() {
   kill -9 "$pid" 2>/dev/null || true
 }
 
+# --- Public IP lookup ---
+# With a single provider (ip.p3terx.com) the whole status block degrades to
+# "Query failed" whenever that one host is down -- measured: ip.p3terx.com is now
+# unreachable entirely (80/443 both "Failed to connect", 0/10 successes), so fall
+# back through several providers, fastest-measured first.
+_PUB_PROVIDERS4=("https://api.ipify.org" "https://ifconfig.me/ip" "https://ip.p3terx.com")
+# IPv6 is usually unavailable; failing fast matters more than coverage here.
+_PUB_PROVIDERS6=("https://api64.ipify.org" "https://ifconfig.me/ip")
+# $1=-4/-6; $2=optional socks5h proxy. Prints the address, or returns 1 if all fail.
+_pub_ip() {
+  local fam="$1" proxy="${2:-}" url out
+  local list=("${_PUB_PROVIDERS4[@]}")
+  local tmo=(-s -A "Mozilla/5.0" --connect-timeout 4 --max-time 8)
+  if [ "$fam" = "-6" ]; then
+    list=("${_PUB_PROVIDERS6[@]}")
+    tmo=(-s -A "Mozilla/5.0" --connect-timeout 3 --max-time 5)
+  fi
+  [ -n "$proxy" ] && tmo=(-s -A "Mozilla/5.0" --connect-timeout 6 --max-time 12 -x "$proxy")
+  for url in "${list[@]}"; do
+    out=$("$CURL_CMD" "$fam" "${tmo[@]}" "$url" 2>/dev/null | head -n1 | tr -d '\r\n[:space:]')
+    [ -n "$out" ] && { echo "$out"; return 0; }
+  done
+  return 1
+}
+
 # --- IPv6 Connectivity Test ---
 test_netns_ipv6() {
   local test_passed=0
@@ -536,7 +561,7 @@ _execute_with_safety_net() {
   if "$func_to_run"; then
     trap - SIGINT # Success, remove the trap
     [ "$job" != "none" ] && atrm "$job" && log "Connection stable, failsafe job cancelled."
-    show_status
+    show_status || true
   else
     trap - SIGINT # Failure, remove the trap
     log_err "Startup process failed, please check the logs."
@@ -763,55 +788,58 @@ stop_vpn() {
 
 # --- Status Display ---
 show_status() {
-  local ip_provider="ip.p3terx.com"; local curl_opts=(-s -A "Mozilla/5.0" --connect-timeout 4 --max-time 8)
   local sc; sc=$(_shortcut_state)
+  local L=12
+  local scc="${C_GREY}"; case "$sc" in *"✓"*) scc="${C_GREEN}";; esac
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then
-    echo -e "${C_BOLD}VPN Status:${C_RESET} ${C_RED}🔴 Stopped${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Shortcut:${C_RESET} ${sc}"
-    echo -e "${C_BOLD}Public IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "Query failed")  ${C_GREY}|${C_RESET}  ${C_BOLD}Public IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "None/Query failed")"
+    echo -e "  ${C_GREY}$(_pad "Status" $L)${C_RESET} ${C_RED}🔴 Stopped${C_RESET}"
+    echo -e "  ${C_GREY}$(_pad "Public IPv4" $L)${C_RESET} $(_pub_ip -4 || echo "Query failed")"
+    echo -e "  ${C_GREY}$(_pad "Public IPv6" $L)${C_RESET} $(_pub_ip -6 || echo "None / Query failed")"
+    echo -e "  ${C_GREY}$(_pad "Shortcut" $L)${C_RESET} ${scc}${sc}${C_RESET}"
   else
     local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
     local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
-    echo -e "${C_BOLD}VPN Status:${C_RESET} ${C_GREEN}🟢 Running${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Mode:${C_RESET} ${MODE:-unknown}  ${C_GREY}|${C_RESET}  ${C_BOLD}Protocol:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Shortcut:${C_RESET} ${sc}"
+    local mname="${MODE:-unknown}"; case "${MODE:-}" in default) mname="Default";; ocproxy) mname="ocproxy";; netns) mname="Netns";; esac
+    echo -e "  ${C_GREY}$(_pad "Status" $L)${C_RESET} ${C_GREEN}🟢 Running${C_RESET}  ${C_GREY}·${C_RESET}  ${C_BOLD}${mname}${C_RESET} Mode  ${C_GREY}·${C_RESET}  Protocol ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
     
     case "${MODE:-}" in
       default)
-        echo -e "  ${C_BOLD}Egress IPv4:${C_RESET} ${C_YELLOW}$($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo Failed)${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Egress IPv6:${C_RESET} ${C_YELLOW}$($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider"|head -n1||echo None/Failed)${C_RESET}"
+        echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}$(_pub_ip -4 || echo Failed)${C_RESET}  ${C_GREY}·${C_RESET}  IPv6 ${C_YELLOW}$(_pub_ip -6 || echo None/Failed)${C_RESET}"
       ;;
       ocproxy)
-        local sip4; sip4=$($CURL_CMD -x "socks5h://127.0.0.1:${SOCKS_PORT}" -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo "Query failed")
-        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}  ${C_GREY}|${C_RESET}  ${C_BOLD}Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        local sip4; sip4=$(_pub_ip -4 "socks5h://127.0.0.1:${SOCKS_PORT}" || echo "Query failed")
+        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
+        echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
       ;;
       netns)
         local f_info; f_info="${FORWARDER:-socat}"
-        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) by ${f_info})${C_RESET}"
+        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
-        local curl_opts_socks=(-s -A "Mozilla/5.0" --connect-timeout 8 --max-time 15)
         
-        local sip4; sip4=$($CURL_CMD -x "$socks_proxy" -4 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "Query failed")
-        echo -e "  ${C_BOLD}Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        local sip4; sip4=$(_pub_ip -4 "$socks_proxy" || echo "Query failed")
+        echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
         
-        local sip6="";
-        sip6=$($CURL_CMD -x "$socks_proxy" -6 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "")
-        
-        if [ -z "$sip6" ] || [[ "$sip6" == *"Query failed"* ]]; then
-          sip6=$($CURL_CMD -x "$socks_proxy" -6 "${curl_opts_socks[@]}" "https://api64.ipify.org" 2>/dev/null || echo "")
-        fi
+        local sip6=""
+        # The || true is required: _pub_ip returns non-zero when IPv6 is absent and a
+        # bare assignment failure would trip set -e, killing the whole script.
+        sip6="$(_pub_ip -6 "$socks_proxy" || true)"
         
         if [ -z "$sip6" ] && [ -n "${NETNS_NAME:-}" ]; then
-          sip6=$("$IP_CMD" netns exec "${NETNS_NAME}" curl -6 -s --connect-timeout 5 --max-time 10 "$ip_provider" 2>/dev/null | head -n1 || echo "")
+          sip6=$("$IP_CMD" netns exec "${NETNS_NAME}" curl -6 -s --connect-timeout 5 --max-time 10 "${_PUB_PROVIDERS6[0]}" 2>/dev/null | head -n1 | tr -d '\r\n[:space:]' || echo "")
           [ -n "$sip6" ] && sip6="${sip6} ${C_GREY}(Detected inside Netns)${C_RESET}"
         fi
         
-        if [ -n "$sip6" ] && [[ "$sip6" != *"Query failed"* ]]; then
-          echo -e "  ${C_BOLD}Egress IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
+        if [ -n "$sip6" ]; then
+          echo -e "  ${C_GREY}$(_pad "Egress IPv6" $L)${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
         else
-          echo -e "  ${C_BOLD}Egress IPv6:${C_RESET} ${C_YELLOW}Detection timed out or unavailable${C_RESET}"
+          echo -e "  ${C_GREY}$(_pad "Egress IPv6" $L)${C_RESET} ${C_YELLOW}Detection timed out or unavailable${C_RESET}"
         fi
       ;;
       *) :;;
     esac
-    echo -e "  ${C_BOLD}Account:${C_RESET} ${acct:-unknown}  ${C_GREY}|${C_RESET}  ${C_BOLD}PID:${C_RESET} $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}|${C_RESET}  ${C_BOLD}Host IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo Failed)"
+    echo -e "  ${C_GREY}$(_pad "Account" $L)${C_RESET} ${acct:-unknown}  ${C_GREY}·${C_RESET}  PID $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}·${C_RESET}  Host ${C_YELLOW}$(_pub_ip -4 || echo "Query failed")${C_RESET}"
+    echo -e "  ${C_GREY}$(_pad "Shortcut" $L)${C_RESET} ${scc}${sc}${C_RESET}"
   fi
 }
 
@@ -928,17 +956,24 @@ _internal_cron_handler() {
 # --- Main Menu ---
 main_menu() {
   clear
-  echo -e "${C_BOLD}=== OpenConnect Master v7.7.7 (Final) ===${C_RESET}"
+  sep
+  echo -e "    ${C_BOLD}🚀  OpenConnect Master Manager${C_RESET}    ${C_GREY}v7.7.7 (Final)${C_RESET}"
+  sep
   echo
-  show_status
+  # Status is display-only: any lookup failure inside must not break the menu.
+  show_status || true
+  echo
+  echo -e "  ${C_GREEN}1)${C_RESET} 🛡️  ${C_GREEN}Default Mode${C_RESET}${C_GREY} (Global VPN, protects SSH)${C_RESET}"
+  echo -e "  ${C_GREEN}2)${C_RESET} 🔌 ${C_GREEN}ocproxy Mode${C_RESET}${C_GREY} (SOCKS5, IPv4 only)${C_RESET}"
+  echo -e "  ${C_GREEN}3)${C_RESET} 🌐 ${C_GREEN}Netns Mode${C_RESET}${C_GREY} (SOCKS5, IPv4 + IPv6)${C_RESET}"
+  echo -e "  ${C_RED}4)${C_RESET} ⛔ ${C_RED}Stop VPN${C_RESET}"
   sep
-  local pad=40
-  printf '  %b1.%b %s%b2.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "Default Mode (Global VPN, SSH-safe)" $pad)" "$C_GREEN" "$C_RESET" "ocproxy Mode (SOCKS5, IPv4 only)"
-  printf '  %b3.%b %s%b4.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "Netns Mode (SOCKS5, IPv4 + IPv6)" $pad)" "$C_RED" "$C_RESET" "Stop VPN"
-  sep
-  printf '  %b5.%b %s%b6.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "Manage VPN Accounts" $pad)" "$C_GREY" "$C_RESET" "Cron / Daemon Jobs"
-  printf '  %b7.%b %s%b8.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "Check / Install Dependencies" $pad)" "$C_GREY" "$C_RESET" "Test Netns IPv6"
-  printf '  %b9.%b %s%b0.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "Uninstall" $pad)" "$C_GREY" "$C_RESET" "Exit"
+  echo -e "  ${C_CYAN}5)${C_RESET} 👤 Manage VPN Accounts"
+  echo -e "  ${C_CYAN}6)${C_RESET} 🗓️  Cron / Daemon Jobs"
+  echo -e "  ${C_CYAN}7)${C_RESET} 📦 Check / Install Dependencies"
+  echo -e "  ${C_CYAN}8)${C_RESET} 🧪 Test Netns IPv6"
+  echo -e "  ${C_CYAN}9)${C_RESET} 🗑️  Uninstall"
+  echo -e "  ${C_GREY}0)${C_RESET} 🚪 Exit"
   echo
   # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
   # menu loop forever, issuing two public-IP lookups per iteration. read fails on EOF.

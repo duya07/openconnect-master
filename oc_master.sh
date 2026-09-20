@@ -293,6 +293,30 @@ _wait_pid_gone() {
   kill -9 "$pid" 2>/dev/null || true
 }
 
+# --- 公网 IP 查询 ---
+# 只用单一 provider（原 ip.p3terx.com）时，那家一挂整个状态区就只剩"查询失败"——
+# 实测 ip.p3terx.com 已完全连不上（80/443 均 Failed to connect，连续 10 次 0 成功），
+# 因此改为按顺序回退多个 provider，首个是实测最稳的。
+_PUB_PROVIDERS4=("https://api.ipify.org" "https://ifconfig.me/ip" "https://ip.p3terx.com")
+# IPv6 通常不可用，失败要快：候选少、超时短，避免状态区卡十几秒。
+_PUB_PROVIDERS6=("https://api64.ipify.org" "https://ifconfig.me/ip")
+# $1=-4/-6；$2=可选 socks5h 代理。成功打印地址并返回 0，全部失败返回 1。
+_pub_ip() {
+  local fam="$1" proxy="${2:-}" url out
+  local list=("${_PUB_PROVIDERS4[@]}")
+  local tmo=(-s -A "Mozilla/5.0" --connect-timeout 4 --max-time 8)
+  if [ "$fam" = "-6" ]; then
+    list=("${_PUB_PROVIDERS6[@]}")
+    tmo=(-s -A "Mozilla/5.0" --connect-timeout 3 --max-time 5)
+  fi
+  [ -n "$proxy" ] && tmo=(-s -A "Mozilla/5.0" --connect-timeout 6 --max-time 12 -x "$proxy")
+  for url in "${list[@]}"; do
+    out=$("$CURL_CMD" "$fam" "${tmo[@]}" "$url" 2>/dev/null | head -n1 | tr -d '\r\n[:space:]')
+    [ -n "$out" ] && { echo "$out"; return 0; }
+  done
+  return 1
+}
+
 # --- IPv6 连通性测试 ---
 test_netns_ipv6() {
   local test_passed=0
@@ -525,7 +549,7 @@ _execute_with_safety_net() {
   if "$func_to_run"; then
     trap - SIGINT # 成功后解除陷阱
     [ "$job" != "none" ] && atrm "$job" && log "连接稳定, 已取消保底任务"
-    show_status
+    show_status || true
   else
     trap - SIGINT # 失败后解除陷阱
     log_err "启动过程失败，请检查日志。"
@@ -742,56 +766,59 @@ stop_vpn() {
 
 # --- 状态显示 ---
 show_status() {
-  local ip_provider="ip.p3terx.com"; local curl_opts=(-s -A "Mozilla/5.0" --connect-timeout 4 --max-time 8)
   local sc; sc=$(_shortcut_state)
+  local L=10
+  local scc="${C_GREY}"; case "$sc" in *"✓"*) scc="${C_GREEN}";; esac
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then
-    echo -e "${C_BOLD}VPN 状态:${C_RESET} ${C_RED}🔴 停止${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}快捷命令:${C_RESET} ${sc}"
-    echo -e "${C_BOLD}公网 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "查询失败")  ${C_GREY}|${C_RESET}  ${C_BOLD}公网 IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "无/查询失败")"
+    echo -e "  ${C_GREY}$(_pad "状态" $L)${C_RESET} ${C_RED}🔴 停止${C_RESET}"
+    echo -e "  ${C_GREY}$(_pad "公网 IPv4" $L)${C_RESET} $(_pub_ip -4 || echo "查询失败")"
+    echo -e "  ${C_GREY}$(_pad "公网 IPv6" $L)${C_RESET} $(_pub_ip -6 || echo "无 / 查询失败")"
+    echo -e "  ${C_GREY}$(_pad "快捷命令" $L)${C_RESET} ${scc}${sc}${C_RESET}"
   else
     local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
     local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
-    echo -e "${C_BOLD}VPN 状态:${C_RESET} ${C_GREEN}🟢 运行中${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}模式:${C_RESET} ${MODE:-未知}  ${C_GREY}|${C_RESET}  ${C_BOLD}协议:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}快捷命令:${C_RESET} ${sc}"
+    local mname="${MODE:-未知}"; case "${MODE:-}" in default) mname="默认全局";; ocproxy) mname="ocproxy";; netns) mname="Netns";; esac
+    echo -e "  ${C_GREY}$(_pad "状态" $L)${C_RESET} ${C_GREEN}🟢 运行中${C_RESET}  ${C_GREY}·${C_RESET}  ${C_BOLD}${mname}${C_RESET} 模式  ${C_GREY}·${C_RESET}  协议 ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
     
     case "${MODE:-}" in
       default)
-        echo -e "  ${C_BOLD}出口 IPv4:${C_RESET} ${C_YELLOW}$($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 失败)${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}出口 IPv6:${C_RESET} ${C_YELLOW}$($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 无/失败)${C_RESET}"
+        echo -e "  ${C_GREY}$(_pad "出口" $L)${C_RESET} ${C_YELLOW}$(_pub_ip -4 || echo 失败)${C_RESET}  ${C_GREY}·${C_RESET}  IPv6 ${C_YELLOW}$(_pub_ip -6 || echo 无/失败)${C_RESET}"
       ;;
       ocproxy)
-        local sip4; sip4=$($CURL_CMD -x "socks5h://127.0.0.1:${SOCKS_PORT}" -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo "查询失败")
-        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}  ${C_GREY}|${C_RESET}  ${C_BOLD}出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        local sip4; sip4=$(_pub_ip -4 "socks5h://127.0.0.1:${SOCKS_PORT}" || echo "查询失败")
+        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
+        echo -e "  ${C_GREY}$(_pad "出口" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
       ;;
       netns)
         local f_info; f_info="${FORWARDER:-socat}"
-        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) by ${f_info})${C_RESET}"
+        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
-        local curl_opts_socks=(-s -A "Mozilla/5.0" --connect-timeout 8 --max-time 15)
         
-        local sip4; sip4=$($CURL_CMD -x "$socks_proxy" -4 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "查询失败")
-        echo -e "  ${C_BOLD}出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        local sip4; sip4=$(_pub_ip -4 "$socks_proxy" || echo "查询失败")
+        echo -e "  ${C_GREY}$(_pad "出口" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
         
-        local sip6="";
-        sip6=$($CURL_CMD -x "$socks_proxy" -6 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "")
-        
-        if [ -z "$sip6" ] || [[ "$sip6" == *"查询失败"* ]]; then
-          sip6=$($CURL_CMD -x "$socks_proxy" -6 "${curl_opts_socks[@]}" "https://api64.ipify.org" 2>/dev/null || echo "")
-        fi
+        local sip6=""
+        # 必须有 || true：_pub_ip 在无 IPv6 时返回非 0，裸赋值失败会触发 set -e
+        # 把整个脚本杀掉（表现为菜单渲染到"出口"就没了、返回码 1）。
+        sip6="$(_pub_ip -6 "$socks_proxy" || true)"
         
         if [ -z "$sip6" ] && [ -n "${NETNS_NAME:-}" ]; then
-          sip6=$("$IP_CMD" netns exec "${NETNS_NAME}" curl -6 -s --connect-timeout 5 --max-time 10 "$ip_provider" 2>/dev/null | head -n1 || echo "")
+          sip6=$("$IP_CMD" netns exec "${NETNS_NAME}" curl -6 -s --connect-timeout 5 --max-time 10 "${_PUB_PROVIDERS6[0]}" 2>/dev/null | head -n1 | tr -d '\r\n[:space:]' || echo "")
           [ -n "$sip6" ] && sip6="${sip6} ${C_GREY}(Netns内检测)${C_RESET}"
         fi
         
-        if [ -n "$sip6" ] && [[ "$sip6" != *"查询失败"* ]]; then
-          echo -e "  ${C_BOLD}出口 IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
+        if [ -n "$sip6" ]; then
+          echo -e "  ${C_GREY}$(_pad "出口 IPv6" $L)${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
         else
-          echo -e "  ${C_BOLD}出口 IPv6:${C_RESET} ${C_YELLOW}检测超时或不可用${C_RESET}"
+          echo -e "  ${C_GREY}$(_pad "出口 IPv6" $L)${C_RESET} ${C_YELLOW}检测超时或不可用${C_RESET}"
         fi
         
       ;;
       *) :;;
     esac
-    echo -e "  ${C_BOLD}账户:${C_RESET} ${acct:-未知}  ${C_GREY}|${C_RESET}  ${C_BOLD}PID:${C_RESET} $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}|${C_RESET}  ${C_BOLD}本机 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo 失败)"
+    echo -e "  ${C_GREY}$(_pad "账户" $L)${C_RESET} ${acct:-未知}  ${C_GREY}·${C_RESET}  PID $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}·${C_RESET}  本机 ${C_YELLOW}$(_pub_ip -4 || echo 查询失败)${C_RESET}"
+    echo -e "  ${C_GREY}$(_pad "快捷命令" $L)${C_RESET} ${scc}${sc}${C_RESET}"
   fi
 }
 
@@ -906,17 +933,24 @@ _internal_cron_handler() {
 # --- 主菜单 ---
 main_menu() {
   clear
-  echo -e "${C_BOLD}=== OpenConnect Master v7.7.7 (Final) ===${C_RESET}"
+  sep
+  echo -e "    ${C_BOLD}🚀  OpenConnect Master Manager${C_RESET}    ${C_GREY}v7.7.7 (Final)${C_RESET}"
+  sep
   echo
-  show_status
+  # 状态显示只是展示：它内部任何查询失败都不该中断主菜单（见 _pub_ip 的 set -e 陷阱）
+  show_status || true
+  echo
+  echo -e "  ${C_GREEN}1)${C_RESET} 🛡️  ${C_GREEN}默认模式${C_RESET}${C_GREY}（全局 VPN，保护 SSH）${C_RESET}"
+  echo -e "  ${C_GREEN}2)${C_RESET} 🔌 ${C_GREEN}ocproxy 模式${C_RESET}${C_GREY}（SOCKS5，仅 IPv4）${C_RESET}"
+  echo -e "  ${C_GREEN}3)${C_RESET} 🌐 ${C_GREEN}Netns 模式${C_RESET}${C_GREY}（SOCKS5，IPv4 + IPv6）${C_RESET}"
+  echo -e "  ${C_RED}4)${C_RESET} ⛔ ${C_RED}停止 VPN${C_RESET}"
   sep
-  local pad=40
-  printf '  %b1.%b %s%b2.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "默认模式（全局 VPN，保护 SSH）" $pad)" "$C_GREEN" "$C_RESET" "ocproxy 模式（SOCKS5，仅 IPv4）"
-  printf '  %b3.%b %s%b4.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "Netns 模式（SOCKS5，IPv4 + IPv6）" $pad)" "$C_RED" "$C_RESET" "停止 VPN"
-  sep
-  printf '  %b5.%b %s%b6.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "VPN 账户管理" $pad)" "$C_GREY" "$C_RESET" "定时 / 守护任务"
-  printf '  %b7.%b %s%b8.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "检查 / 安装依赖" $pad)" "$C_GREY" "$C_RESET" "Netns IPv6 连通性测试"
-  printf '  %b9.%b %s%b0.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "卸载" $pad)" "$C_GREY" "$C_RESET" "退出"
+  echo -e "  ${C_CYAN}5)${C_RESET} 👤 VPN 账户管理"
+  echo -e "  ${C_CYAN}6)${C_RESET} 🗓️  定时 / 守护任务"
+  echo -e "  ${C_CYAN}7)${C_RESET} 📦 检查 / 安装依赖"
+  echo -e "  ${C_CYAN}8)${C_RESET} 🧪 Netns IPv6 连通性测试"
+  echo -e "  ${C_CYAN}9)${C_RESET} 🗑️  卸载"
+  echo -e "  ${C_GREY}0)${C_RESET} 🚪 退出"
   echo
   # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，
   # 每轮还会发两次公网 IP 查询。read 失败正是 EOF 的情形。
