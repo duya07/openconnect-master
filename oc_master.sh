@@ -474,7 +474,7 @@ EOT
   while true; do
     clear; title "🔐 管理 VPN 账户 ($ACCOUNTS_FILE)"; sep
     grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  文件为空。"
-    sep; echo "  1) 添加  2) 删除  3) 返回"; read -rp "选择 [1-3]: " c
+    sep; echo "  1) 添加  2) 删除  3) 返回"; read -rp "选择 [1-3]: " c || { echo; log_info "标准输入已结束，返回。"; return 0; }
     case "$c" in
       1) read -rp "显示名: " d; read -rp "用户: " u; read -sp "密码: " p; echo; read -rp "主机: " h; read -rp "认证组(可选): " g
          [ -z "$d" ] || [ -z "$u" ] || [ -z "$p" ] || [ -z "$h" ] && { log_err "必填项不能为空"; read -n1 -s -p "按任意键继续"; continue; }
@@ -587,7 +587,7 @@ _start_ocproxy_logic() {
     socks_port="$SOCKS_PORT"
     _check_port_free "$socks_port" || { log_err "重连端口 ${socks_port} 当前被占用，本次放弃重连"; return 1; }
   else
-    while true;do read -rp "请输入SOCKS5监听端口 (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port"||{ log_err "端口已被占用";continue; }; break; done
+    while true;do read -rp "请输入SOCKS5监听端口 (e.g. 1080): " socks_port || { echo; log_err "标准输入已结束，取消启动。"; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port"||{ log_err "端口已被占用";continue; }; break; done
   fi
   
   log_info "正在启动 ocproxy 模式 (协议: ${VPN_PROTOCOL:-anyconnect}, 监听地址: $listen_addr)...";
@@ -613,7 +613,7 @@ start_netns_mode() {
 }
 _start_netns_logic() {
   local socks_port
-  while true;do read -rp "请输入SOCKS5监听端口 (e.g. 8585): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port" || { log_err "端口已被占用"; continue; }; break; done
+  while true;do read -rp "请输入SOCKS5监听端口 (e.g. 8585): " socks_port || { echo; log_err "标准输入已结束，取消启动。"; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port" || { log_err "端口已被占用"; continue; }; break; done
   
   local listen_addr="127.0.0.1"
   # || yn=""：非交互调用（管道/无终端）时 read 会 EOF 并返回非 0，裸 read 会被 set -e
@@ -1053,7 +1053,7 @@ manage_cron() {
     echo -e "  2) 添加定时关闭任务"
     echo -e "  3) 清除所有此脚本相关的定时任务"
     echo -e "  4) 返回主菜单"
-    read -rp "请选择 [1-4]: " c
+    read -rp "请选择 [1-4]: " c || { echo; log_info "标准输入已结束，返回。"; return 0; }
     case "$c" in
       1) log_warn "守护任务目前仅支持 [默认] 和 [ocproxy] 模式。"
          (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * $SCRIPT_PATH _internal_check_health"; } | crontab -

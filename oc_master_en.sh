@@ -489,7 +489,7 @@ EOT
   while true; do
     clear; title "🔐 Manage VPN Accounts ($ACCOUNTS_FILE)"; sep
     grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  File is empty."
-    sep; echo "  1) Add  2) Delete  3) Back"; read -rp "Select [1-3]: " c
+    sep; echo "  1) Add  2) Delete  3) Back"; read -rp "Select [1-3]: " c || { echo; log_info "Standard input ended, returning."; return 0; }
     case "$c" in
       1) read -rp "Display Name: " d; read -rp "User: " u; read -sp "Password: " p; echo; read -rp "Host: " h; read -rp "Auth Group (Optional): " g
          [ -z "$d" ] || [ -z "$u" ] || [ -z "$p" ] || [ -z "$h" ] && { log_err "Required fields cannot be empty"; read -n1 -s -p "Press any key to continue"; continue; }
@@ -601,7 +601,7 @@ _start_ocproxy_logic() {
     socks_port="$SOCKS_PORT"
     _check_port_free "$socks_port" || { log_err "Reconnect port ${socks_port} is currently in use, giving up this round"; return 1; }
   else
-    while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 1080): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port"||{ log_err "Port is already in use";continue; }; break; done
+    while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 1080): " socks_port || { echo; log_err "Standard input ended, start cancelled."; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port"||{ log_err "Port is already in use";continue; }; break; done
   fi
   
   log_info "Starting ocproxy mode (Protocol: ${VPN_PROTOCOL:-anyconnect}, listening on: $listen_addr)...";
@@ -628,7 +628,7 @@ start_netns_mode() {
 }
 _start_netns_logic() {
   local socks_port
-  while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 8585): " socks_port; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port" || { log_err "Port is already in use"; continue; }; break; done
+  while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 8585): " socks_port || { echo; log_err "Standard input ended, start cancelled."; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port" || { log_err "Port is already in use"; continue; }; break; done
   
   local listen_addr="127.0.0.1"
   # || yn="": in non-interactive use (pipe / no terminal) read hits EOF and returns
@@ -1085,7 +1085,7 @@ manage_cron() {
     echo -e "  2) Add a scheduled stop task"
     echo -e "  3) Clear all cron jobs for this script"
     echo -e "  4) Back to Main Menu"
-    read -rp "Please select [1-4]: " c
+    read -rp "Please select [1-4]: " c || { echo; log_info "Standard input ended, returning."; return 0; }
     case "$c" in
       1) log_warn "Daemon task currently supports [Default] and [ocproxy] modes only."
          (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * $SCRIPT_PATH _internal_check_health"; } | crontab -
