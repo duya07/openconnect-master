@@ -181,6 +181,8 @@ When starting any mode, you are asked which protocol to use right after choosing
 - IPv4 and IPv6 dual-stack support
 - Access via SOCKS5 proxy
 - Option for local or remote listening
+- Two port-forwarding backends: `socat` (default) and `iptables` double NAT (used automatically when socat is missing); menu `10) Port forwarding backend` switches between **auto / socat / iptables**
+- Optional **SOCKS5 username/password**: asked at startup, empty means anonymous; once enabled the main menu shows the auth info
 
 **Usage**:
 ```bash
@@ -370,6 +372,9 @@ ps aux | grep openconnect
 - 🔧 **Fix**: In the Netns stop path, a failing `eval iptables -D` (rule already removed elsewhere) aborted the whole stop flow via `set -e`, leaving processes and the netns behind
 - 🔧 **Fix**: After a failed start, `stop_vpn` took the "not running" early exit and left the state file plus the policy routes (ip rule) behind; machines with the health cron installed would retry the bad account every 5 minutes
 - 🔧 **Fix**: The ocproxy health reconnect never worked under cron - the reconnect logic starts with an interactive port prompt, and without a terminal `read` hits EOF and `set -e` kills the flow instantly. Reconnects now reuse the port saved in the state file; also removed the dead link to the deleted docs/FAQ.md
+- ✨ **New**: Menu `10) Port forwarding backend` switches between **auto / socat / iptables double NAT**. The preference is stored in `/var/lib/oc-master/forwarder` and applied the next time Netns mode starts; precedence is the `OCM_FORWARDER` env var > menu setting > auto (socat first)
+- ✨ **New**: Netns mode supports an optional **SOCKS5 username/password**, asked at startup (empty means anonymous); gost is started as `socks5://user:pass@host:port`. Both fields reject `@ : /` quotes backslash and blanks (they break gost's URL parsing); the state file is written with `%q` escaping and tightened to 600; the main menu shows the listening address and the auth info on the SOCKS line
+- 🔧 **Fix**: In `_fwd_setup_iptables`, `dst` and `socks_port` were assigned in the same `local` statement, so the port never took effect (it only worked because bash's dynamic scope happened to find a variable of that name in the caller); split into two `local` statements
 
 ### v7.7.6 (2025-01-10)
 
