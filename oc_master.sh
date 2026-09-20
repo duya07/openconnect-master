@@ -672,6 +672,28 @@ _start_netns_logic() {
     log_err "OpenConnect 在 Netns 中启动失败或 TUN 接口未能正常启动"; return 1
   fi
 
+  # 光看 tun0 存在还不够：实测出现过"TUN 已就绪"但 VPN 的默认路由还没生效的情况，
+  # 那时脚本继续往下走，gost 就以宿主出口（本机公网 IP）对外了——主菜单显示"运行中"，
+  # 实际完全没走 VPN。这里改成先等路由真的生效，等不到就判定启动失败，交给
+  # _execute_with_safety_net 走失败分支（它会 stop_vpn 并撤掉保底任务）。
+  local vpn_ready=0 i
+  log_info "等待 Netns 内 VPN 路由生效..."
+  for ((i=1; i<=15; i++)); do
+    # 判据一：默认路由已指向 tun（VPN 接管了默认路由；本网关就是这种）
+    if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then
+      vpn_ready=1; break
+    fi
+    # 判据二：已经能通外网（有些网关不抢默认路由，只下发特定网段）
+    if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+      vpn_ready=1; break
+    fi
+    sleep 2
+  done
+  if [ "$vpn_ready" -eq 0 ]; then
+    log_err "Netns 内 VPN 路由在 30 秒内未生效，判定启动失败"; return 1
+  fi
+  log "Netns 内 VPN 已生效 (等待 $(( (i-1) * 2 )) 秒)"
+
   log_info "测试 Netns 内通过 VPN 的 IPv4 网络连通性...";
   if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then
     log "Netns 内 VPN IPv4 网络连通性正常"

@@ -690,6 +690,31 @@ _start_netns_logic() {
     log_err "Failed to start OpenConnect in Netns or the TUN interface did not come up"; return 1
   fi
 
+  # tun0 existing is not enough: measured cases where the TUN reported "ready" but the
+  # VPN default route had not taken effect yet. The script used to continue anyway, and
+  # gost then reached the outside through the host (its own public IP) - the menu showed
+  # "running" while nothing actually went through the VPN. Now we wait for the route to
+  # really take effect; if it never does, startup fails and _execute_with_safety_net runs
+  # the rollback branch (stop_vpn + cancel the scheduled safety-net job).
+  local vpn_ready=0 i
+  log_info "Waiting for the VPN route inside Netns to take effect..."
+  for ((i=1; i<=15; i++)); do
+    # Check 1: the default route now points at tun (the VPN took over the default route)
+    if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then
+      vpn_ready=1; break
+    fi
+    # Check 2: outbound traffic already works (some gateways only push specific subnets)
+    if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+      vpn_ready=1; break
+    fi
+    sleep 2
+  done
+  if [ "$vpn_ready" -eq 0 ]; then
+    log_err "The VPN route inside Netns did not take effect within 30s; treating startup as failed"
+    return 1
+  fi
+  log "VPN inside Netns is effective (waited $(( (i-1) * 2 ))s)"
+
   log_info "Testing IPv4 connectivity via VPN inside Netns...";
   if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then
     log "VPN IPv4 connectivity inside Netns is OK"
