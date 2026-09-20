@@ -375,6 +375,7 @@ ps aux | grep openconnect
 - 🔧 **修复**：ocproxy 模式的守护重连在 cron 环境下完全不可用——重连逻辑第一步是交互式端口输入，无终端时 `read` 立即 EOF 并被 `set -e` 终止。守护重连现复用状态文件里保存的端口；移除了指向已删除的 docs/FAQ.md 的失效链接
 - ✨ **新增**：Netns 模式按转发后端拆成两个启动项——`3) Netns 模式 (socat 转发)` 与 `4) Netns 模式 (iptables 双 NAT)`，直接选，不再需要先切"偏好"。选 socat 时若 socat 装不上会明确拒绝启动，不会悄悄降级；`OCM_FORWARDER` 环境变量仍可一次性覆盖，供脚本化调用
 - ✨ **新增**：Netns 模式支持可选 **SOCKS5 用户名/密码**。启动时询问（留空即匿名），gost 以 `socks5://user:pass@host:port` 启动；用户名/密码拒绝含 `@ : /` 引号 反斜杠 空白（这些会破坏 gost 的 URL 解析）；状态文件用 `%q` 转义写入并收紧为 600；主菜单会在 SOCKS 行显示监听地址与认证信息
+- 🔧 **修复**：**iptables 双 NAT 后端在部分机器上完全不转发**。本机产生的流量经 OUTPUT DNAT 后源地址仍是 `127.0.0.1`，netfilter 会随后重新路由（`ip_route_me_harder`），内核按 `route_localnet` 判断 `127.0.0.0/8` 能否从这个接口出去——默认 `0` 表示不能，包被当 martian 丢弃，连 POSTROUTING 都到不了（实测：DNAT 计数一路涨、SNAT 计数恒为 0、veth 抓不到任何包）。此前在测试机上"能用"只是因为那台机器的全局 `all=1`（内核用 `IN_DEV_ORCONF`，`all` 与接口值取 OR），属于环境巧合。现在启动时会把 `veth_ocm_h` 的 `route_localnet` 置 1，只放开脚本自己建的这个接口，不碰全局 `all`
 - 🔧 **修复**：`_fwd_setup_iptables` 里 `dst` 与 `socks_port` 写在同一条 `local` 语句上，导致端口取不到值（靠 bash 动态作用域偶然拿到调用方的同名变量才没出错），拆成两条 `local`
 
 ### v7.7.6 (2025-01-10)
