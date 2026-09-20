@@ -317,6 +317,19 @@ _pub_ip() {
   return 1
 }
 
+# 判断 netns 模式的 VPN 是否真的可用——判据是"netns 内的实际出口 ≠ 本机出口"，
+# 而不是"tun0 在不在"或"ping 通不通"（那两个都会假阳性，原因见 _start_netns_logic）。
+# 返回 0 = 可用；1 = 明确不可用；2 = 无法判断（连本机出口都查不到，例如网络受限）。
+# 启动流程与守护任务共用同一个函数，避免两处判据日后漂移。
+_netns_vpn_probe() {
+  local host_ip ns_ip
+  host_ip="$(_pub_ip -4 2>/dev/null || true)"
+  [ -n "$host_ip" ] || return 2
+  ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
+  if [ -n "$ns_ip" ] && [ "$ns_ip" != "$host_ip" ]; then return 0; fi
+  return 1
+}
+
 # --- IPv6 连通性测试 ---
 test_netns_ipv6() {
   local test_passed=0
@@ -680,16 +693,16 @@ _start_netns_logic() {
   # 路由、随后连接中断又把 tun0 删掉的情形——那一瞬间静态判据全都成立，但流量已经
   # 回落到 veth→宿主，gost 于是以本机公网 IP 对外（主菜单显示运行中，实际没走 VPN）。
   # 所以以后者的直接证据为准：netns 内的实际出口不再等于本机出口。
-  local vpn_ready=0 i host_ip="" ns_ip=""
-  host_ip="$(_pub_ip -4 2>/dev/null || true)"
+  local vpn_ready=0 i probe_rc=1
   log_info "等待 Netns 内 VPN 真正可用..."
   for ((i=1; i<=6; i++)); do
-    ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
-    if [ -n "$ns_ip" ] && [ -n "$host_ip" ] && [ "$ns_ip" != "$host_ip" ]; then vpn_ready=1; break; fi
+    probe_rc=0; _netns_vpn_probe || probe_rc=$?
+    [ "$probe_rc" -eq 0 ] && { vpn_ready=1; break; }
+    [ "$probe_rc" -eq 2 ] && break   # 宿主出口都查不到，交给下面的路由判据
     sleep 2
   done
-  # 宿主出口都查不到（网络受限）时退回静态判据，总比完全不判强
-  if [ "$vpn_ready" -eq 0 ] && [ -z "$host_ip" ]; then
+  # 宿主出口查不到（网络受限）时退回静态判据，总比完全不判强
+  if [ "$vpn_ready" -eq 0 ] && [ "$probe_rc" -eq 2 ]; then
     log_warn "无法取得宿主出口 IP，改用路由判据"
     for ((i=1; i<=6; i++)); do
       if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then vpn_ready=1; break; fi
@@ -1106,6 +1119,21 @@ _internal_cron_handler() {
   local a="$1"; shift; check_root
   case "$a" in
     _internal_check_health)
+      # netns 模式单独处理：它不自动重连（重建 netns + 重新认证的副作用大，也容易和
+      # 用户的手动操作打架），但绝不能什么都不做——连接断了而接口/state 还在时，
+      # gost 会回落走宿主出口，主菜单显示"运行中"而实际完全没走 VPN。
+      # 一旦明确探测到不可用就做一次彻底停止，让状态如实变成"停止"，用户看到后自己重连。
+      local _mode=""
+      [ -f "$STATE_FILE" ] && _mode="$(grep '^MODE=' "$STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)"
+      if [ "$_mode" = "netns" ]; then
+        local _rc=0; _netns_vpn_probe || _rc=$?
+        # 只有"明确不可用"(1) 才动手；"无法判断"(2) 时保持原状，避免网络抖动误停
+        if [ "$_rc" -eq 1 ]; then
+          log_warn "守护进程: Netns 模式的 VPN 已不可用，执行停止清理（不自动重连）。"
+          stop_vpn
+        fi
+        return 0
+      fi
       if ! is_vpn_running && [ -f "$STATE_FILE" ]; then
         log_info "守护进程: 检测到连接断开, 正在尝试自动重连..."; 
         . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"

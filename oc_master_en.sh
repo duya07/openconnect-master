@@ -332,6 +332,20 @@ _pub_ip() {
   return 1
 }
 
+# Whether the VPN in netns mode is really usable: the criterion is "the egress seen inside
+# the netns differs from the host egress", NOT "does tun0 exist" or "does ping work" (both
+# give false positives; see the note in _start_netns_logic).
+# 0 = usable; 1 = definitely unusable; 2 = cannot tell (even the host egress is unknown,
+# e.g. on a restricted network). Startup and the daemon share it so the two cannot drift.
+_netns_vpn_probe() {
+  local host_ip ns_ip
+  host_ip="$(_pub_ip -4 2>/dev/null || true)"
+  [ -n "$host_ip" ] || return 2
+  ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
+  if [ -n "$ns_ip" ] && [ "$ns_ip" != "$host_ip" ]; then return 0; fi
+  return 1
+}
+
 # --- IPv6 Connectivity Test ---
 test_netns_ipv6() {
   local test_passed=0
@@ -702,17 +716,17 @@ _start_netns_logic() {
   # has already fallen back to veth -> host, so gost egresses through the machine's own
   # public IP (the menu says "running" while nothing goes through the VPN). So the direct
   # evidence wins: the netns egress no longer equals the host egress.
-  local vpn_ready=0 i host_ip="" ns_ip=""
-  host_ip="$(_pub_ip -4 2>/dev/null || true)"
+  local vpn_ready=0 i probe_rc=1
   log_info "Waiting until the VPN inside Netns really works..."
   for ((i=1; i<=6; i++)); do
-    ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
-    if [ -n "$ns_ip" ] && [ -n "$host_ip" ] && [ "$ns_ip" != "$host_ip" ]; then vpn_ready=1; break; fi
+    probe_rc=0; _netns_vpn_probe || probe_rc=$?
+    [ "$probe_rc" -eq 0 ] && { vpn_ready=1; break; }
+    [ "$probe_rc" -eq 2 ] && break   # host egress unknown - use the route criterion below
     sleep 2
   done
   # When even the host egress cannot be resolved (restricted network), fall back to the
   # static criterion - better than not checking at all.
-  if [ "$vpn_ready" -eq 0 ] && [ -z "$host_ip" ]; then
+  if [ "$vpn_ready" -eq 0 ] && [ "$probe_rc" -eq 2 ]; then
     log_warn "Cannot determine the host egress IP; falling back to the route criterion"
     for ((i=1; i<=6; i++)); do
       if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then vpn_ready=1; break; fi
@@ -1150,6 +1164,24 @@ _internal_cron_handler() {
   local a="$1"; shift; check_root
   case "$a" in
     _internal_check_health)
+      # netns mode is handled separately: it does not auto-reconnect (rebuilding the netns
+      # and re-authenticating has heavy side effects and easily fights the user's own
+      # actions), but doing nothing is worse - when the tunnel drops while the interfaces
+      # and state file are still there, gost falls back to the host egress and the menu
+      # says "running" while nothing goes through the VPN. On a definite failure we stop
+      # and clean up, so the status honestly becomes "stopped" and the user reconnects.
+      local _mode=""
+      [ -f "$STATE_FILE" ] && _mode="$(grep '^MODE=' "$STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)"
+      if [ "$_mode" = "netns" ]; then
+        local _rc=0; _netns_vpn_probe || _rc=$?
+        # Only act on "definitely unusable" (1); on "cannot tell" (2) leave it alone so a
+        # network hiccup does not tear down a working tunnel
+        if [ "$_rc" -eq 1 ]; then
+          log_warn "Daemon: the VPN in Netns mode is no longer usable; stopping and cleaning up (no auto-reconnect)."
+          stop_vpn
+        fi
+        return 0
+      fi
       if ! is_vpn_running && [ -f "$STATE_FILE" ]; then
         log_info "Daemon: Connection loss detected, attempting to reconnect automatically..."; 
         . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"
