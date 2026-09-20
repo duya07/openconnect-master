@@ -57,7 +57,7 @@ log_err()  { echo -e "${C_RED}❌ [$VR_TAG] $1${C_RESET}" >&2; }
 log_info() { echo -e "${C_CYAN}ℹ️  [$VR_TAG] $1${C_RESET}"; }
 log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
-sep()      { echo -e "${C_GREY}────────────────────────────────────────────────────────${C_RESET}"; }
+sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "Please run as root"; exit 1; }; }
 
 # Terminal display width: non-ASCII (CJK etc.) counts as 2 columns, used to align the
@@ -1010,40 +1010,43 @@ stop_vpn() {
 
 # --- Status Display ---
 show_status() {
-  local sc; sc=$(_shortcut_state)
-  local L=12
-  local scc="${C_GREY}"; case "$sc" in *"✓"*) scc="${C_GREEN}";; esac
+  sep
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then
-    echo -e "  ${C_GREY}$(_pad "Status" $L)${C_RESET} ${C_RED}🔴 Stopped${C_RESET}"
-    echo -e "  ${C_GREY}$(_pad "Public IPv4" $L)${C_RESET} $(_pub_ip -4 || echo "Query failed")"
-    echo -e "  ${C_GREY}$(_pad "Public IPv6" $L)${C_RESET} $(_pub_ip -6 || echo "None / Query failed")"
-    echo -e "  ${C_GREY}$(_pad "Shortcut" $L)${C_RESET} ${scc}${sc}${C_RESET}"
+    title "  VPN Status: ${C_RED}🔴 Stopped${C_RESET}"
+    echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $(_pub_ip -4 || echo "Query failed")"
+    echo -e "    ${C_BOLD}Host Public IPv6:${C_RESET} $(_pub_ip -6 || echo "None/Query failed")"
+    echo -e "    ${C_BOLD}Shortcut:${C_RESET} $(_shortcut_state)"
   else
     local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL SOCKS_USER SOCKS_PASS; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
-    local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
-    local mname="${MODE:-unknown}"; case "${MODE:-}" in default) mname="Default";; ocproxy) mname="ocproxy";; netns) mname="Netns";; esac
-    echo -e "  ${C_GREY}$(_pad "Status" $L)${C_RESET} ${C_GREEN}🟢 Running${C_RESET}  ${C_GREY}·${C_RESET}  ${C_BOLD}${mname}${C_RESET} Mode  ${C_GREY}·${C_RESET}  Protocol ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
+    title "  VPN Status: ${C_GREEN}🟢 Running${C_RESET} (OpenConnect PID: $(cat "$PID_FILE" 2>/dev/null || echo N/A))"
+    if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && echo -e "    ${C_BOLD}Account:${C_RESET} $(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
+    echo -e "    ${C_BOLD}VPN Protocol:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
     
     case "${MODE:-}" in
       default)
-        echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}$(_pub_ip -4 || echo Failed)${C_RESET}  ${C_GREY}·${C_RESET}  IPv6 ${C_YELLOW}$(_pub_ip -6 || echo None/Failed)${C_RESET}"
+        echo -e "    ${C_BOLD}Mode:${C_RESET} 🛡️  Default Global"
+        echo -e "    ${C_BOLD}VPN Egress IPv4:${C_RESET} ${C_YELLOW}$(_pub_ip -4 || echo Failed)${C_RESET}"
+        echo -e "    ${C_BOLD}VPN Egress IPv6:${C_RESET} ${C_YELLOW}$(_pub_ip -6 || echo None/Failed)${C_RESET}"
       ;;
       ocproxy)
+        echo -e "    ${C_BOLD}Mode:${C_RESET} 🔌 ocproxy Proxy ${C_GREY}(IPv4 only)${C_RESET}"
+        echo -e "    ${C_BOLD}SOCKS Address:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
         local sip4; sip4=$(_pub_ip -4 "socks5h://127.0.0.1:${SOCKS_PORT}" || echo "Query failed")
-        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
-        echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        echo -e "    ${C_BOLD}SOCKS Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $(_pub_ip -4 || echo Failed)"
       ;;
       netns)
-        local f_info; f_info="${FORWARDER:-socat}"
+        echo -e "    ${C_BOLD}Mode:${C_RESET} 🌐 Network Namespace Proxy ${C_GREEN}(IPv4+IPv6)${C_RESET}"
+        local f_info; if [[ "${FORWARDER:-}" == "socat" ]]; then f_info="socat"; else f_info="iptables"; fi
         local auth_txt=""
-        [ -n "${SOCKS_USER:-}" ] && auth_txt="  ${C_YELLOW}auth ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
-        echo -e "  ${C_GREY}$(_pad "SOCKS" $L)${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}${auth_txt}  ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) · ${f_info})${C_RESET}"
+        [ -n "${SOCKS_USER:-}" ] && auth_txt=" ${C_YELLOW}auth ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
+        echo -e "    ${C_BOLD}SOCKS Address:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}${auth_txt} ${C_GREY}(gost PID: $(cat "$GOST_PID_FILE" 2>/dev/null), by ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
         [ -n "${SOCKS_USER:-}" ] && socks_proxy="socks5h://${SOCKS_USER}:${SOCKS_PASS:-}@127.0.0.1:${SOCKS_PORT}"
         
         local sip4; sip4=$(_pub_ip -4 "$socks_proxy" || echo "Query failed")
-        echo -e "  ${C_GREY}$(_pad "Egress" $L)${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        echo -e "    ${C_BOLD}SOCKS Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
         
         local sip6=""
         # The || true is required: _pub_ip returns non-zero when IPv6 is absent and a
@@ -1056,16 +1059,18 @@ show_status() {
         fi
         
         if [ -n "$sip6" ]; then
-          echo -e "  ${C_GREY}$(_pad "Egress IPv6" $L)${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
+          echo -e "    ${C_BOLD}SOCKS Egress IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
         else
-          echo -e "  ${C_GREY}$(_pad "Egress IPv6" $L)${C_RESET} ${C_YELLOW}Detection timed out or unavailable${C_RESET}"
+          echo -e "    ${C_BOLD}SOCKS Egress IPv6:${C_RESET} ${C_YELLOW}Detection timed out or unavailable${C_RESET}"
         fi
+        
+        echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $(_pub_ip -4 2>/dev/null || echo Failed)"
       ;;
-      *) :;;
+      *) echo -e "    ${C_BOLD}Mode:${C_RESET} unknown";;
     esac
-    echo -e "  ${C_GREY}$(_pad "Account" $L)${C_RESET} ${acct:-unknown}  ${C_GREY}·${C_RESET}  PID $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}·${C_RESET}  Host ${C_YELLOW}$(_pub_ip -4 || echo "Query failed")${C_RESET}"
-    echo -e "  ${C_GREY}$(_pad "Shortcut" $L)${C_RESET} ${scc}${sc}${C_RESET}"
+    echo -e "    ${C_BOLD}Shortcut:${C_RESET} $(_shortcut_state)"
   fi
+  sep
 }
 
 # --- Cron & Uninstall ---
@@ -1181,25 +1186,24 @@ _internal_cron_handler() {
 # --- Main Menu ---
 main_menu() {
   clear
-  sep
-  echo -e "    ${C_BOLD}🚀  OpenConnect Master Manager${C_RESET}    ${C_GREY}v7.7.7 (Final)${C_RESET}"
-  sep
-  echo
+  echo -e "${C_BOLD}========================================================${C_RESET}"
+  echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v7.7.7 (Final) 🚀${C_RESET}"
+  echo -e "${C_BOLD}========================================================${C_RESET}"
   # Status is display-only: any lookup failure inside must not break the menu.
   show_status || true
-  echo
-  echo -e "  ${C_GREEN}1)${C_RESET} 🛡️  ${C_GREEN}Default Mode${C_RESET}${C_GREY} (Global VPN, protects SSH)${C_RESET}"
-  echo -e "  ${C_GREEN}2)${C_RESET} 🔌 ${C_GREEN}ocproxy Mode${C_RESET}${C_GREY} (SOCKS5, IPv4 only)${C_RESET}"
-  echo -e "  ${C_GREEN}3)${C_RESET} 🌐 ${C_GREEN}Netns Mode${C_RESET}${C_GREY} (SOCKS5, IPv4 + IPv6)${C_RESET}"
-  echo -e "  ${C_RED}4)${C_RESET} ⛔ ${C_RED}Stop VPN${C_RESET}"
+  title "Main Menu:"
+  echo -e "  ${C_GREEN}1) Start: 🛡️  Default Mode (Global VPN, protects SSH)${C_RESET}"
+  echo -e "  ${C_GREEN}2) Start: 🔌 ocproxy Mode (SOCKS5, IPv4 only)${C_RESET}"
+  echo -e "  ${C_GREEN}3) Start: 🌐 Netns Mode (SOCKS5, IPv4+IPv6 Full Features)${C_RESET}"
+  echo -e "  ${C_RED}4) Stop VPN${C_RESET}"
   sep
-  echo -e "  ${C_CYAN}5)${C_RESET} 👤 Manage VPN Accounts"
-  echo -e "  ${C_CYAN}6)${C_RESET} 🗓️  Cron / Daemon Jobs"
-  echo -e "  ${C_CYAN}7)${C_RESET} 📦 Check / Install Dependencies"
-  echo -e "  ${C_CYAN}8)${C_RESET} 🧪 Test Netns IPv6"
-  echo -e "  ${C_CYAN}9)${C_RESET} 🗑️  Uninstall"
-  echo -e "  ${C_CYAN}10)${C_RESET} 🔀 Port forwarding backend${C_GREY} (now: $(_fwd_pref_label))${C_RESET}"
-  echo -e "  ${C_GREY}0)${C_RESET} 🚪 Exit"
+  echo -e "  5) ⚙️  Manage VPN Accounts"
+  echo -e "  6) 🗓️  Cron / Daemon Jobs"
+  echo -e "  7) 📦 Check/Install Dependencies"
+  echo -e "  8) 🧪 ${C_CYAN}Test Netns IPv6 Connectivity${C_RESET}"
+  echo -e "  9) 🗑️  Uninstall"
+  echo -e "  10) 🔀 Port forwarding backend ${C_GREY}(now: $(_fwd_pref_label))${C_RESET}"
+  echo -e "  0) 🚪 Exit"
   echo
   # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
   # menu loop forever, issuing two public-IP lookups per iteration. read fails on EOF.
