@@ -69,7 +69,7 @@
 - `openconnect` - OpenConnect VPN 客户端
 - `ocproxy` - ocproxy 模式所需
 - `gost` - Netns 模式的 SOCKS5 服务器
-- `socat` - Netns 模式的端口转发（推荐）
+- `socat` - Netns 模式的端口转发（必需）
 - `iptables` - 防火墙和 NAT 规则
 - `iproute2` - 网络配置工具
 
@@ -128,8 +128,6 @@ chmod +x oc_master.sh
 | 1 | `anyconnect` | Cisco AnyConnect、ocserv（默认） |
 | 2 | `pulse` | Pulse Secure / Ivanti Secure Access |
 | 3 | `nc` | Juniper Network Connect |
-
-例如某些网关必须选 `3) NC`；选 `anyconnect` 会在登录页面前就失败。
 
 ### 模式选择指南
 
@@ -202,8 +200,8 @@ chmod +x oc_master.sh
 
 示例：
 ```
-我的大学VPN|student001|mypassword|vpn.university.edu|DefaultGroup
-公司VPN|employee@company.com|companypass|vpn.company.com|
+示例网关A|user001|your_password|vpn.example.com|DefaultGroup
+示例网关B|user002|your_password|vpn2.example.com|
 ```
 
 也可以参考 [examples/vpn_accounts.example](examples/vpn_accounts.example)
@@ -341,14 +339,6 @@ ps aux | grep openconnect
 4. **SSH 连接中断**（默认模式）
    - 脚本会自动保护 SSH 连接
    - 如果仍然中断，检查策略路由配置
-
-### Netns 模式需要 socat
-
-Netns 模式的端口转发**只用 socat**，脚本不再提供 iptables 备用方案（v7.7.7 之前的版本有，已移除）。
-
-原因（tcpdump 实测）：iptables DNAT 转发在 netns 内是**全局 VPN**（网关推送默认路由，`default dev tun0`）时数据面根本不通——gost 的回包目标不在 veth 直连网段内，被默认路由吸进 tun、从 VPN 出口离开，客户端永远收不到回包；本机走 `127.0.0.1` 时还有第二重死因（DNAT 不改源地址，127/8 源进 veth 被判 martian 丢弃）。socat 是进程级转发，两段连接各自独立、主机↔netns 那段两端地址都在 veth 直连段内，不受影响。
-
-socat 缺失时启动 Netns 模式会提示安装，拒绝安装则不启动该模式。安装：菜单 7，或 `apt install socat`。
 
 ## 📊 版本历史
 

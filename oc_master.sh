@@ -9,6 +9,8 @@
 #   - 新增: OpenConnect 协议选择，支持 AnyConnect / Pulse(Ivanti) / NC(Juniper)。
 #   - 移除(Netns): iptables DNAT 备用转发（实测在 netns 全局 VPN 下回包被吸进 tun、
 #     数据面不通），socat 改为必需；旧 state 的规则清理保留兼容。
+#   - 改进: ocm 快捷命令改为启动时自动安装、状态区显示（不再占一个菜单项）；
+#     主菜单改为两列紧凑排版，状态区合并为紧凑行。
 # =================================================================
 set -euo pipefail
 
@@ -51,19 +53,37 @@ log_err()  { echo -e "${C_RED}❌ [$VR_TAG] $1${C_RESET}" >&2; }
 log_info() { echo -e "${C_CYAN}ℹ️  [$VR_TAG] $1${C_RESET}"; }
 log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
-sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
+sep()      { echo -e "${C_GREY}────────────────────────────────────────────────────────${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "请用 root 运行"; exit 1; }; }
+
+# 终端显示宽度：非 ASCII（中文等）按 2 列计，用于两列菜单对齐。
+# 显式指定 UTF-8 locale——脚本可能被 cron 或没有 LANG 的环境调用，
+# 那时 wc -m 会退化成字节数，宽度算错、菜单就会歪。
+_disp_w() {
+  local s="$1" c b
+  c=$(printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m)
+  b=$(printf '%s' "$s" | LC_ALL=C wc -c)
+  echo $(( c + (b - c) / 2 ))
+}
+_pad() { # 左对齐补空格到 N 列（末尾必须 return 0：本函数会作为 AND 列表的末尾被调用）
+  local s="$1" w="$2" cur
+  cur=$(_disp_w "$s")
+  printf '%s' "$s"
+  [ "$cur" -lt "$w" ] && printf '%*s' "$(( w - cur ))" ''
+  return 0
+}
 
 # --- ocm 快捷命令 ---
 # 用符号链接而不是拷贝：脚本自身用 readlink -f "$0" 解析真实路径，所以从
 # /usr/local/bin/ocm 调用时行为完全一致（菜单、ocm stop、_internal_* 都照常）。
 # 只接管"已经指向本脚本"的链接；同名真实文件一律不覆盖。
 install_shortcut() {
+  local quiet="${1:-}"
   local current=""
   if [ -L "$SHORTCUT_PATH" ]; then
     current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
     if [ "$current" = "$SCRIPT_PATH" ]; then
-      log "快捷命令已就绪：${SHORTCUT_PATH}"
+      [ -n "$quiet" ] || log "快捷命令已就绪：${SHORTCUT_PATH}"
       return 0
     fi
     log_err "${SHORTCUT_PATH} 已是指向别处的符号链接（${current:-未知}），拒绝覆盖。"
@@ -90,6 +110,40 @@ remove_shortcut() {
   [ -L "$SHORTCUT_PATH" ] || return 0
   current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
   [ "$current" = "$SCRIPT_PATH" ] && { rm -f "$SHORTCUT_PATH"; log "已移除快捷命令 ${SHORTCUT_PATH}"; }
+  return 0
+}
+
+# 脚本启动时自动确保快捷命令就绪（不再占用一个菜单项）。三种情况不动：
+#   - 脚本本身在 /tmp 等临时目录（下载后还没移动、或正在测试）→ 不建指向临时文件的链接
+#   - 同名实体文件、或指向别处的符号链接 → 可能是别的程序的，绝不覆盖
+# 只有"悬空链接"会被接管：那是本脚本被移动/删除后留下的残骸。
+_ensure_shortcut() {
+  local tgt=""
+  case "$SCRIPT_PATH" in /tmp/*|/var/tmp/*) return 0 ;; esac
+  if [ -L "$SHORTCUT_PATH" ]; then
+    tgt="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+    [ -n "$tgt" ] && return 0
+    rm -f "$SHORTCUT_PATH" 2>/dev/null || return 0
+  elif [ -e "$SHORTCUT_PATH" ]; then
+    return 0
+  fi
+  install_shortcut quiet >/dev/null 2>&1 || true
+  return 0
+}
+
+# 主菜单状态区用的一行摘要（纯文本，颜色由调用处套）
+_shortcut_state() {
+  local tgt="" base=""
+  if [ -L "$SHORTCUT_PATH" ]; then
+    tgt="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+    if [ "$tgt" = "$SCRIPT_PATH" ]; then echo "ocm ✓"
+    elif [ -n "$tgt" ]; then base="$(basename "$tgt")"; echo "ocm → ${base}"
+    else echo "ocm 悬空链接"; fi
+  elif [ -e "$SHORTCUT_PATH" ]; then
+    echo "ocm 非本脚本链接"
+  else
+    echo "ocm 未安装"
+  fi
   return 0
 }
 
@@ -689,40 +743,32 @@ stop_vpn() {
 # --- 状态显示 ---
 show_status() {
   local ip_provider="ip.p3terx.com"; local curl_opts=(-s -A "Mozilla/5.0" --connect-timeout 4 --max-time 8)
-  sep
+  local sc; sc=$(_shortcut_state)
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then
-    title "  VPN 状态: ${C_RED}🔴 停止${C_RESET}"
-    echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "查询失败")"
-    echo -e "    ${C_BOLD}本机公网 IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "无/查询失败")"
+    echo -e "${C_BOLD}VPN 状态:${C_RESET} ${C_RED}🔴 停止${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}快捷命令:${C_RESET} ${sc}"
+    echo -e "${C_BOLD}公网 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "查询失败")  ${C_GREY}|${C_RESET}  ${C_BOLD}公网 IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "无/查询失败")"
   else
     local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
-    title "  VPN 状态: ${C_GREEN}🟢 运行中${C_RESET} (OpenConnect PID: $(cat "$PID_FILE" 2>/dev/null || echo N/A))"
-    if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && echo -e "    ${C_BOLD}使用账户:${C_RESET} $(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
-    echo -e "    ${C_BOLD}VPN 协议:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
+    local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
+    echo -e "${C_BOLD}VPN 状态:${C_RESET} ${C_GREEN}🟢 运行中${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}模式:${C_RESET} ${MODE:-未知}  ${C_GREY}|${C_RESET}  ${C_BOLD}协议:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}快捷命令:${C_RESET} ${sc}"
     
     case "${MODE:-}" in
       default)
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🛡️  默认全局模式"
-        echo -e "    ${C_BOLD}VPN 出口 IPv4:${C_RESET} ${C_YELLOW}$($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 失败)${C_RESET}"
-        echo -e "    ${C_BOLD}VPN 出口 IPv6:${C_RESET} ${C_YELLOW}$($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 无/失败)${C_RESET}"
+        echo -e "  ${C_BOLD}出口 IPv4:${C_RESET} ${C_YELLOW}$($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 失败)${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}出口 IPv6:${C_RESET} ${C_YELLOW}$($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 无/失败)${C_RESET}"
       ;;
       ocproxy)
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🔌 ocproxy 代理 ${C_GREY}(仅 IPv4)${C_RESET}"
-        echo -e "    ${C_BOLD}SOCKS 地址:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
         local sip4; sip4=$($CURL_CMD -x "socks5h://127.0.0.1:${SOCKS_PORT}" -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo "查询失败")
-        echo -e "    ${C_BOLD}SOCKS 出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
-        echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo 失败)"
+        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}  ${C_GREY}|${C_RESET}  ${C_BOLD}出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
       ;;
       netns)
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🌐 Network Namespace 代理 ${C_GREEN}(IPv4+IPv6)${C_RESET}"
         local f_info; f_info="${FORWARDER:-socat}"
-        echo -e "    ${C_BOLD}SOCKS 地址:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost PID: $(cat "$GOST_PID_FILE" 2>/dev/null), by ${f_info})${C_RESET}"
+        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) by ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
         local curl_opts_socks=(-s -A "Mozilla/5.0" --connect-timeout 8 --max-time 15)
         
         local sip4; sip4=$($CURL_CMD -x "$socks_proxy" -4 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "查询失败")
-        echo -e "    ${C_BOLD}SOCKS 出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        echo -e "  ${C_BOLD}出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
         
         local sip6="";
         sip6=$($CURL_CMD -x "$socks_proxy" -6 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "")
@@ -737,17 +783,16 @@ show_status() {
         fi
         
         if [ -n "$sip6" ] && [[ "$sip6" != *"查询失败"* ]]; then
-          echo -e "    ${C_BOLD}SOCKS 出口 IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
+          echo -e "  ${C_BOLD}出口 IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
         else
-          echo -e "    ${C_BOLD}SOCKS 出口 IPv6:${C_RESET} ${C_YELLOW}检测超时或不可用${C_RESET}"
+          echo -e "  ${C_BOLD}出口 IPv6:${C_RESET} ${C_YELLOW}检测超时或不可用${C_RESET}"
         fi
         
-        echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo 失败)"
       ;;
-      *) echo "    ${C_BOLD}运行模式:${C_RESET} 未知";;
+      *) :;;
     esac
+    echo -e "  ${C_BOLD}账户:${C_RESET} ${acct:-未知}  ${C_GREY}|${C_RESET}  ${C_BOLD}PID:${C_RESET} $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}|${C_RESET}  ${C_BOLD}本机 IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo 失败)"
   fi
-  sep
 }
 
 # --- 定时与卸载 ---
@@ -861,27 +906,21 @@ _internal_cron_handler() {
 # --- 主菜单 ---
 main_menu() {
   clear
-  echo -e "${C_BOLD}========================================================${C_RESET}"
-  echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v7.7.7 (Final) 🚀${C_RESET}"
-  echo -e "${C_BOLD}========================================================${C_RESET}"
+  echo -e "${C_BOLD}=== OpenConnect Master v7.7.7 (Final) ===${C_RESET}"
+  echo
   show_status
-  title "主菜单:"
-  echo -e "  ${C_GREEN}1) 启动: 🛡️  默认模式 (全局VPN, 保护SSH)${C_RESET}"
-  echo -e "  ${C_GREEN}2) 启动: 🔌 ocproxy 模式 (SOCKS5, 仅IPv4)${C_RESET}"
-  echo -e "  ${C_GREEN}3) 启动: 🌐 Netns 模式 (SOCKS5, IPv4+IPv6 全功能)${C_RESET}"
-  echo -e "  ${C_RED}4) 停止 VPN${C_RESET}"
   sep
-  echo -e "  5) ⚙️  管理 VPN 账户"
-  echo -e "  6) 🗓️  设置定时/守护任务"
-  echo -e "  7) 📦 检查/安装依赖"
-  echo -e "  8) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
-  echo -e "  9) 🗑️  卸载"
-  echo -e "  ${C_CYAN}10) 🔗 安装 ocm 快捷命令 (以后直接输 ocm)${C_RESET}"
-  echo -e "  0) 🚪 退出"
+  local pad=40
+  printf '  %b1.%b %s%b2.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "默认模式（全局 VPN，保护 SSH）" $pad)" "$C_GREEN" "$C_RESET" "ocproxy 模式（SOCKS5，仅 IPv4）"
+  printf '  %b3.%b %s%b4.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "Netns 模式（SOCKS5，IPv4 + IPv6）" $pad)" "$C_RED" "$C_RESET" "停止 VPN"
+  sep
+  printf '  %b5.%b %s%b6.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "VPN 账户管理" $pad)" "$C_GREY" "$C_RESET" "定时 / 守护任务"
+  printf '  %b7.%b %s%b8.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "检查 / 安装依赖" $pad)" "$C_GREY" "$C_RESET" "Netns IPv6 连通性测试"
+  printf '  %b9.%b %s%b0.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "卸载" $pad)" "$C_GREY" "$C_RESET" "退出"
   echo
   # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，
   # 每轮还会发两次公网 IP 查询。read 失败正是 EOF 的情形。
-  read -rp "请选择 [0-9] 或 10: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
+  read -rp "请选择 [0-9]: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -896,14 +935,13 @@ main_menu() {
          log_err "Netns 模式未运行，无法测试"
        fi;;
     9) uninstall; exit 0;;
-    10) install_shortcut || true;;
     0) exit 0;;
     *) log_err "无效选项 '$c'";;
   esac
   # 选项 5/6、直接回车或输错键时，上面那条 AND 列表返回 1；而"函数最后一条语句返回
   # 非 0"会让 set -e 结束整个脚本（实测：在主菜单按一下回车程序就退出了）。
   # 显式 return 0，保证任何输入都回到菜单循环里。
-  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
+  [[ "$c" =~ ^([1-4]|7|8)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
   return 0
 }
 
@@ -911,5 +949,5 @@ main_menu() {
 case "${1:-main}" in
   _internal_*) _internal_cron_handler "$@"; exit 0 ;;
   stop) check_root; stop_vpn; exit 0 ;;
-  main|*) check_root; while true; do main_menu; done ;;
+  main|*) check_root; _ensure_shortcut; while true; do main_menu; done ;;
 esac

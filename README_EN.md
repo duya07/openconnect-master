@@ -69,7 +69,7 @@ Three Running Modes | Policy Routing Protection | Network Namespace Isolation | 
 - `openconnect` - OpenConnect VPN client
 - `ocproxy` - Required for ocproxy mode
 - `gost` - SOCKS5 server for Netns mode
-- `socat` - Port forwarding for Netns mode (recommended)
+- `socat` - Port forwarding for Netns mode (required)
 - `iptables` - Firewall and NAT rules
 - `iproute2` - Network configuration tools
 
@@ -128,8 +128,6 @@ When starting any mode, you are asked which protocol to use right after choosing
 | 1 | `anyconnect` | Cisco AnyConnect, ocserv (default) |
 | 2 | `pulse` | Pulse Secure / Ivanti Secure Access |
 | 3 | `nc` | Juniper Network Connect |
-
-For example, some gateways require `3) NC`; with `anyconnect` it fails before the login page even appears.
 
 ### Mode Selection Guide
 
@@ -202,8 +200,8 @@ DisplayName|Username|Password|VPNHost|AuthGroup(optional)
 
 Example:
 ```
-My University VPN|student001|mypassword|vpn.university.edu|DefaultGroup
-Company VPN|employee@company.com|companypass|vpn.company.com|
+Example Gateway A|user001|your_password|vpn.example.com|DefaultGroup
+Example Gateway B|user002|your_password|vpn2.example.com|
 ```
 
 See also [examples/vpn_accounts.example](examples/vpn_accounts.example)
@@ -341,14 +339,6 @@ ps aux | grep openconnect
 4. **SSH Connection Interrupted** (Default Mode)
    - Script automatically protects SSH connections
    - If still interrupted, check policy routing configuration
-
-### Netns mode requires socat
-
-Netns mode uses **socat only** for port forwarding; the script no longer ships an iptables fallback (earlier releases up to v7.7.7 had one - it has been removed).
-
-Why (measured with tcpdump): the iptables DNAT forwarder has a dead data plane whenever the netns has a **global VPN** (the gateway pushes a default route, `default dev tun0`) - gost's replies have a destination outside the veth directly-connected subnet, so the netns default route pushes them into tun and out through the VPN exit, and the client never receives a reply. Local access via `127.0.0.1` has a second, independent cause: DNAT does not rewrite the source address, and 127/8 sources entering the veth are dropped as martian. socat is a process-level forwarder whose two connection legs are independent, and both ends of the host<->netns leg live inside the veth directly-connected subnet, so it is unaffected.
-
-If socat is missing, starting Netns mode asks to install it; declining means the mode does not start. Install via menu 7, or `apt install socat`.
 
 ## 📊 Version History
 

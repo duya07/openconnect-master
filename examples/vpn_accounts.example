@@ -16,17 +16,17 @@
 # - 此文件包含敏感信息，请妥善保管
 # - 建议设置文件权限: chmod 600 /root/.vpn_accounts.env
 
-# 示例1: 大学 VPN（不需要认证组）
-我的大学VPN|student001|mypassword123|vpn.university.edu|
+# 示例1: 不需要认证组
+示例网关A|user001|your_password123|vpn.example.com|
 
-# 示例2: 公司 VPN（需要认证组）
-公司VPN|employee@company.com|CompanyPass456|vpn.company.com|DefaultGroup
+# 示例2: 需要认证组
+示例网关B|user002|YourPass456|vpn2.example.com|DefaultGroup
 
-# 示例3: 个人 VPN（使用域名）
-个人VPN Server|john.doe|MySecretPass789|my-vpn.example.com|
+# 示例3: 使用域名
+示例网关C|user003|YourPass789|my-vpn.example.com|
 
 # 示例4: 使用 IP 地址
-备用VPN|user123|pass123|192.168.1.100|GroupA
+示例网关D|user004|YourPass000|192.168.1.100|GroupA
 
 # 您的账户（请修改以下信息）
-# 我的VPN|your_username|your_password|vpn.example.com|认证组(可选)
+# 示例网关|your_username|your_password|vpn.example.com|认证组(可选)

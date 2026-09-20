@@ -9,6 +9,8 @@
 #   - Removed(Netns): iptables DNAT fallback forwarder (measured: under a global VPN inside
 #     the netns replies are swallowed by tun, so its data plane is dead). socat is now
 #     required; cleanup of legacy state is still kept for compatibility.
+#   - Improved: the ocm shortcut is installed automatically at startup and shown in the
+#     status area (no longer its own menu item); the main menu is a compact two-column layout.
 # =================================================================
 set -euo pipefail
 
@@ -53,8 +55,26 @@ log_err()  { echo -e "${C_RED}❌ [$VR_TAG] $1${C_RESET}" >&2; }
 log_info() { echo -e "${C_CYAN}ℹ️  [$VR_TAG] $1${C_RESET}"; }
 log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
-sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
+sep()      { echo -e "${C_GREY}────────────────────────────────────────────────────────${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "Please run as root"; exit 1; }; }
+
+# Terminal display width: non-ASCII (CJK etc.) counts as 2 columns, used to align the
+# two-column menu. UTF-8 locale is set explicitly - the script may be invoked from cron
+# or from an environment without LANG, where wc -m degrades to byte counts and the width
+# math (and therefore the menu) would be wrong.
+_disp_w() {
+  local s="$1" c b
+  c=$(printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m)
+  b=$(printf '%s' "$s" | LC_ALL=C wc -c)
+  echo $(( c + (b - c) / 2 ))
+}
+_pad() { # left-align, padded with spaces to N columns (must return 0: used as an AND-list tail)
+  local s="$1" w="$2" cur
+  cur=$(_disp_w "$s")
+  printf '%s' "$s"
+  [ "$cur" -lt "$w" ] && printf '%*s' "$(( w - cur ))" ''
+  return 0
+}
 
 # --- ocm Shortcut Command ---
 # Use a symlink instead of a copy: the script resolves its own real path with
@@ -63,11 +83,12 @@ check_root(){ [ "$EUID" -eq 0 ] || { log_err "Please run as root"; exit 1; }; }
 # Only takes over a link that already points at this script; an existing real
 # file at that path is never overwritten.
 install_shortcut() {
+  local quiet="${1:-}"
   local current=""
   if [ -L "$SHORTCUT_PATH" ]; then
     current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
     if [ "$current" = "$SCRIPT_PATH" ]; then
-      log "Shortcut command is already in place: ${SHORTCUT_PATH}"
+      [ -n "$quiet" ] || log "Shortcut command is already in place: ${SHORTCUT_PATH}"
       return 0
     fi
     log_err "${SHORTCUT_PATH} is a symlink pointing elsewhere (${current:-unknown}), refusing to overwrite."
@@ -95,6 +116,42 @@ remove_shortcut() {
   [ -L "$SHORTCUT_PATH" ] || return 0
   current="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
   [ "$current" = "$SCRIPT_PATH" ] && { rm -f "$SHORTCUT_PATH"; log "Removed shortcut command ${SHORTCUT_PATH}"; }
+  return 0
+}
+
+# Ensures the shortcut command exists when the script starts (it no longer occupies a
+# menu item). Three cases are left untouched:
+#   - the script lives in /tmp or another temp dir (just downloaded, or under test)
+#     -> never create a link that points at a temporary file
+#   - a real file, or a symlink pointing elsewhere -> may belong to another program
+# Only a dangling symlink is taken over: that is what a moved/deleted copy leaves behind.
+_ensure_shortcut() {
+  local tgt=""
+  case "$SCRIPT_PATH" in /tmp/*|/var/tmp/*) return 0 ;; esac
+  if [ -L "$SHORTCUT_PATH" ]; then
+    tgt="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+    [ -n "$tgt" ] && return 0
+    rm -f "$SHORTCUT_PATH" 2>/dev/null || return 0
+  elif [ -e "$SHORTCUT_PATH" ]; then
+    return 0
+  fi
+  install_shortcut quiet >/dev/null 2>&1 || true
+  return 0
+}
+
+# One-line summary for the main menu status area (plain text; the caller adds colour)
+_shortcut_state() {
+  local tgt="" base=""
+  if [ -L "$SHORTCUT_PATH" ]; then
+    tgt="$(readlink -f "$SHORTCUT_PATH" 2>/dev/null || true)"
+    if [ "$tgt" = "$SCRIPT_PATH" ]; then echo "ocm ✓"
+    elif [ -n "$tgt" ]; then base="$(basename "$tgt")"; echo "ocm → ${base}"
+    else echo "ocm dangling link"; fi
+  elif [ -e "$SHORTCUT_PATH" ]; then
+    echo "ocm is not our link"
+  else
+    echo "ocm not installed"
+  fi
   return 0
 }
 
@@ -707,40 +764,32 @@ stop_vpn() {
 # --- Status Display ---
 show_status() {
   local ip_provider="ip.p3terx.com"; local curl_opts=(-s -A "Mozilla/5.0" --connect-timeout 4 --max-time 8)
-  sep
+  local sc; sc=$(_shortcut_state)
   if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then
-    title "  VPN Status: ${C_RED}🔴 Stopped${C_RESET}"
-    echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "Query failed")"
-    echo -e "    ${C_BOLD}Host Public IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "None/Query failed")"
+    echo -e "${C_BOLD}VPN Status:${C_RESET} ${C_RED}🔴 Stopped${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Shortcut:${C_RESET} ${sc}"
+    echo -e "${C_BOLD}Public IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "Query failed")  ${C_GREY}|${C_RESET}  ${C_BOLD}Public IPv6:${C_RESET} $($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider" | head -n1 || echo "None/Query failed")"
   else
     local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
-    title "  VPN Status: ${C_GREEN}🟢 Running${C_RESET} (OpenConnect PID: $(cat "$PID_FILE" 2>/dev/null || echo N/A))"
-    if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && echo -e "    ${C_BOLD}Using Account:${C_RESET} $(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
-    echo -e "    ${C_BOLD}VPN Protocol:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
+    local acct=""; if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && acct="$(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
+    echo -e "${C_BOLD}VPN Status:${C_RESET} ${C_GREEN}🟢 Running${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Mode:${C_RESET} ${MODE:-unknown}  ${C_GREY}|${C_RESET}  ${C_BOLD}Protocol:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Shortcut:${C_RESET} ${sc}"
     
     case "${MODE:-}" in
       default)
-        echo -e "    ${C_BOLD}Running Mode:${C_RESET} 🛡️  Default (Global) Mode"
-        echo -e "    ${C_BOLD}VPN Egress IPv4:${C_RESET} ${C_YELLOW}$($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo Failed)${C_RESET}"
-        echo -e "    ${C_BOLD}VPN Egress IPv6:${C_RESET} ${C_YELLOW}$($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider"|head -n1||echo None/Failed)${C_RESET}"
+        echo -e "  ${C_BOLD}Egress IPv4:${C_RESET} ${C_YELLOW}$($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo Failed)${C_RESET}  ${C_GREY}|${C_RESET}  ${C_BOLD}Egress IPv6:${C_RESET} ${C_YELLOW}$($CURL_CMD -6 "${curl_opts[@]}" "$ip_provider"|head -n1||echo None/Failed)${C_RESET}"
       ;;
       ocproxy)
-        echo -e "    ${C_BOLD}Running Mode:${C_RESET} 🔌 ocproxy Proxy ${C_GREY}(IPv4 only)${C_RESET}"
-        echo -e "    ${C_BOLD}SOCKS Address:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
         local sip4; sip4=$($CURL_CMD -x "socks5h://127.0.0.1:${SOCKS_PORT}" -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo "Query failed")
-        echo -e "    ${C_BOLD}SOCKS Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
-        echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider"|head -n1||echo Failed)"
+        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}  ${C_GREY}|${C_RESET}  ${C_BOLD}Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
       ;;
       netns)
-        echo -e "    ${C_BOLD}Running Mode:${C_RESET} 🌐 Network Namespace Proxy ${C_GREEN}(IPv4+IPv6)${C_RESET}"
         local f_info; f_info="${FORWARDER:-socat}"
-        echo -e "    ${C_BOLD}SOCKS Address:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost PID: $(cat "$GOST_PID_FILE" 2>/dev/null), by ${f_info})${C_RESET}"
+        echo -e "  ${C_BOLD}SOCKS:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost $(cat "$GOST_PID_FILE" 2>/dev/null) by ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
         local curl_opts_socks=(-s -A "Mozilla/5.0" --connect-timeout 8 --max-time 15)
         
         local sip4; sip4=$($CURL_CMD -x "$socks_proxy" -4 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "Query failed")
-        echo -e "    ${C_BOLD}SOCKS Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
+        echo -e "  ${C_BOLD}Egress IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
         
         local sip6="";
         sip6=$($CURL_CMD -x "$socks_proxy" -6 "${curl_opts_socks[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo "")
@@ -755,17 +804,15 @@ show_status() {
         fi
         
         if [ -n "$sip6" ] && [[ "$sip6" != *"Query failed"* ]]; then
-          echo -e "    ${C_BOLD}SOCKS Egress IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
+          echo -e "  ${C_BOLD}Egress IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
         else
-          echo -e "    ${C_BOLD}SOCKS Egress IPv6:${C_RESET} ${C_YELLOW}Detection timed out or unavailable${C_RESET}"
+          echo -e "  ${C_BOLD}Egress IPv6:${C_RESET} ${C_YELLOW}Detection timed out or unavailable${C_RESET}"
         fi
-        
-        echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo Failed)"
       ;;
-      *) echo "    ${C_BOLD}Running Mode:${C_RESET} Unknown";;
+      *) :;;
     esac
+    echo -e "  ${C_BOLD}Account:${C_RESET} ${acct:-unknown}  ${C_GREY}|${C_RESET}  ${C_BOLD}PID:${C_RESET} $(cat "$PID_FILE" 2>/dev/null || echo N/A)  ${C_GREY}|${C_RESET}  ${C_BOLD}Host IPv4:${C_RESET} $($CURL_CMD -4 "${curl_opts[@]}" "$ip_provider" 2>/dev/null | head -n1 || echo Failed)"
   fi
-  sep
 }
 
 # --- Cron & Uninstall ---
@@ -881,27 +928,21 @@ _internal_cron_handler() {
 # --- Main Menu ---
 main_menu() {
   clear
-  echo -e "${C_BOLD}========================================================${C_RESET}"
-  echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v7.7.7 (Final) 🚀${C_RESET}"
-  echo -e "${C_BOLD}========================================================${C_RESET}"
+  echo -e "${C_BOLD}=== OpenConnect Master v7.7.7 (Final) ===${C_RESET}"
+  echo
   show_status
-  title "Main Menu:"
-  echo -e "  ${C_GREEN}1) Start: 🛡️  Default Mode (Global VPN, protects SSH)${C_RESET}"
-  echo -e "  ${C_GREEN}2) Start: 🔌 ocproxy Mode (SOCKS5, IPv4 only)${C_RESET}"
-  echo -e "  ${C_GREEN}3) Start: 🌐 Netns Mode (SOCKS5, full-featured IPv4+IPv6)${C_RESET}"
-  echo -e "  ${C_RED}4) Stop VPN${C_RESET}"
   sep
-  echo -e "  5) ⚙️  Manage VPN Accounts"
-  echo -e "  6) 🗓️  Setup Cron / Daemon Jobs"
-  echo -e "  7) 📦 Check/Install Dependencies"
-  echo -e "  8) 🧪 ${C_CYAN}Test Netns IPv6 Connectivity${C_RESET}"
-  echo -e "  9) 🗑️  Uninstall"
-  echo -e "  ${C_CYAN}10) 🔗 Install ocm shortcut command (then just type ocm)${C_RESET}"
-  echo -e "  0) 🚪 Exit"
+  local pad=40
+  printf '  %b1.%b %s%b2.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "Default Mode (Global VPN, SSH-safe)" $pad)" "$C_GREEN" "$C_RESET" "ocproxy Mode (SOCKS5, IPv4 only)"
+  printf '  %b3.%b %s%b4.%b %s\n' "$C_GREEN" "$C_RESET" "$(_pad "Netns Mode (SOCKS5, IPv4 + IPv6)" $pad)" "$C_RED" "$C_RESET" "Stop VPN"
+  sep
+  printf '  %b5.%b %s%b6.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "Manage VPN Accounts" $pad)" "$C_GREY" "$C_RESET" "Cron / Daemon Jobs"
+  printf '  %b7.%b %s%b8.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "Check / Install Dependencies" $pad)" "$C_GREY" "$C_RESET" "Test Netns IPv6"
+  printf '  %b9.%b %s%b0.%b %s\n' "$C_GREY" "$C_RESET" "$(_pad "Uninstall" $pad)" "$C_GREY" "$C_RESET" "Exit"
   echo
   # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
   # menu loop forever, issuing two public-IP lookups per iteration. read fails on EOF.
-  read -rp "Please select [0-9] or 10: " c || { echo; log_info "Standard input closed, exiting."; exit 0; }
+  read -rp "Please select [0-9]: " c || { echo; log_info "Standard input closed, exiting."; exit 0; }
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
@@ -916,14 +957,13 @@ main_menu() {
          log_err "Netns mode is not running, cannot perform test"
        fi;;
     9) uninstall; exit 0;;
-    10) install_shortcut || true;;
     0) exit 0;;
     *) log_err "Invalid option '$c'";;
   esac
   # For options 5/6, a bare Enter or a wrong key, the AND list above returns 1; and a
   # function whose last statement returns non-zero makes set -e terminate the whole script
   # (measured: pressing Enter at the main menu quit the program). Return explicitly.
-  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
+  [[ "$c" =~ ^([1-4]|7|8)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
   return 0
 }
 
@@ -931,5 +971,5 @@ main_menu() {
 case "${1:-main}" in
   _internal_*) _internal_cron_handler "$@"; exit 0 ;;
   stop) check_root; stop_vpn; exit 0 ;;
-  main|*) check_root; while true; do main_menu; done ;;
+  main|*) check_root; _ensure_shortcut; while true; do main_menu; done ;;
 esac
