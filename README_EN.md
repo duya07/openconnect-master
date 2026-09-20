@@ -342,15 +342,16 @@ ps aux | grep openconnect
    - Script automatically protects SSH connections
    - If still interrupted, check policy routing configuration
 
-### Known limitation: the iptables fallback forwarder does not work on NAT-style VPS
+### Known limitation: the iptables fallback forwarder has a dead data plane under a global VPN inside the netns
 
-When socat is missing, Netns mode falls back to iptables DNAT forwarding. That fallback has a dead data plane on **NAT-style VPS** (NIC has a private address; the public IP is NATed by an upstream gateway), for three measured reasons:
+When socat is missing, Netns mode falls back to iptables DNAT forwarding. Measured (packet-by-packet tcpdump): as long as the VPN gateway pushes a **global default route** (`default dev tun0` inside the netns), the data plane of that fallback is completely dead - regardless of local vs external access, and regardless of NAT:
 
-- Connecting via `127.0.0.1`: after DNAT, packets with source `127.0.0.1` entering the veth are dropped as martian by the netns kernel (Linux forbids 127/8 sources on non-lo interfaces);
-- Connecting via the public IP: the public IP is not a local address, so the packet goes straight to the gateway and gets RST;
-- External clients: the gateway must forward the port to this machine (not configured by default).
+- gost receives the DNAT-forwarded SYN and replies with a SYN-ACK, but the reply's destination (the client's original address) is not inside the veth directly-connected subnet (192.168.200.0/24), so the netns default route sends it into tun and out through the VPN exit - the client expects the reply source to be this machine's address but receives the VPN exit address instead, and the handshake dies (packet capture: `tun0 Out ... [S.E]`);
+- local access via `127.0.0.1` has a second, independent cause: DNAT does not rewrite the source address, and packets with a 127/8 source entering the veth are dropped as martian by the netns kernel (Linux forbids 127/8 sources on non-lo interfaces).
 
-The first reason is NAT-independent - dropping 127/8 sources on non-lo interfaces is a hard kernel constraint, so local 127 access is dead on **any** machine, including ones with the public IP directly on the NIC. On such machines the "external client" and "local via public IP" paths should theoretically work (the DNAT rules and the return-path MASQUERADE have the right shape), but this has not been tested on real hardware. There, use the public IP rather than 127.0.0.1 for local access.
+The only measured-working form is **host access to an address inside the veth directly-connected subnet** (e.g. 192.168.200.2), because the reply destination 192.168.200.1 then follows the veth direct route - but that is the script's internal topology and must not be relied upon.
+
+Theoretical (untested): under a **split-tunnel VPN** (gateway pushes only selected subnets; the default route still points at the veth gateway), replies can return via veth to the host and be reverse-rewritten by conntrack, which would make the branch usable. The socat branch is a process-level forwarder (client <- host socat <- veth directly-connected segment -> netns gost) that does not depend on reply routing and is unaffected - keep socat available (menu 7 or `apt install socat`). The control plane of the iptables branch (rule installation and stop-time cleanup) works correctly.
 
 On such machines keep socat available (menu 7 or `apt install socat`) - socat is a process-level forwarder and is unaffected. The control plane of the iptables fallback (rule installation and stop-time cleanup) works correctly; only the forwarding itself is dead.
 
