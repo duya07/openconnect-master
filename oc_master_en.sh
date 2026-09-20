@@ -6,6 +6,9 @@
 #   - Enhancement(Netns): socat forwarding now supports dual-stack (IPv4 & IPv6) listening.
 #   - New(Netns): Added active IPv6 connectivity test function at startup and in the menu.
 #   - New: OpenConnect protocol selection, supporting AnyConnect / Pulse(Ivanti) / NC(Juniper).
+#   - Removed(Netns): iptables DNAT fallback forwarder (measured: under a global VPN inside
+#     the netns replies are swallowed by tun, so its data plane is dead). socat is now
+#     required; cleanup of legacy state is still kept for compatibility.
 # =================================================================
 set -euo pipefail
 
@@ -120,7 +123,7 @@ _DEPS_LIST=(
   "openconnect|openconnect|VPN client (needed by all three modes)"
   "ocproxy|ocproxy|ocproxy mode"
   "gost|gost|SOCKS5 server for Netns mode"
-  "socat|socat|Port forwarding for Netns mode"
+  "socat|socat|Port forwarding for Netns mode (required)"
 )
 
 # Menu 7: scan the current state first, then decide what to install
@@ -209,12 +212,12 @@ ensure_cmd_gost() {
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
-  log_warn "Netns mode recommends using 'socat' for port forwarding."
+  log_warn "Netns mode requires 'socat' for port forwarding (the only forwarder)."
   local yn=""
   read -rp "Do you want to install socat now? [Y/n]: " yn || yn=""
-  [[ "$yn" =~ ^[nN]$ ]] && { log_info "iptables will be used as a fallback."; return 1; }
+  [[ "$yn" =~ ^[nN]$ ]] && { log_err "socat is missing, Netns mode cannot start."; return 1; }
   _pkg_install socat
-  command -v socat &>/dev/null || { log_warn "socat installation failed, will use iptables."; return 1; }
+  command -v socat &>/dev/null || { log_err "socat installation failed, Netns mode cannot start."; return 1; }
   _mark_dep_installed socat
   log "socat has been installed."
   return 0
@@ -531,7 +534,7 @@ start_netns_mode() {
   is_vpn_running && { log_err "VPN is already running"; return; }
   ensure_pkg_openconnect
   ensure_cmd_gost || return
-  ensure_cmd_socat || true # Continue even if socat fails, use iptables
+  ensure_cmd_socat || return # socat is the only port forwarder for Netns mode; without it nothing can start
   select_account || return
   select_protocol || return
   _execute_with_safety_net "_start_netns_logic"
@@ -582,43 +585,32 @@ _start_netns_logic() {
   log "SOCKS5 service (gost) started in Netns (PID: $gost_pid)"
   
   log_info "Configuring port forwarding from host to Netns..."
-  local forwarder_mode="" RULE_DNAT_PREROUTING="" RULE_DNAT_OUTPUT="" RULE_FORWARD="" socat_pid_v4="" socat_pid_v6=""
-  if command -v socat &>/dev/null; then
-    socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-    socat_pid_v4=$!; echo "$socat_pid_v4" > "$SOCAT_PID_FILE"
-    
-    if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
-      socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-      socat_pid_v6=$!; echo "$socat_pid_v6" > "$SOCAT_PID_FILE_V6"
-      log "Using socat for port forwarding (IPv4 PID: $socat_pid_v4, IPv6 PID: $socat_pid_v6)"
-    else
-      log "Using socat for port forwarding (PID: $socat_pid_v4)"
-    fi
-    forwarder_mode="socat"
+  local socat_pid_v4="" socat_pid_v6=""
+  # Port forwarding uses socat only. The old iptables DNAT fallback was removed: with a
+  # global VPN inside the netns (default dev tun0), gost's reply packets have a destination
+  # outside the veth directly-connected subnet, so the netns default route pushes them into
+  # tun and out through the VPN exit - the client never receives a reply (measured with
+  # tcpdump); the data plane simply does not work. socat is a process-level forwarder:
+  # client<->host socat and socat<->netns gost are two independent connections, and both
+  # ends of the host<->netns leg live inside the veth directly-connected subnet, so it does
+  # not depend on reply routing.
+  socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+  socat_pid_v4=$!; echo "$socat_pid_v4" > "$SOCAT_PID_FILE"
+  sleep 1; if ! kill -0 "$socat_pid_v4" 2>/dev/null; then log_err "socat port forwarding failed to start"; return 1; fi
+
+  if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
+    socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+    socat_pid_v6=$!; echo "$socat_pid_v6" > "$SOCAT_PID_FILE_V6"
+    log "Using socat for port forwarding (IPv4 PID: $socat_pid_v4, IPv6 PID: $socat_pid_v6)"
   else
-    log_info "socat not found, using iptables DNAT as a fallback."
-    RULE_DNAT_PREROUTING="-p tcp --dport ${socks_port} -j DNAT --to-destination ${VETH_NS_IP}:${socks_port}"
-    [ "$listen_addr" != "0.0.0.0" ] && RULE_DNAT_PREROUTING="-p tcp -d ${listen_addr} --dport ${socks_port} -j DNAT --to-destination ${VETH_NS_IP}:${socks_port}"
-    RULE_DNAT_OUTPUT="-p tcp -o lo --dport ${socks_port} -j DNAT --to-destination ${VETH_NS_IP}:${socks_port}"
-    RULE_FORWARD="-i ${VETH_HOST} -d ${VETH_NS_IP} -p tcp --dport ${socks_port} -j ACCEPT"
-    
-    "$IPTABLES_CMD" -t nat -A PREROUTING ${RULE_DNAT_PREROUTING}
-    "$IPTABLES_CMD" -t nat -A OUTPUT ${RULE_DNAT_OUTPUT}
-    "$IPTABLES_CMD" -A FORWARD ${RULE_FORWARD}
-    log "Using iptables for port forwarding"
-    forwarder_mode="iptables"
+    log "Using socat for port forwarding (PID: $socat_pid_v4)"
   fi
-  
+
   {
     echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
-    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${forwarder_mode}";
+    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=socat";
     [ -n "$socat_pid_v4" ] && echo "SOCAT_PID=${socat_pid_v4}";
     [ -n "$socat_pid_v6" ] && echo "SOCAT_PID_V6=${socat_pid_v6}";
-    [ "$forwarder_mode" = "iptables" ] && {
-      echo "RULE_DNAT_PREROUTING='${RULE_DNAT_PREROUTING}'"
-      echo "RULE_DNAT_OUTPUT='${RULE_DNAT_OUTPUT}'"
-      echo "RULE_FORWARD='${RULE_FORWARD}'"
-    }
   } > "$STATE_FILE"
   
   return 0
@@ -671,7 +663,10 @@ stop_vpn() {
           [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
           [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
         elif [ "${FORWARDER:-}" = "iptables" ]; then
-          log_info "Cleaning up Netns iptables forwarding rules..."
+          # Only to clean up sessions left by older versions (new versions no longer create
+          # iptables forwarding), so a machine upgraded from an older release - or one that
+          # rolled back - does not keep these three rules around.
+          log_info "Cleaning up legacy iptables forwarding rules..."
           # || true: iptables -D returns non-zero for a rule already removed elsewhere; eval is the
           # final command of an && list, and that failure makes set -e abort stop_vpn entirely.
           [ -n "${RULE_DNAT_PREROUTING:-}" ] && eval "\$IPTABLES_CMD -t nat -D PREROUTING ${RULE_DNAT_PREROUTING}" 2>/dev/null || true
@@ -738,7 +733,7 @@ show_status() {
       ;;
       netns)
         echo -e "    ${C_BOLD}Running Mode:${C_RESET} 🌐 Network Namespace Proxy ${C_GREEN}(IPv4+IPv6)${C_RESET}"
-        local f_info; if [[ "${FORWARDER:-}" == "socat" ]]; then f_info="socat"; else f_info="iptables"; fi
+        local f_info; f_info="${FORWARDER:-socat}"
         echo -e "    ${C_BOLD}SOCKS Address:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost PID: $(cat "$GOST_PID_FILE" 2>/dev/null), by ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
@@ -841,7 +836,7 @@ uninstall() {
   fi
   
   if command -v socat &>/dev/null; then
-    if _ask_uninstall_dep socat "Port forwarding for Netns mode"; then
+    if _ask_uninstall_dep socat "Port forwarding for Netns mode (required)"; then
       if command -v apt-get &>/dev/null; then apt-get purge -y socat >/dev/null || true
       elif command -v yum &>/dev/null; then yum remove -y socat >/dev/null || true
       elif command -v dnf &>/dev/null; then dnf remove -y socat >/dev/null || true; fi

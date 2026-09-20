@@ -7,6 +7,8 @@
 #   - 增强(Netns): socat 转发支持 IPv4 和 IPv6 双栈监听。
 #   - 新增(Netns): 启动时和菜单中增加 IPv6 连通性主动测试功能。
 #   - 新增: OpenConnect 协议选择，支持 AnyConnect / Pulse(Ivanti) / NC(Juniper)。
+#   - 移除(Netns): iptables DNAT 备用转发（实测在 netns 全局 VPN 下回包被吸进 tun、
+#     数据面不通），socat 改为必需；旧 state 的规则清理保留兼容。
 # =================================================================
 set -euo pipefail
 
@@ -115,7 +117,7 @@ _DEPS_LIST=(
   "openconnect|openconnect|VPN 客户端（三种模式都要）"
   "ocproxy|ocproxy|ocproxy 模式"
   "gost|gost|Netns 模式的 SOCKS5 服务端"
-  "socat|socat|Netns 模式的端口转发"
+  "socat|socat|Netns 模式的端口转发（必需）"
 )
 
 # 菜单 7：先扫描现状，再决定装什么
@@ -203,12 +205,12 @@ ensure_cmd_gost() {
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
-  log_warn "Netns 模式推荐使用 'socat' 进行端口转发。"
+  log_warn "Netns 模式需要 'socat' 进行端口转发（唯一的转发方式）。"
   local yn=""
   read -rp "是否立即安装 socat? [Y/n]: " yn || yn=""
-  [[ "$yn" =~ ^[nN]$ ]] && { log_info "将使用 iptables 作为备用方案。"; return 1; }
+  [[ "$yn" =~ ^[nN]$ ]] && { log_err "缺少 socat，Netns 模式无法启动。"; return 1; }
   _pkg_install socat
-  command -v socat &>/dev/null || { log_warn "socat 安装失败，将使用 iptables。"; return 1; }
+  command -v socat &>/dev/null || { log_err "socat 安装失败，Netns 模式无法启动。"; return 1; }
   _mark_dep_installed socat
   log "socat 已安装。"
   return 0
@@ -522,7 +524,7 @@ start_netns_mode() {
   is_vpn_running && { log_err "VPN 已在运行"; return; }
   ensure_pkg_openconnect
   ensure_cmd_gost || return
-  ensure_cmd_socat || true # 即使 socat 安装失败也继续，使用 iptables
+  ensure_cmd_socat || return # socat 是 Netns 模式唯一的端口转发方式，缺失即无法启动
   select_account || return
   select_protocol || return
   _execute_with_safety_net "_start_netns_logic"
@@ -573,43 +575,29 @@ _start_netns_logic() {
   log "SOCKS5 服务 (gost) 已在 Netns 中启动 (PID: $gost_pid)"
   
   log_info "配置主机到 Netns 的端口转发..."
-  local forwarder_mode="" RULE_DNAT_PREROUTING="" RULE_DNAT_OUTPUT="" RULE_FORWARD="" socat_pid_v4="" socat_pid_v6=""
-  if command -v socat &>/dev/null; then
-    socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-    socat_pid_v4=$!; echo "$socat_pid_v4" > "$SOCAT_PID_FILE"
-    
-    if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
-      socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
-      socat_pid_v6=$!; echo "$socat_pid_v6" > "$SOCAT_PID_FILE_V6"
-      log "使用 socat 完成端口转发 (IPv4 PID: $socat_pid_v4, IPv6 PID: $socat_pid_v6)"
-    else
-      log "使用 socat 完成端口转发 (PID: $socat_pid_v4)"
-    fi
-    forwarder_mode="socat"
+  local socat_pid_v4="" socat_pid_v6=""
+  # 端口转发只用 socat。旧版本的 iptables DNAT 备用方案已移除：netns 内是全局 VPN
+  # （default dev tun0），gost 的回包目标不在 veth 直连网段内，会被默认路由吸进 tun、
+  # 从 VPN 出口离开，客户端永远收不到回包（tcpdump 实测），数据面根本不通。
+  # socat 是进程级转发：客户端↔主机 socat、socat↔netns gost 两段各自成连接，
+  # 主机↔netns 那段两端地址都在 veth 直连段内，不依赖回包路由。
+  socat TCP4-LISTEN:"${socks_port}",bind="${listen_addr}",fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+  socat_pid_v4=$!; echo "$socat_pid_v4" > "$SOCAT_PID_FILE"
+  sleep 1; if ! kill -0 "$socat_pid_v4" 2>/dev/null; then log_err "socat 端口转发启动失败"; return 1; fi
+
+  if [[ "$listen_addr" == "0.0.0.0" ]] || [[ "$listen_addr" == "::" ]]; then
+    socat TCP6-LISTEN:"${socks_port}",ipv6only=1,fork,reuseaddr TCP4:"${VETH_NS_IP}:${socks_port}" >/dev/null 2>&1 &
+    socat_pid_v6=$!; echo "$socat_pid_v6" > "$SOCAT_PID_FILE_V6"
+    log "使用 socat 完成端口转发 (IPv4 PID: $socat_pid_v4, IPv6 PID: $socat_pid_v6)"
   else
-    log_info "socat 未找到, 使用 iptables DNAT 作为备用方案。"
-    RULE_DNAT_PREROUTING="-p tcp --dport ${socks_port} -j DNAT --to-destination ${VETH_NS_IP}:${socks_port}"
-    [ "$listen_addr" != "0.0.0.0" ] && RULE_DNAT_PREROUTING="-p tcp -d ${listen_addr} --dport ${socks_port} -j DNAT --to-destination ${VETH_NS_IP}:${socks_port}"
-    RULE_DNAT_OUTPUT="-p tcp -o lo --dport ${socks_port} -j DNAT --to-destination ${VETH_NS_IP}:${socks_port}"
-    RULE_FORWARD="-i ${VETH_HOST} -d ${VETH_NS_IP} -p tcp --dport ${socks_port} -j ACCEPT"
-    
-    "$IPTABLES_CMD" -t nat -A PREROUTING ${RULE_DNAT_PREROUTING}
-    "$IPTABLES_CMD" -t nat -A OUTPUT ${RULE_DNAT_OUTPUT}
-    "$IPTABLES_CMD" -A FORWARD ${RULE_FORWARD}
-    log "使用 iptables 完成端口转发"
-    forwarder_mode="iptables"
+    log "使用 socat 完成端口转发 (PID: $socat_pid_v4)"
   fi
-  
+
   {
     echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
-    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${forwarder_mode}";
+    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=socat";
     [ -n "$socat_pid_v4" ] && echo "SOCAT_PID=${socat_pid_v4}";
     [ -n "$socat_pid_v6" ] && echo "SOCAT_PID_V6=${socat_pid_v6}";
-    [ "$forwarder_mode" = "iptables" ] && {
-      echo "RULE_DNAT_PREROUTING='${RULE_DNAT_PREROUTING}'"
-      echo "RULE_DNAT_OUTPUT='${RULE_DNAT_OUTPUT}'"
-      echo "RULE_FORWARD='${RULE_FORWARD}'"
-    }
   } > "$STATE_FILE"
   
   return 0
@@ -659,7 +647,9 @@ stop_vpn() {
           [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
           [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
         elif [ "${FORWARDER:-}" = "iptables" ]; then
-          log_info "清理 Netns 的 iptables 转发规则..."
+          # 只为清理旧版本留下的会话（新版启动侧已不再产生 iptables 转发），
+          # 保证从旧版升上来、或回滚过版本的机器上不会残留这三条规则。
+          log_info "清理旧版遗留的 iptables 转发规则..."
           # || true：iptables -D 对"已被外部清掉的规则"返回非 0，eval 是 && 列表最后的命令，
           # 失败会被 set -e 当成错误直接终止 stop_vpn（gost/openconnect 不杀、netns 不清）。
           [ -n "${RULE_DNAT_PREROUTING:-}" ] && eval "\$IPTABLES_CMD -t nat -D PREROUTING ${RULE_DNAT_PREROUTING}" 2>/dev/null || true
@@ -725,7 +715,7 @@ show_status() {
       ;;
       netns)
         echo -e "    ${C_BOLD}运行模式:${C_RESET} 🌐 Network Namespace 代理 ${C_GREEN}(IPv4+IPv6)${C_RESET}"
-        local f_info; if [[ "${FORWARDER:-}" == "socat" ]]; then f_info="socat"; else f_info="iptables"; fi
+        local f_info; f_info="${FORWARDER:-socat}"
         echo -e "    ${C_BOLD}SOCKS 地址:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT} ${C_GREY}(gost PID: $(cat "$GOST_PID_FILE" 2>/dev/null), by ${f_info})${C_RESET}"
         
         local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"

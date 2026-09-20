@@ -342,18 +342,13 @@ ps aux | grep openconnect
    - Script automatically protects SSH connections
    - If still interrupted, check policy routing configuration
 
-### Known limitation: the iptables fallback forwarder has a dead data plane under a global VPN inside the netns
+### Netns mode requires socat
 
-When socat is missing, Netns mode falls back to iptables DNAT forwarding. Measured (packet-by-packet tcpdump): as long as the VPN gateway pushes a **global default route** (`default dev tun0` inside the netns), the data plane of that fallback is completely dead - regardless of local vs external access, and regardless of NAT:
+Netns mode uses **socat only** for port forwarding; the script no longer ships an iptables fallback (earlier releases up to v7.7.7 had one - it has been removed).
 
-- gost receives the DNAT-forwarded SYN and replies with a SYN-ACK, but the reply's destination (the client's original address) is not inside the veth directly-connected subnet (192.168.200.0/24), so the netns default route sends it into tun and out through the VPN exit - the client expects the reply source to be this machine's address but receives the VPN exit address instead, and the handshake dies (packet capture: `tun0 Out ... [S.E]`);
-- local access via `127.0.0.1` has a second, independent cause: DNAT does not rewrite the source address, and packets with a 127/8 source entering the veth are dropped as martian by the netns kernel (Linux forbids 127/8 sources on non-lo interfaces).
+Why (measured with tcpdump): the iptables DNAT forwarder has a dead data plane whenever the netns has a **global VPN** (the gateway pushes a default route, `default dev tun0`) - gost's replies have a destination outside the veth directly-connected subnet, so the netns default route pushes them into tun and out through the VPN exit, and the client never receives a reply. Local access via `127.0.0.1` has a second, independent cause: DNAT does not rewrite the source address, and 127/8 sources entering the veth are dropped as martian. socat is a process-level forwarder whose two connection legs are independent, and both ends of the host<->netns leg live inside the veth directly-connected subnet, so it is unaffected.
 
-The only measured-working form is **host access to an address inside the veth directly-connected subnet** (e.g. 192.168.200.2), because the reply destination 192.168.200.1 then follows the veth direct route - but that is the script's internal topology and must not be relied upon.
-
-Theoretical (untested): under a **split-tunnel VPN** (gateway pushes only selected subnets; the default route still points at the veth gateway), replies can return via veth to the host and be reverse-rewritten by conntrack, which would make the branch usable. The socat branch is a process-level forwarder (client <- host socat <- veth directly-connected segment -> netns gost) that does not depend on reply routing and is unaffected - keep socat available (menu 7 or `apt install socat`). The control plane of the iptables branch (rule installation and stop-time cleanup) works correctly.
-
-On such machines keep socat available (menu 7 or `apt install socat`) - socat is a process-level forwarder and is unaffected. The control plane of the iptables fallback (rule installation and stop-time cleanup) works correctly; only the forwarding itself is dead.
+If socat is missing, starting Netns mode asks to install it; declining means the mode does not start. Install via menu 7, or `apt install socat`.
 
 ## 📊 Version History
 

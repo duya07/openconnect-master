@@ -342,18 +342,13 @@ ps aux | grep openconnect
    - 脚本会自动保护 SSH 连接
    - 如果仍然中断，检查策略路由配置
 
-### 已知限制：iptables 备用转发在"netns 内全局 VPN"下数据面完全不通
+### Netns 模式需要 socat
 
-socat 缺失时 Netns 模式会退到 iptables DNAT 转发。实测（tcpdump 逐包跟踪）：只要 VPN 网关推送的是**全局默认路由**（netns 内 `default dev tun0`），该备用分支的数据面就完全不通——与本机/外部、NAT 与否都无关：
+Netns 模式的端口转发**只用 socat**，脚本不再提供 iptables 备用方案（v7.7.7 之前的版本有，已移除）。
 
-- gost 收到经 DNAT 转发来的 SYN 后正常回 SYN-ACK，但回包目标（客户端原始地址）不在 veth 直连网段（192.168.200.0/24）内，被 netns 的默认路由送进 tun、从 VPN 出口离开——客户端期望的回包源是本机地址，实际收到的是 VPN 出口地址，握手失败（抓包实证：`tun0 Out … [S.E]`）；
-- 本机经 `127.0.0.1` 访问时另有第二重死因：DNAT 不改源地址，源为 127/8 的包进入 veth 会被 netns 内核按 martian 丢弃（Linux 不允许 127/8 源出现在非 lo 接口）。
+原因（tcpdump 实测）：iptables DNAT 转发在 netns 内是**全局 VPN**（网关推送默认路由，`default dev tun0`）时数据面根本不通——gost 的回包目标不在 veth 直连网段内，被默认路由吸进 tun、从 VPN 出口离开，客户端永远收不到回包；本机走 `127.0.0.1` 时还有第二重死因（DNAT 不改源地址，127/8 源进 veth 被判 martian 丢弃）。socat 是进程级转发，两段连接各自独立、主机↔netns 那段两端地址都在 veth 直连段内，不受影响。
 
-唯一实测能通的形态是**主机直连 veth 直连段地址**（如 192.168.200.2），因为那时回包目标 192.168.200.1 走 veth 直连路由——但这是脚本内部拓扑地址，不该被使用方依赖。
-
-理论推断（未实测）：**split-tunnel VPN**（网关只推送部分网段、默认路由仍指向 veth 网关）下回包能走 veth 回主机、经 conntrack 反向改写后送达客户端，该分支才可用。socat 分支是进程级转发（客户端 ← 主机 socat ←veth 直连段→ netns gost），不依赖回包路由，不受此限制——请保持 socat 可用（菜单 7 或 `apt install socat`）。iptables 分支的控制面（规则写入与停止清理）工作正常。
-
-在这类机器上请保持 socat 可用（菜单 7 或 `apt install socat`）——socat 是进程转发，不受此限制。iptables 备用分支的控制面（规则写入与停止清理）工作正常，只是转发不通。
+socat 缺失时启动 Netns 模式会提示安装，拒绝安装则不启动该模式。安装：菜单 7，或 `apt install socat`。
 
 ## 📊 版本历史
 
