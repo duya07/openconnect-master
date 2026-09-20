@@ -857,6 +857,17 @@ _fwd_setup_iptables() {
     # Local-only bind: restrict to 127.0.0.1 and skip PREROUTING, matching "socat bind 127.0.0.1"
     R_OUT="-p tcp -d 127.0.0.1 --dport ${socks_port} -j DNAT --to-destination ${dst}"
   fi
+  # Prerequisite: after the OUTPUT DNAT the source address of host-generated traffic is
+  # still 127.0.0.1. Following the DNAT, netfilter re-routes the packet
+  # (ip_route_me_harder) and the kernel consults route_localnet to decide whether
+  # 127.0.0.0/8 may leave through *this* interface. The default 0 means it may not, so the
+  # packet is dropped as a martian and never even reaches POSTROUTING (measured: the DNAT
+  # counter keeps climbing, the SNAT counter stays at 0, tcpdump on the veth sees nothing).
+  # The kernel reads it via IN_DEV_ORCONF - "all" OR the interface value - so enabling just
+  # this veth is enough; the global "all" stays untouched, and the setting disappears
+  # together with the veth this script creates.
+  sysctl -w "net.ipv4.conf.${VETH_HOST}.route_localnet=1" >/dev/null 2>&1 || true
+
   # -C before -A so repeated runs do not stack duplicate rules
   "$IPTABLES_CMD" -t nat -C OUTPUT $R_OUT 2>/dev/null || "$IPTABLES_CMD" -t nat -A OUTPUT $R_OUT \
     || { log_err "Failed to add iptables DNAT (local)"; return 1; }

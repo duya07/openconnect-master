@@ -829,6 +829,14 @@ _fwd_setup_iptables() {
     # 只监听本地：限定目标为 127.0.0.1，且不加 PREROUTING —— 语义与 socat bind 127.0.0.1 一致
     R_OUT="-p tcp -d 127.0.0.1 --dport ${socks_port} -j DNAT --to-destination ${dst}"
   fi
+  # 关键前提：本机产生的流量经 OUTPUT DNAT 后，源地址仍然是 127.0.0.1。DNAT 之后
+  # netfilter 会重新做一次路由（ip_route_me_harder），内核按 route_localnet 判断
+  # 127.0.0.0/8 能不能从"这个接口"出去；默认 0 = 不能，包被当 martian 丢弃，
+  # 连 POSTROUTING 都到不了（实测：DNAT 计数一路涨、SNAT 计数恒为 0、veth 抓不到包）。
+  # 内核取值是 IN_DEV_ORCONF —— all 与接口值取 OR，所以只放开这个 veth 就够，
+  # 不必动全局 all；影响面限于本脚本自己建的接口，veth 删除后设置随之消失。
+  sysctl -w "net.ipv4.conf.${VETH_HOST}.route_localnet=1" >/dev/null 2>&1 || true
+
   # 先 -C 再 -A：重复运行不会叠加规则
   "$IPTABLES_CMD" -t nat -C OUTPUT $R_OUT 2>/dev/null || "$IPTABLES_CMD" -t nat -A OUTPUT $R_OUT \
     || { log_err "iptables DNAT(本机) 添加失败"; return 1; }
