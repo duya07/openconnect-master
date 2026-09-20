@@ -676,23 +676,30 @@ _start_netns_logic() {
   # 那时脚本继续往下走，gost 就以宿主出口（本机公网 IP）对外了——主菜单显示"运行中"，
   # 实际完全没走 VPN。这里改成先等路由真的生效，等不到就判定启动失败，交给
   # _execute_with_safety_net 走失败分支（它会 stop_vpn 并撤掉保底任务）。
-  local vpn_ready=0 i
-  log_info "等待 Netns 内 VPN 路由生效..."
-  for ((i=1; i<=15; i++)); do
-    # 判据一：默认路由已指向 tun（VPN 接管了默认路由；本网关就是这种）
-    if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then
-      vpn_ready=1; break
-    fi
-    # 判据二：已经能通外网（有些网关不抢默认路由，只下发特定网段）
-    if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-      vpn_ready=1; break
-    fi
+  # 只等"TUN 存在 + 默认路由指向 tun"是不够的：实测遇到过 openconnect 先建好 tun0 与
+  # 路由、随后连接中断又把 tun0 删掉的情形——那一瞬间静态判据全都成立，但流量已经
+  # 回落到 veth→宿主，gost 于是以本机公网 IP 对外（主菜单显示运行中，实际没走 VPN）。
+  # 所以以后者的直接证据为准：netns 内的实际出口不再等于本机出口。
+  local vpn_ready=0 i host_ip="" ns_ip=""
+  host_ip="$(_pub_ip -4 2>/dev/null || true)"
+  log_info "等待 Netns 内 VPN 真正可用..."
+  for ((i=1; i<=6; i++)); do
+    ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
+    if [ -n "$ns_ip" ] && [ -n "$host_ip" ] && [ "$ns_ip" != "$host_ip" ]; then vpn_ready=1; break; fi
     sleep 2
   done
-  if [ "$vpn_ready" -eq 0 ]; then
-    log_err "Netns 内 VPN 路由在 30 秒内未生效，判定启动失败"; return 1
+  # 宿主出口都查不到（网络受限）时退回静态判据，总比完全不判强
+  if [ "$vpn_ready" -eq 0 ] && [ -z "$host_ip" ]; then
+    log_warn "无法取得宿主出口 IP，改用路由判据"
+    for ((i=1; i<=6; i++)); do
+      if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then vpn_ready=1; break; fi
+      sleep 2
+    done
   fi
-  log "Netns 内 VPN 已生效 (等待 $(( (i-1) * 2 )) 秒)"
+  if [ "$vpn_ready" -eq 0 ]; then
+    log_err "Netns 内 VPN 在约 50 秒内仍不可用，判定启动失败（避免 gost 以本机出口对外）"; return 1
+  fi
+  log "Netns 内 VPN 已可用 (等待约 $(( (i-1) * 8 )) 秒，出口 ${ns_ip:-未知})"
 
   log_info "测试 Netns 内通过 VPN 的 IPv4 网络连通性...";
   if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then

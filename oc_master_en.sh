@@ -696,24 +696,34 @@ _start_netns_logic() {
   # "running" while nothing actually went through the VPN. Now we wait for the route to
   # really take effect; if it never does, startup fails and _execute_with_safety_net runs
   # the rollback branch (stop_vpn + cancel the scheduled safety-net job).
-  local vpn_ready=0 i
-  log_info "Waiting for the VPN route inside Netns to take effect..."
-  for ((i=1; i<=15; i++)); do
-    # Check 1: the default route now points at tun (the VPN took over the default route)
-    if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then
-      vpn_ready=1; break
-    fi
-    # Check 2: outbound traffic already works (some gateways only push specific subnets)
-    if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-      vpn_ready=1; break
-    fi
+  # Waiting for "tun exists + default route points at tun" is not enough: measured cases
+  # where openconnect first created tun0 and installed the route, then lost the connection
+  # and removed tun0 again. During that window every static criterion holds, yet traffic
+  # has already fallen back to veth -> host, so gost egresses through the machine's own
+  # public IP (the menu says "running" while nothing goes through the VPN). So the direct
+  # evidence wins: the netns egress no longer equals the host egress.
+  local vpn_ready=0 i host_ip="" ns_ip=""
+  host_ip="$(_pub_ip -4 2>/dev/null || true)"
+  log_info "Waiting until the VPN inside Netns really works..."
+  for ((i=1; i<=6; i++)); do
+    ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
+    if [ -n "$ns_ip" ] && [ -n "$host_ip" ] && [ "$ns_ip" != "$host_ip" ]; then vpn_ready=1; break; fi
     sleep 2
   done
+  # When even the host egress cannot be resolved (restricted network), fall back to the
+  # static criterion - better than not checking at all.
+  if [ "$vpn_ready" -eq 0 ] && [ -z "$host_ip" ]; then
+    log_warn "Cannot determine the host egress IP; falling back to the route criterion"
+    for ((i=1; i<=6; i++)); do
+      if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then vpn_ready=1; break; fi
+      sleep 2
+    done
+  fi
   if [ "$vpn_ready" -eq 0 ]; then
-    log_err "The VPN route inside Netns did not take effect within 30s; treating startup as failed"
+    log_err "The VPN inside Netns is still unusable after ~50s; treating startup as failed (gost would otherwise egress through this machine)"
     return 1
   fi
-  log "VPN inside Netns is effective (waited $(( (i-1) * 2 ))s)"
+  log "VPN inside Netns is usable (waited ~$(( (i-1) * 8 ))s, egress ${ns_ip:-unknown})"
 
   log_info "Testing IPv4 connectivity via VPN inside Netns...";
   if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then
