@@ -29,8 +29,6 @@ SHORTCUT_PATH="/usr/local/bin/ocm"
 # 老版本升上来的机器没有这个文件，于是所有依赖都算"用户自己的"（偏保守）。
 DEPS_STATE_DIR="/var/lib/oc-master"
 DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
-# 端口转发方式偏好（菜单 10 里设置）：auto | socat | iptables
-FWD_PREF_FILE="${DEPS_STATE_DIR}/forwarder"
 
 # --- 路由与网络配置 ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -538,7 +536,7 @@ _load_account_by_index() {
 
 # --- 启动/停止核心逻辑 ---
 _execute_with_safety_net() {
-  local func_to_run="$1"
+  local func_to_run="$1"; shift   # 其余参数原样透传给被调函数（菜单 3/4 用它传转发后端）
   trap cleanup_on_interrupt SIGINT
   check_atd
   # 保底回滚：先排一个 2 分钟后执行的 stop，连接稳定后再取消它（见下方 atrm）。
@@ -548,7 +546,7 @@ _execute_with_safety_net() {
   local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || echo "none")
   [ "$job" != "none" ] && log_warn "已设保底清理任务 (Job $job), 2分钟内连接失败将自动回滚。"
 
-  if "$func_to_run"; then
+  if "$func_to_run" "$@"; then
     trap - SIGINT # 成功后解除陷阱
     [ "$job" != "none" ] && atrm "$job" && log "连接稳定, 已取消保底任务"
     show_status || true
@@ -602,16 +600,23 @@ _start_ocproxy_logic() {
   log_err "ocproxy 连接失败或超时"; return 1
 }
 
+# 菜单 3/4：Netns 模式，转发后端由菜单项直接指定（不再有"切换偏好"这一步）。
+# $1 = socat 或 iptables
 start_netns_mode() {
+  local want_fwd="${1:-socat}"
   is_vpn_running && { log_err "VPN 已在运行"; return; }
   ensure_pkg_openconnect
   ensure_cmd_gost || return
-  ensure_cmd_socat || true  # 没有 socat 不阻断：转发后端会退到 iptables 双 NAT
+  if [ "$want_fwd" = "socat" ]; then
+    # 选了 socat 就必须有 socat：装不上就明确拒绝，不悄悄换成别的后端
+    ensure_cmd_socat || { log_err "socat 不可用，Netns(socat) 无法启动。想走内核转发请用菜单 4。"; return; }
+  fi
   select_account || return
   select_protocol || return
-  _execute_with_safety_net "_start_netns_logic"
+  _execute_with_safety_net "_start_netns_logic" "$want_fwd"
 }
 _start_netns_logic() {
+  local want_fwd="${1:-socat}"
   local socks_port
   while true;do read -rp "请输入SOCKS5监听端口 (e.g. 8585): " socks_port || { echo; log_err "标准输入已结束，取消启动。"; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port" || { log_err "端口已被占用"; continue; }; break; done
   
@@ -684,10 +689,11 @@ _start_netns_logic() {
   sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost 在 Netns 中启动失败"; return 1; fi
   log "SOCKS5 服务 (gost) 已在 Netns 中启动 (PID: $gost_pid)"
   
-  log_info "配置主机到 Netns 的端口转发..."
-  # 后端由模块区决定（socat 优先，iptables 兜底，可用 OCM_FORWARDER 强制指定）
-  local fwd=""
-  fwd="$(_fwd_pick)" || { log_err "socat 与 iptables 都不可用，Netns 模式无法启动。"; return 1; }
+  log_info "配置主机到 Netns 的端口转发 (后端: ${want_fwd})..."
+  # 后端由菜单项指定（3=socat / 4=iptables）；OCM_FORWARDER 仍可一次性覆盖，供脚本化调用
+  local fwd="$want_fwd"
+  if [ -n "${OCM_FORWARDER:-}" ] && _fwd_avail "$OCM_FORWARDER"; then fwd="$OCM_FORWARDER"; fi
+  _fwd_avail "$fwd" || { log_err "转发后端 '$fwd' 不可用，Netns 模式无法启动。"; return 1; }
   _FWD_DESC=""; _FWD_STATE=""
   _fwd_setup "$fwd" "$socks_port" "$listen_addr" || return 1
 
@@ -744,39 +750,16 @@ cleanup_ssh_protect_routes() {
 #                会走 lo 出不了 netns、其它地址会被 tun0 吞掉，客户端永远收不到回包。
 #                本机实测：仅 DNAT 时四种访问方式全灭；补一条 SNAT 后立即全通。
 #
-#  统一入口（主流程只认这两个）：
-#     _fwd_pick                        → 选后端（OCM_FORWARDER 可强制指定）
+#  统一入口（主流程只认这三个）：
+#     _fwd_avail <名>                    → 该后端当前可用吗
 #     _fwd_setup <后端> <端口> <监听地址> → 0=成功，并填好 _FWD_DESC / _FWD_STATE
 #     _fwd_teardown <后端>             → 按 state 里的规则串拆除，可重复调用
-#  新增后端：写 _fwd_setup_<名> 与 _fwd_teardown_<名>，在 _fwd_avail、_fwd_pick 的
-#            候选列表和各分发处各加一行即可；主流程、停止流程、状态显示都不用改。
+#  后端由菜单项直接决定（3=socat / 4=iptables），不再有"选偏好"这一步。
+#  新增后端：写 _fwd_setup_<名> 与 _fwd_teardown_<名>，在 _fwd_avail 与各分发处
+#            各加一行、菜单里加一项即可；主流程、停止流程、状态显示都不用改。
 # ============================================================================
 _FWD_DESC=""    # 实际使用的后端名（写进 state 的 FORWARDER）
 _FWD_STATE=""   # 需要额外写进 state 文件的行
-
-# 转发方式偏好（菜单 10）。文件里只存一个词：auto | socat | iptables。
-# 文件不存在或内容异常一律按 auto 处理，所以老版本升级上来行为不变。
-_fwd_pref_get() {
-  local v="auto"
-  [ -f "$FWD_PREF_FILE" ] && v="$(head -n1 "$FWD_PREF_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
-  case "$v" in socat|iptables|auto) printf '%s' "$v" ;; *) printf 'auto' ;; esac
-  return 0
-}
-_fwd_pref_set() {
-  case "$1" in socat|iptables|auto) ;; *) return 1 ;; esac
-  mkdir -p "$DEPS_STATE_DIR" 2>/dev/null || return 1
-  printf '%s\n' "$1" > "$FWD_PREF_FILE" 2>/dev/null || return 1
-  return 0
-}
-# 菜单/状态区显示用的一句话描述
-_fwd_pref_label() {
-  case "$(_fwd_pref_get)" in
-    socat)    printf 'socat（进程转发）' ;;
-    iptables) printf 'iptables 双 NAT（内核转发）' ;;
-    *)        printf '自动（socat 优先）' ;;
-  esac
-  return 0
-}
 
 _fwd_avail() {
   case "$1" in
@@ -784,28 +767,6 @@ _fwd_avail() {
     iptables) command -v iptables &>/dev/null || [ -x "$IPTABLES_CMD" ] ;;
     *)        return 1 ;;
   esac
-}
-
-_fwd_pick() {
-  local want="${OCM_FORWARDER:-}" b pref
-  # 1) 环境变量优先级最高（脚本化调用/一次性覆盖）
-  if [ -n "$want" ]; then
-    if _fwd_avail "$want"; then echo "$want"; return 0; fi
-    log_warn "指定的转发后端 '$want' 不可用，改为自动选择。" >&2
-  fi
-  # 2) 菜单 10 里设置的偏好；它当前不可用就退回自动，并说明原因
-  pref="$(_fwd_pref_get)"
-  case "$pref" in
-    socat|iptables)
-      if _fwd_avail "$pref"; then echo "$pref"; return 0; fi
-      log_warn "偏好后端 '$pref' 当前不可用，改为自动选择。" >&2
-      ;;
-  esac
-  # 3) 自动：socat 优先，缺失时用 iptables 双 NAT
-  for b in socat iptables; do
-    if _fwd_avail "$b"; then echo "$b"; return 0; fi
-  done
-  return 1
 }
 
 _fwd_setup() {
@@ -898,34 +859,6 @@ _fwd_teardown_iptables() {
     esac
   done
   return 0
-}
-
-# 菜单 10：选择端口转发方式。设置写进 FWD_PREF_FILE，下次启动 Netns 生效。
-manage_forwarder() {
-  local c
-  while true; do
-    clear; title "🔀 端口转发方式（Netns 模式）"; sep
-    echo -e "  当前设置: ${C_CYAN}$(_fwd_pref_label)${C_RESET}"
-    echo
-    echo -e "  ${C_GREEN}1)${C_RESET} 自动      ${C_GREY}socat 优先，没有 socat 时自动退回 iptables${C_RESET}"
-    echo -e "  ${C_GREEN}2)${C_RESET} socat     ${C_GREY}进程级中继：客户端↔socat↔gost 两段独立连接${C_RESET}"
-    echo -e "  ${C_GREEN}3)${C_RESET} iptables  ${C_GREY}双 NAT：内核直接转发（DNAT 进 netns + SNAT 保证回程）${C_RESET}"
-    echo -e "  ${C_GREY}4) 返回${C_RESET}"
-    echo
-    sep
-    echo -e "  ${C_GREY}本机可用性: socat $(_fwd_avail socat && echo 可用 || echo 缺失) · iptables $(_fwd_avail iptables && echo 可用 || echo 缺失)${C_RESET}"
-    echo -e "  ${C_GREY}只影响之后启动的 Netns 会话；已经连上的不受影响。${C_RESET}"
-    echo
-    read -rp "请选择 [1-4]: " c || { echo; log_info "标准输入已结束。"; return 0; }
-    case "$c" in
-      1) _fwd_pref_set auto     && log "已设为：自动（socat 优先）" ;;
-      2) _fwd_pref_set socat    && log "已设为：socat" ;;
-      3) _fwd_pref_set iptables && log "已设为：iptables 双 NAT" ;;
-      4) return 0 ;;
-      *) log_err "无效选项"; sleep 1; continue ;;
-    esac
-    sleep 1
-  done
 }
 
 stop_vpn() {
@@ -1126,7 +1059,8 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "账户文件已删除"
-  rm -f "$DEPS_MARK_FILE" "$FWD_PREF_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
+  # 老版本（菜单 10 那套）可能在 /var/lib/oc-master 下留过一个 forwarder 偏好文件，一并清掉
+  rm -f "$DEPS_MARK_FILE" "${DEPS_STATE_DIR}/forwarder"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
   remove_shortcut
   log_info "正在删除脚本文件: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "卸载完成，再见！"
 }
@@ -1160,15 +1094,15 @@ main_menu() {
   title "主菜单:"
   echo -e "  ${C_GREEN}1) 启动: 🛡️  默认模式 (全局VPN, 保护SSH)${C_RESET}"
   echo -e "  ${C_GREEN}2) 启动: 🔌 ocproxy 模式 (SOCKS5, 仅IPv4)${C_RESET}"
-  echo -e "  ${C_GREEN}3) 启动: 🌐 Netns 模式 (SOCKS5, IPv4+IPv6 全功能)${C_RESET}"
-  echo -e "  ${C_RED}4) 停止 VPN${C_RESET}"
+  echo -e "  ${C_GREEN}3) 启动: 🌐 Netns 模式 (SOCKS5, socat 转发)${C_RESET}"
+  echo -e "  ${C_GREEN}4) 启动: 🌐 Netns 模式 (SOCKS5, iptables 双 NAT)${C_RESET}"
+  echo -e "  ${C_RED}5) 停止 VPN${C_RESET}"
   sep
-  echo -e "  5) ⚙️  管理 VPN 账户"
-  echo -e "  6) 🗓️  设置定时/守护任务"
-  echo -e "  7) 📦 检查/安装依赖"
-  echo -e "  8) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
-  echo -e "  9) 🗑️  卸载"
-  echo -e "  10) 🔀 端口转发方式 ${C_GREY}(当前: $(_fwd_pref_label))${C_RESET}"
+  echo -e "  6) ⚙️  管理 VPN 账户"
+  echo -e "  7) 🗓️  设置定时/守护任务"
+  echo -e "  8) 📦 检查/安装依赖"
+  echo -e "  9) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
+  echo -e "  10) 🗑️  卸载"
   echo -e "  0) 🚪 退出"
   echo
   # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，
@@ -1177,25 +1111,25 @@ main_menu() {
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
-    3) start_netns_mode || true;;
-    4) stop_vpn || true;;
-    5) manage_accounts;;
-    6) manage_cron;;
-    7) manage_deps;;
-    8) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
+    3) start_netns_mode socat || true;;
+    4) start_netns_mode iptables || true;;
+    5) stop_vpn || true;;
+    6) manage_accounts;;
+    7) manage_cron;;
+    8) manage_deps;;
+    9) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
          test_netns_ipv6 || true
        else
          log_err "Netns 模式未运行，无法测试"
        fi;;
-    9) uninstall; exit 0;;
-    10) manage_forwarder;;
+    10) uninstall; exit 0;;
     0) exit 0;;
     *) log_err "无效选项 '$c'";;
   esac
-  # 选项 5/6、直接回车或输错键时，上面那条 AND 列表返回 1；而"函数最后一条语句返回
+  # 选项 6/7、直接回车或输错键时，上面那条 AND 列表返回 1；而"函数最后一条语句返回
   # 非 0"会让 set -e 结束整个脚本（实测：在主菜单按一下回车程序就退出了）。
   # 显式 return 0，保证任何输入都回到菜单循环里。
-  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
+  [[ "$c" =~ ^([1-5]|8|9)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
   return 0
 }
 

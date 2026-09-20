@@ -31,8 +31,6 @@ SHORTCUT_PATH="/usr/local/bin/ocm"
 # no marker file, so every dependency counts as "already there" (the safe direction).
 DEPS_STATE_DIR="/var/lib/oc-master"
 DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
-# Port-forwarding backend preference (set from menu 10): auto | socat | iptables
-FWD_PREF_FILE="${DEPS_STATE_DIR}/forwarder"
 
 # --- Routing & Network Config ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -554,13 +552,13 @@ _load_account_by_index() {
 
 # --- Core Start/Stop Logic ---
 _execute_with_safety_net() {
-  local func_to_run="$1"
+  local func_to_run="$1"; shift   # remaining args are passed through (menus 3/4 pass the backend)
   trap cleanup_on_interrupt SIGINT
   check_atd
   local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || echo "none")
   [ "$job" != "none" ] && log_warn "Failsafe cleanup job set (Job $job). Will auto-rollback if connection fails within 2 minutes."
 
-  if "$func_to_run"; then
+  if "$func_to_run" "$@"; then
     trap - SIGINT # Success, remove the trap
     [ "$job" != "none" ] && atrm "$job" && log "Connection stable, failsafe job cancelled."
     show_status || true
@@ -617,16 +615,24 @@ _start_ocproxy_logic() {
   log_err "ocproxy connection failed or timed out"; return 1
 }
 
+# Menu 3/4: Netns mode; the forwarding backend comes straight from the menu entry
+# (no more "switch a preference" step). $1 = socat or iptables
 start_netns_mode() {
+  local want_fwd="${1:-socat}"
   is_vpn_running && { log_err "VPN is already running"; return; }
   ensure_pkg_openconnect
   ensure_cmd_gost || return
-  ensure_cmd_socat || true  # missing socat is not fatal: the backend falls back to iptables double NAT
+  if [ "$want_fwd" = "socat" ]; then
+    # socat was explicitly chosen: if it cannot be installed, refuse instead of
+    # silently switching to another backend
+    ensure_cmd_socat || { log_err "socat is unavailable, Netns (socat) cannot start. Use menu 4 for kernel forwarding."; return; }
+  fi
   select_account || return
   select_protocol || return
-  _execute_with_safety_net "_start_netns_logic"
+  _execute_with_safety_net "_start_netns_logic" "$want_fwd"
 }
 _start_netns_logic() {
+  local want_fwd="${1:-socat}"
   local socks_port
   while true;do read -rp "Please enter the SOCKS5 listening port (e.g. 8585): " socks_port || { echo; log_err "Standard input ended, start cancelled."; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "Invalid port";continue; }; _check_port_free "$socks_port" || { log_err "Port is already in use"; continue; }; break; done
   
@@ -701,11 +707,12 @@ _start_netns_logic() {
   sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost failed to start in Netns"; return 1; fi
   log "SOCKS5 service (gost) started in Netns (PID: $gost_pid)"
   
-  log_info "Configuring port forwarding from host to Netns..."
-  # The backend comes from the module area (socat preferred, iptables as fallback;
-  # OCM_FORWARDER can force one).
-  local fwd=""
-  fwd="$(_fwd_pick)" || { log_err "Neither socat nor iptables is available; Netns mode cannot start."; return 1; }
+  log_info "Configuring port forwarding from host to Netns (backend: ${want_fwd})..."
+  # Backend comes from the menu entry (3=socat / 4=iptables); OCM_FORWARDER can still
+  # override it once, for scripted calls.
+  local fwd="$want_fwd"
+  if [ -n "${OCM_FORWARDER:-}" ] && _fwd_avail "$OCM_FORWARDER"; then fwd="$OCM_FORWARDER"; fi
+  _fwd_avail "$fwd" || { log_err "Forwarding backend '$fwd' is unavailable; Netns mode cannot start."; return 1; }
   _FWD_DESC=""; _FWD_STATE=""
   _fwd_setup "$fwd" "$socks_port" "$listen_addr" || return 1
 
@@ -767,69 +774,25 @@ cleanup_ssh_protect_routes() {
 #               all four access paths; adding one SNAT rule made every one of them work.
 #
 #  Entry points (the main flow knows only these):
-#     _fwd_pick                          -> pick a backend (OCM_FORWARDER forces one)
+#     _fwd_avail <name>                  -> is that backend available right now
 #     _fwd_setup <backend> <port> <bind> -> 0 = ok; fills _FWD_DESC / _FWD_STATE
 #     _fwd_teardown <backend>            -> remove per the rule strings in state; repeatable
-#  Adding a backend: write _fwd_setup_<name> and _fwd_teardown_<name>, then add one line to
-#  _fwd_avail, to the candidate list in _fwd_pick and to each dispatch below. Nothing in the
-#  main flow, the stop flow or the status display needs to change.
+#  The backend comes straight from the menu entry (3=socat / 4=iptables); there is no
+#  "preference" step any more. Adding a backend: write _fwd_setup_<name> and
+#  _fwd_teardown_<name>, then add one line to _fwd_avail, to each dispatch below, and a
+#  menu entry. Nothing in the main flow, the stop flow or the status display needs to change.
 # ============================================================================
 _FWD_DESC=""    # backend actually used (written to state as FORWARDER)
 _FWD_STATE=""   # extra lines to append to the state file
 
-# Forwarding-backend preference (menu 10). The file holds a single word:
-# auto | socat | iptables. A missing file or garbage content means auto, so machines
-# upgraded from older versions keep behaving exactly as before.
-_fwd_pref_get() {
-  local v="auto"
-  [ -f "$FWD_PREF_FILE" ] && v="$(head -n1 "$FWD_PREF_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
-  case "$v" in socat|iptables|auto) printf '%s' "$v" ;; *) printf 'auto' ;; esac
-  return 0
-}
-_fwd_pref_set() {
-  case "$1" in socat|iptables|auto) ;; *) return 1 ;; esac
-  mkdir -p "$DEPS_STATE_DIR" 2>/dev/null || return 1
-  printf '%s\n' "$1" > "$FWD_PREF_FILE" 2>/dev/null || return 1
-  return 0
-}
-# One-line description for the menu / status area
-_fwd_pref_label() {
-  case "$(_fwd_pref_get)" in
-    socat)    printf 'socat (process relay)' ;;
-    iptables) printf 'iptables double NAT (kernel forwarding)' ;;
-    *)        printf 'auto (socat preferred)' ;;
-  esac
-  return 0
-}
-
+# The backend is decided directly by the menu entry (3=socat / 4=iptables);
+# there is no "pick a preference" step any more.
 _fwd_avail() {
   case "$1" in
     socat)    command -v socat &>/dev/null ;;
     iptables) command -v iptables &>/dev/null || [ -x "$IPTABLES_CMD" ] ;;
     *)        return 1 ;;
   esac
-}
-
-_fwd_pick() {
-  local want="${OCM_FORWARDER:-}" b pref
-  # 1) Environment variable wins (scripted calls / one-off override)
-  if [ -n "$want" ]; then
-    if _fwd_avail "$want"; then echo "$want"; return 0; fi
-    log_warn "Requested forwarding backend '$want' is unavailable, falling back to auto." >&2
-  fi
-  # 2) Preference from menu 10; fall back to auto when it is currently unavailable
-  pref="$(_fwd_pref_get)"
-  case "$pref" in
-    socat|iptables)
-      if _fwd_avail "$pref"; then echo "$pref"; return 0; fi
-      log_warn "Preferred backend '$pref' is currently unavailable, falling back to auto." >&2
-      ;;
-  esac
-  # 3) Auto: socat first, iptables double NAT when socat is missing
-  for b in socat iptables; do
-    if _fwd_avail "$b"; then echo "$b"; return 0; fi
-  done
-  return 1
 }
 
 _fwd_setup() {
@@ -924,35 +887,6 @@ _fwd_teardown_iptables() {
     esac
   done
   return 0
-}
-
-# Menu 10: pick the port-forwarding backend. Stored in FWD_PREF_FILE and applied the
-# next time Netns mode starts.
-manage_forwarder() {
-  local c
-  while true; do
-    clear; title "🔀 Port forwarding backend (Netns mode)"; sep
-    echo -e "  Current: ${C_CYAN}$(_fwd_pref_label)${C_RESET}"
-    echo
-    echo -e "  ${C_GREEN}1)${C_RESET} auto      ${C_GREY}socat first; falls back to iptables when socat is missing${C_RESET}"
-    echo -e "  ${C_GREEN}2)${C_RESET} socat     ${C_GREY}process relay: client↔socat↔gost, two independent connections${C_RESET}"
-    echo -e "  ${C_GREEN}3)${C_RESET} iptables  ${C_GREY}double NAT: DNAT into the netns + SNAT so the reply gets back${C_RESET}"
-    echo -e "  ${C_GREY}4) Back${C_RESET}"
-    echo
-    sep
-    echo -e "  ${C_GREY}Available here: socat $(_fwd_avail socat && echo OK || echo missing) · iptables $(_fwd_avail iptables && echo OK || echo missing)${C_RESET}"
-    echo -e "  ${C_GREY}Applies to Netns sessions started afterwards; running ones are unaffected.${C_RESET}"
-    echo
-    read -rp "Select [1-4]: " c || { echo; log_info "Standard input ended."; return 0; }
-    case "$c" in
-      1) _fwd_pref_set auto     && log "Set to: auto (socat preferred)" ;;
-      2) _fwd_pref_set socat    && log "Set to: socat" ;;
-      3) _fwd_pref_set iptables && log "Set to: iptables double NAT" ;;
-      4) return 0 ;;
-      *) log_err "Invalid option"; sleep 1; continue ;;
-    esac
-    sleep 1
-  done
 }
 
 stop_vpn() {
@@ -1160,7 +1094,8 @@ uninstall() {
   fi
   
   rm -f "$ACCOUNTS_FILE"; log "Account file deleted"
-  rm -f "$DEPS_MARK_FILE" "$FWD_PREF_FILE"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
+  # Older builds (the menu-10 scheme) may have left a forwarder preference file behind
+  rm -f "$DEPS_MARK_FILE" "${DEPS_STATE_DIR}/forwarder"; rmdir "$DEPS_STATE_DIR" 2>/dev/null || true
   remove_shortcut
   log_info "Deleting script file: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "Uninstallation complete. Goodbye!"
 }
@@ -1194,15 +1129,15 @@ main_menu() {
   title "Main Menu:"
   echo -e "  ${C_GREEN}1) Start: 🛡️  Default Mode (Global VPN, protects SSH)${C_RESET}"
   echo -e "  ${C_GREEN}2) Start: 🔌 ocproxy Mode (SOCKS5, IPv4 only)${C_RESET}"
-  echo -e "  ${C_GREEN}3) Start: 🌐 Netns Mode (SOCKS5, IPv4+IPv6 Full Features)${C_RESET}"
-  echo -e "  ${C_RED}4) Stop VPN${C_RESET}"
+  echo -e "  ${C_GREEN}3) Start: 🌐 Netns Mode (SOCKS5, socat forwarding)${C_RESET}"
+  echo -e "  ${C_GREEN}4) Start: 🌐 Netns Mode (SOCKS5, iptables double NAT)${C_RESET}"
+  echo -e "  ${C_RED}5) Stop VPN${C_RESET}"
   sep
-  echo -e "  5) ⚙️  Manage VPN Accounts"
-  echo -e "  6) 🗓️  Cron / Daemon Jobs"
-  echo -e "  7) 📦 Check/Install Dependencies"
-  echo -e "  8) 🧪 ${C_CYAN}Test Netns IPv6 Connectivity${C_RESET}"
-  echo -e "  9) 🗑️  Uninstall"
-  echo -e "  10) 🔀 Port forwarding backend ${C_GREY}(now: $(_fwd_pref_label))${C_RESET}"
+  echo -e "  6) ⚙️  Manage VPN Accounts"
+  echo -e "  7) 🗓️  Cron / Daemon Jobs"
+  echo -e "  8) 📦 Check/Install Dependencies"
+  echo -e "  9) 🧪 ${C_CYAN}Test Netns IPv6 Connectivity${C_RESET}"
+  echo -e "  10) 🗑️  Uninstall"
   echo -e "  0) 🚪 Exit"
   echo
   # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
@@ -1211,25 +1146,25 @@ main_menu() {
   case "$c" in
     1) start_default || true;;
     2) start_ocproxy_mode || true;;
-    3) start_netns_mode || true;;
-    4) stop_vpn || true;;
-    5) manage_accounts;;
-    6) manage_cron;;
-    7) manage_deps;;
-    8) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
+    3) start_netns_mode socat || true;;
+    4) start_netns_mode iptables || true;;
+    5) stop_vpn || true;;
+    6) manage_accounts;;
+    7) manage_cron;;
+    8) manage_deps;;
+    9) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
          test_netns_ipv6 || true
        else
          log_err "Netns mode is not running, cannot perform test"
        fi;;
-    9) uninstall; exit 0;;
-    10) manage_forwarder;;
+    10) uninstall; exit 0;;
     0) exit 0;;
     *) log_err "Invalid option '$c'";;
   esac
-  # For options 5/6, a bare Enter or a wrong key, the AND list above returns 1; and a
+  # For options 6/7, a bare Enter or a wrong key, the AND list above returns 1; and a
   # function whose last statement returns non-zero makes set -e terminate the whole script
   # (measured: pressing Enter at the main menu quit the program). Return explicitly.
-  [[ "$c" =~ ^([1-4]|7|8|10)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
+  [[ "$c" =~ ^([1-5]|8|9)$ ]] && read -n1 -s -p $'\n'"Press any key to return to the main menu..."
   return 0
 }
 
