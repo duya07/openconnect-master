@@ -1139,7 +1139,7 @@ main_menu() {
   echo -e "  7) 🗓️  设置定时/守护任务"
   echo -e "  8) 📦 检查/安装依赖"
   echo -e "  9) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
-  echo -e "  10) 🗑️  卸载"
+  echo -e " 10) 🗑️  卸载"
   echo -e "  0) 🚪 退出"
   echo
   # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，

@@ -1183,7 +1183,7 @@ main_menu() {
   echo -e "  7) 🗓️  Cron / Daemon Jobs"
   echo -e "  8) 📦 Check/Install Dependencies"
   echo -e "  9) 🧪 ${C_CYAN}Test Netns IPv6 Connectivity${C_RESET}"
-  echo -e "  10) 🗑️  Uninstall"
+  echo -e " 10) 🗑️  Uninstall"
   echo -e "  0) 🚪 Exit"
   echo
   # Exit when stdin ends (pipe/redirect): otherwise the trailing return 0 makes the
