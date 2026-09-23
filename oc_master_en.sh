@@ -6,11 +6,13 @@
 #   - Enhancement(Netns): socat forwarding now supports dual-stack (IPv4 & IPv6) listening.
 #   - New(Netns): Added active IPv6 connectivity test function at startup and in the menu.
 #   - New: OpenConnect protocol selection, supporting AnyConnect / Pulse(Ivanti) / NC(Juniper).
-#   - Removed(Netns): iptables DNAT fallback forwarder (measured: under a global VPN inside
-#     the netns replies are swallowed by tun, so its data plane is dead). socat is now
-#     required; cleanup of legacy state is still kept for compatibility.
+#   - New(Netns): port forwarding is split into two menu entries - 3) socat forwarding and
+#     4) iptables double NAT; the latter sets route_localnet=1 on its own veth at startup
+#     (host-generated traffic keeps 127.0.0.1 as its source after the DNAT, and by default
+#     that address may not leave the interface, so the packet is dropped as a martian).
 #   - Improved: the ocm shortcut is installed automatically at startup and shown in the
-#     status area (no longer its own menu item); the main menu is a compact two-column layout.
+#     status area (no longer its own menu item); the main menu stays single-column with
+#     emoji icons and per-line colours.
 # =================================================================
 set -euo pipefail
 

@@ -7,10 +7,11 @@
 #   - 增强(Netns): socat 转发支持 IPv4 和 IPv6 双栈监听。
 #   - 新增(Netns): 启动时和菜单中增加 IPv6 连通性主动测试功能。
 #   - 新增: OpenConnect 协议选择，支持 AnyConnect / Pulse(Ivanti) / NC(Juniper)。
-#   - 移除(Netns): iptables DNAT 备用转发（实测在 netns 全局 VPN 下回包被吸进 tun、
-#     数据面不通），socat 改为必需；旧 state 的规则清理保留兼容。
+#   - 新增(Netns): 端口转发拆成两个启动项——3) socat 转发 / 4) iptables 双 NAT；
+#     后者启动时需放开 veth 的 route_localnet（本机流量经 DNAT 后源地址仍是
+#     127.0.0.1，默认不允许从该接口出去，包会被当 martian 丢掉）。
 #   - 改进: ocm 快捷命令改为启动时自动安装、状态区显示（不再占一个菜单项）；
-#     主菜单改为两列紧凑排版，状态区合并为紧凑行。
+#     主菜单保持一列 + emoji 图标 + 整行颜色。
 # =================================================================
 set -euo pipefail
 
