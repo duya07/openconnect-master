@@ -59,7 +59,7 @@ Three Running Modes | Policy Routing Protection | Network Namespace Isolation | 
 
 ## 📦 System Requirements
 
-- **Operating System**: Debian/Ubuntu/CentOS/RHEL or other Linux distributions
+- **Operating System**: Debian/Ubuntu/CentOS/RHEL or other Linux distributions (**fully tested on Debian 12 only**; please verify on other distributions first)
 - **Permissions**: Root access required
 - **Network**: Internet access required
 - **Dependencies**: Script will automatically detect and install necessary dependencies

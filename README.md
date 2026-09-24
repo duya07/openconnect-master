@@ -59,7 +59,7 @@
 
 ## 📦 系统要求
 
-- **操作系统**: Debian/Ubuntu/CentOS/RHEL 或其他 Linux 发行版
+- **操作系统**: Debian/Ubuntu/CentOS/RHEL 或其他 Linux 发行版（**目前只在 Debian 12 上做过完整测试**，其他发行版请先自行验证）
 - **权限**: 需要 root 权限
 - **网络**: 需要能访问外网
 - **依赖**: 脚本会自动检测并安装必要依赖
