@@ -24,6 +24,9 @@ GOST_PID_FILE="/var/run/oc_gost.pid"
 SOCAT_PID_FILE="/var/run/oc_socat.pid"
 SOCAT_PID_FILE_V6="${SOCAT_PID_FILE}.v6"
 STATE_FILE="/var/run/oc_manager.state"
+# setup_netns turns the kernel forwarding switches on; the previous values are recorded here
+# so cleanup_netns can put them back
+SYSCTL_STATE_FILE="/var/run/oc_manager.sysctl"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
 SHORTCUT_PATH="/usr/local/bin/ocm"
 # Dependency marker: records only the dependencies THIS script installed. Uninstall
@@ -59,24 +62,6 @@ log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
 sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "Please run as root"; exit 1; }; }
-
-# Terminal display width: non-ASCII (CJK etc.) counts as 2 columns, used to align the
-# two-column menu. UTF-8 locale is set explicitly - the script may be invoked from cron
-# or from an environment without LANG, where wc -m degrades to byte counts and the width
-# math (and therefore the menu) would be wrong.
-_disp_w() {
-  local s="$1" c b
-  c=$(printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m)
-  b=$(printf '%s' "$s" | LC_ALL=C wc -c)
-  echo $(( c + (b - c) / 2 ))
-}
-_pad() { # left-align, padded with spaces to N columns (must return 0: used as an AND-list tail)
-  local s="$1" w="$2" cur
-  cur=$(_disp_w "$s")
-  printf '%s' "$s"
-  [ "$cur" -lt "$w" ] && printf '%*s' "$(( w - cur ))" ''
-  return 0
-}
 
 # --- ocm Shortcut Command ---
 # Use a symlink instead of a copy: the script resolves its own real path with
@@ -182,10 +167,10 @@ _DEPS_LIST=(
   "openconnect|openconnect|VPN client (needed by all three modes)"
   "ocproxy|ocproxy|ocproxy mode"
   "gost|gost|SOCKS5 server for Netns mode"
-  "socat|socat|Port forwarding for Netns mode (preferred; falls back to iptables double NAT)"
+  "socat|socat|Port forwarding for Netns mode (preferred; also provides an IPv4/IPv6 entry point; without it menu 3 cannot start - use menu 4 for the kernel path)"
 )
 
-# Menu 7: scan the current state first, then decide what to install
+# Menu 8: scan the current state first, then decide what to install
 show_deps() {
   local entry name cmd desc state
   title "📦 Dependency status:"
@@ -249,10 +234,23 @@ ensure_cmd_ss()          { command -v ss &>/dev/null || { _pkg_install iproute2 
 _install_gost_now() { # installs only, never prompts (the caller already asked)
   log_info "Installing gost using the official script..."
   if ! command -v curl &>/dev/null; then _pkg_install curl; fi
-  bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install || {
-    log_err "gost installation script failed. Please check your network or try installing it manually."
+  # Do NOT write `bash <(curl ...) --install || {...}`: a failure inside the process
+  # substitution is not caught by `||` - when curl fails (DNS/network/404) bash just reads an
+  # empty script and exits 0, so that branch is dead code and the real failure only surfaces
+  # later at the `command -v` check, whose message points at PATH instead of the network.
+  # Download to a file first, then run it.
+  local _gi="/tmp/oc_gost_install.$$.sh"
+  if ! "$CURL_CMD" -fsSL "https://github.com/go-gost/gost/raw/master/install.sh" -o "$_gi"; then
+    log_err "Failed to download the gost installer (network/proxy/404). Check the network or install gost manually."
+    rm -f "$_gi" 2>/dev/null || true
     return 1
-  }
+  fi
+  if ! bash "$_gi" --install; then
+    log_err "The gost installer failed. Check its output or install gost manually."
+    rm -f "$_gi" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$_gi" 2>/dev/null || true
   if ! command -v gost &>/dev/null; then
     log_err "gost command not found after installation. Please check your PATH variable or the script output."
     return 1
@@ -271,12 +269,12 @@ ensure_cmd_gost() {
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
-  log_warn "Netns mode prefers 'socat' for port forwarding (iptables double NAT is the fallback)."
+  log_warn "Netns mode prefers 'socat' for port forwarding (menu 3 needs it; install it, or pick menu 4 for the kernel path)."
   local yn=""
   read -rp "Do you want to install socat now? [Y/n]: " yn || yn=""
-  [[ "$yn" =~ ^[nN]$ ]] && { log_info "Falling back to iptables double NAT for port forwarding."; return 1; }
+  [[ "$yn" =~ ^[nN]$ ]] && { log_info "Cancelled: menu 3 needs socat; use menu 4 for the kernel path."; return 1; }
   _pkg_install socat
-  command -v socat &>/dev/null || { log_warn "socat installation failed, falling back to iptables double NAT."; return 1; }
+  command -v socat &>/dev/null || { log_warn "socat installation failed: menu 3 cannot start, use menu 4 for the kernel path."; return 1; }
   _mark_dep_installed socat
   log "socat has been installed."
   return 0
@@ -339,12 +337,16 @@ _pub_ip() {
 # give false positives; see the note in _start_netns_logic).
 # 0 = usable; 1 = definitely unusable; 2 = cannot tell (even the host egress is unknown,
 # e.g. on a restricted network). Startup and the daemon share it so the two cannot drift.
+# The netns egress address the probe saw (so callers can print real information; the
+# probe's own return value keeps its three-state meaning)
+_NS_PROBE_IP=""
 _netns_vpn_probe() {
   local host_ip ns_ip
+  _NS_PROBE_IP=""
   host_ip="$(_pub_ip -4 2>/dev/null || true)"
   [ -n "$host_ip" ] || return 2
   ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
-  if [ -n "$ns_ip" ] && [ "$ns_ip" != "$host_ip" ]; then return 0; fi
+  if [ -n "$ns_ip" ] && [ "$ns_ip" != "$host_ip" ]; then _NS_PROBE_IP="$ns_ip"; return 0; fi
   return 1
 }
 
@@ -406,28 +408,70 @@ setup_ssh_protect_routes() {
   gw_dev=$("$IP_CMD" route | awk '/^default/ {print $5; exit}')
   gw4=$("$IP_CMD" route | awk '/^default/ {print $3; exit}')
   vps4=$("$IP_CMD" -4 -o addr show dev "$gw_dev" | awk '{print $4}' | cut -d/ -f1 | head -n1)
+  # All three values are required: if parsing fails, `ip route replace default via '' dev ''`
+  # and `ip rule add from '' ...` below both fail, and this function is called from an
+  # if-condition where set -e is suppressed - so the failure would not stop anything and the
+  # script would bring up the global VPN *without* SSH protection, cutting the very SSH
+  # session the user is working from. Fail here instead and let the caller take the failure
+  # path (stop_vpn + cancel the fallback job).
+  [ -n "$gw_dev" ] && [ -n "$gw4" ] && [ -n "$vps4" ] || { log_err "Cannot parse default route / local address (dev='$gw_dev' via='$gw4' addr='$vps4'); aborting so the SSH connection survives"; return 1; }
 
   check_rt_conflict "$RT4_ID" "$RT4_NAME"
   log "Configuring IPv4 policy routing (for SSH protection)..."
-  "$IP_CMD" route replace default via "$gw4" dev "$gw_dev" table "$RT4_ID"
+  # This step must be checked: if the protection table has no default route while the rule
+  # below is still added, traffic from the host address goes into an empty table and becomes
+  # unreachable (the SSH session drops). Refuse to start instead of "half-configuring".
+  "$IP_CMD" route replace default via "$gw4" dev "$gw_dev" table "$RT4_ID" \
+    || { log_err "Failed to write the IPv4 protection route (table $RT4_ID); aborting so the SSH connection survives"; return 1; }
   "$IP_CMD" rule del from "$vps4" table "$RT4_ID" priority 500 2>/dev/null || true
   "$IP_CMD" rule add from "$vps4" table "$RT4_ID" priority 500
   log "IPv4 OK (from $vps4)"
 
   default_ipv6_route=$("$IP_CMD" -6 route | awk '/^default/ && $0 !~ /tun/ {print; exit}' || true)
   vps6=$("$IP_CMD" -6 -o addr show dev "$gw_dev" scope global | awk '{print $4; exit}' | cut -d/ -f1 || true)
-  if [ -n "$default_ipv6_route" ] && [ -n "$vps6" ]; then
-    gw6_addr=$(echo "$default_ipv6_route" | awk '{print $3}')
-    gw6_if=$(echo "$default_ipv6_route" | awk '{print $5}')
-    echo "$default_ipv6_route" | grep -q " onlink " && onlink_flag="onlink" || onlink_flag=""
+  # The default route can be a multipath one: the first line reads only
+  # "default proto static metric N pref medium" and the real gateway/device live on the
+  # indented "nexthop via X dev Y" lines below it. Taking fixed columns $3/$5 yields
+  # "static"/"1024", `ip -6 route replace` then fails with "inet6 address is expected" - but
+  # the script still added a rule pointing at the (empty) table 101, blackholing that host's
+  # IPv6 traffic (an SSH session over IPv6 drops) while printing "IPv6 OK" (measured on a host
+  # whose IPv6 default route is a two-nexthop multipath route).
+  # So pick the fields by the via/dev keywords instead of columns, validate, and skip IPv6
+  # protection when they cannot be resolved.
+  local v6line="" v6_ok=""
+  v6line=$("$IP_CMD" -6 route | awk '
+    /^default/ { inblk=1; if ($0 !~ /tun/ && $0 ~ / via /) { print; exit } ; next }
+    inblk && /^[[:space:]]/ { if ($0 !~ /tun/ && $0 ~ / via /) { print; exit } ; next }
+    { inblk=0 }' || true)
+  if [ -n "$v6line" ]; then
+    gw6_addr=$(printf '%s\n' "$v6line" | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
+    gw6_if=$(printf '%s\n' "$v6line" | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    case "$v6line" in *" onlink "*|*" onlink") onlink_flag="onlink" ;; esac
+  fi
+  # Validate: the gateway must look like an IPv6 address, the device must exist, and it must
+  # be the same device as the IPv4 default route - the protection table's default route has
+  # to leave through the NIC that owns the host address, or source and egress device mismatch.
+  [ -n "$gw6_addr" ] && [ -n "$gw6_if" ] && [ "${gw6_addr#*:}" != "$gw6_addr" ] \
+    && [ "$gw6_if" = "$gw_dev" ] \
+    && "$IP_CMD" link show dev "$gw6_if" >/dev/null 2>&1 && v6_ok=1
+  if [ -n "$default_ipv6_route" ] && [ -n "$vps6" ] && [ -n "$v6_ok" ]; then
     check_rt_conflict "$RT6_ID" "$RT6_NAME"
     log "Configuring IPv6 policy routing (for SSH protection)..."
-    "$IP_CMD" -6 route replace default via "$gw6_addr" dev "$gw6_if" $onlink_flag table "$RT6_ID"
-    "$IP_CMD" -6 rule del from "$vps6" table "$RT6_ID" priority 500 2>/dev/null || true
-    "$IP_CMD" -6 rule add from "$vps6" table "$RT6_ID" priority 500
-    log "IPv6 OK (from $vps6)"
+    if "$IP_CMD" -6 route replace default via "$gw6_addr" dev "$gw6_if" $onlink_flag table "$RT6_ID"; then
+      "$IP_CMD" -6 rule del from "$vps6" table "$RT6_ID" priority 500 2>/dev/null || true
+      "$IP_CMD" -6 rule add from "$vps6" table "$RT6_ID" priority 500
+      log "IPv6 OK (from $vps6)"
+    else
+      # As with IPv4: never add the rule when the protection table could not be written
+      # (IPv6 traffic would be sent into an empty table).
+      log_warn "Failed to write the IPv6 protection route; skipping IPv6 protection (IPv4 protection is unaffected)"
+    fi
   else
-    log_info "No available IPv6 default route or address, skipping IPv6 setup"
+    if [ -n "$default_ipv6_route" ] && [ -n "$vps6" ]; then
+      log_warn "IPv6 default route has no resolvable gateway (multipath/nexthop form?); skipping IPv6 protection"
+    else
+      log_info "No available IPv6 default route or address, skipping IPv6 setup"
+    fi
     vps6="" # ensure vps6 is empty
   fi
 
@@ -459,6 +503,13 @@ setup_netns() {
   "$IP_CMD" netns exec "${NETNS_NAME}" "$IP_CMD" addr add "${VETH_NS_IP}/24" dev "${VETH_NS}"
   "$IP_CMD" netns exec "${NETNS_NAME}" "$IP_CMD" route add default via "${VETH_HOST_IP}"
   
+  # Record the previous values first: cleanup only restores switches that were off and got
+  # turned on by us, so programs that genuinely rely on forwarding=1 (containers, forwarders)
+  # are left alone.
+  printf 'SYSCTL_IPFWD_ORIG=%s\nSYSCTL_V6FWD_ORIG=%s\n' \
+    "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo unknown)" \
+    "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo unknown)" \
+    > "$SYSCTL_STATE_FILE" 2>/dev/null || true
   log_info "Enabling kernel IP forwarding..."
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
@@ -487,6 +538,22 @@ cleanup_netns() {
   # it over /etc/resolv.conf). Remove it here too, otherwise every Netns run leaves a
   # directory behind on the system, and it survives uninstalling the script.
   rm -rf "/etc/netns/${NETNS_NAME}" 2>/dev/null || true
+  # Restore the forwarding switches: only a previous value of 0 (i.e. one we turned on
+  # ourselves) is put back, anything else is left untouched.
+  if [ -f "$SYSCTL_STATE_FILE" ]; then
+    local _ipfwd_orig="" _v6fwd_orig=""
+    _ipfwd_orig=$(grep '^SYSCTL_IPFWD_ORIG=' "$SYSCTL_STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)
+    _v6fwd_orig=$(grep '^SYSCTL_V6FWD_ORIG=' "$SYSCTL_STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)
+    if [ "$_ipfwd_orig" = "0" ]; then
+      sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+      log_info "Restored net.ipv4.ip_forward to 0 (it was 0 before the script started)"
+    fi
+    if [ "$_v6fwd_orig" = "0" ]; then
+      sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+      log_info "Restored net.ipv6.conf.all.forwarding to 0 (it was 0 before the script started)"
+    fi
+    rm -f "$SYSCTL_STATE_FILE" 2>/dev/null || true
+  fi
   log "Netns base environment has been cleaned up."
 }
 
@@ -501,7 +568,7 @@ EOT
   # (a spurious extra pause that also eats one character of the next input).
   local c
   while true; do
-    clear; title "🔐 Manage VPN Accounts ($ACCOUNTS_FILE)"; sep
+    clear 2>/dev/null || true; title "🔐 Manage VPN Accounts ($ACCOUNTS_FILE)"; sep
     grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  File is empty."
     sep; echo "  1) Add  2) Delete  3) Back"; read -rp "Select [1-3]: " c || { echo; log_info "Standard input ended, returning."; return 0; }
     case "$c" in
@@ -571,8 +638,18 @@ _execute_with_safety_net() {
   local func_to_run="$1"; shift   # remaining args are passed through (menus 3/4 pass the backend)
   trap cleanup_on_interrupt SIGINT
   check_atd
-  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || echo "none")
-  [ "$job" != "none" ] && log_warn "Failsafe cleanup job set (Job $job). Will auto-rollback if connection fails within 2 minutes."
+  # The job id must be numeric to count as scheduled: when at fails (atd not running, time
+  # expression rejected) awk receives an empty string, while the old `|| echo "none"` never
+  # fired - the last stage of that pipeline is awk, whose exit status is always 0. The empty
+  # job was therefore reported as "fallback job set (Job )" although no rollback existed
+  # (measured: a syntax error makes at exit 1 and print no job line at all).
+  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || true)
+  [[ "${job:-}" =~ ^[0-9]+$ ]] || job="none"
+  if [ "$job" != "none" ]; then
+    log_warn "Failsafe cleanup job set (Job $job). Will auto-rollback if connection fails within 2 minutes."
+  else
+    log_warn "Could not schedule the failsafe cleanup job (at/atd unavailable); run stop manually if this start fails."
+  fi
 
   if "$func_to_run" "$@"; then
     trap - SIGINT # Success, remove the trap
@@ -592,8 +669,10 @@ _execute_with_safety_net() {
 
 start_default() { is_vpn_running && { log_err "VPN is already running"; return; }; ensure_pkg_openconnect; select_account || return; select_protocol || return; _execute_with_safety_net "_start_default_logic"; }
 _start_default_logic() {
-  setup_ssh_protect_routes
-  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null
+  # The protection routes are a precondition of default mode: starting the global VPN
+  # without them can lock the user out (the SSH session drops).
+  setup_ssh_protect_routes || return 1
+  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null || true
   log_info "Connecting to VPN [Default Mode / Protocol: ${VPN_PROTOCOL:-anyconnect}]: $VPN_HOST ..."
   local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
@@ -669,18 +748,27 @@ _start_netns_logic() {
   local socks_user="" socks_pass="" need_auth=""
   read -rp "Set a SOCKS5 username/password? [y/N]: " need_auth || need_auth=""
   if [[ "$need_auth" =~ ^[yY]$ ]]; then
-    # gost parses socks5://user:pass@host:port, so @ : / in either field splits the URL
-    # the wrong way (measured: gost then fails to start, or auth is silently a no-op).
     while true; do
       read -rp "  Username: " socks_user || socks_user=""
       [ -n "$socks_user" ] || { log_err "  Username cannot be empty (press Enter on the previous question to skip auth)"; continue; }
-      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  Username must not contain @ : / quotes backslash or blanks (it breaks gost's URL)"; continue ;; esac
+      # gost and the client both parse socks5://user:pass@host:port as a URL: `/`, blanks,
+      # backslashes and quotes really break it (measured: `/` and a blank make gost fail to
+      # start with a lookup error, `\` gives "net/url: invalid userinfo").
+      # A username additionally rejects `@` and `:`, measured: with user=`a@b` the two ends
+      # resolve different credentials (curl's auth fails, http_code=000) and with user=`abc:`
+      # one colon is cut off to the password - i.e. what the user types is not what takes
+      # effect, and the script's own check uses the URL form and cannot see the difference.
+      # Both characters are fine inside the PASSWORD (measured: `p@ss` and `pa:ss` both
+      # authenticate), so the password side allows them.
+      # The official `?auth=<base64>` alternative was measured to fail authentication when the
+      # base64 contains `/`, so it is not used.
+      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  Username must not contain @ : / quotes backslash or blanks (it would silently change the effective credentials)"; continue ;; esac
       break
     done
     while true; do
       read -rsp "  Password: " socks_pass || socks_pass=""; echo
       [ -n "$socks_pass" ] || { log_warn "  Empty password, auth stays disabled for this session."; socks_user=""; break; }
-      case "$socks_pass" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  Password must not contain @ : / quotes backslash or blanks (it breaks gost's URL)"; continue ;; esac
+      case "$socks_pass" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  Password must not contain / quotes backslash or blanks (it breaks gost's URL parsing)"; continue ;; esac
       log_info "  SOCKS5 auth enabled (username: ${socks_user})"
       break
     done
@@ -695,7 +783,11 @@ _start_netns_logic() {
   
   log_info "Waiting for OpenConnect to establish TUN interface...";
   for ((i=0; i<20; i++)); do
-    if [ -f "$PID_FILE" ] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -F "$(cat "$PID_FILE")" && \
+    # The pid must be a non-empty number before matching: `grep -F ""` matches every line,
+    # so an empty pid file (openconnect failed to write it) would always look like "the
+    # process is inside the netns" and the TUN would be considered ready.
+    local _pid=""; [ -f "$PID_FILE" ] && _pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+    if [[ "$_pid" =~ ^[0-9]+$ ]] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -xF "$_pid" && \
        "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
       log "OpenConnect TUN interface is ready (PID=$(cat "$PID_FILE"))"; sleep 2; break
     fi
@@ -739,7 +831,7 @@ _start_netns_logic() {
     log_err "The VPN inside Netns is still unusable after ~50s; treating startup as failed (gost would otherwise egress through this machine)"
     return 1
   fi
-  log "VPN inside Netns is usable (waited ~$(( (i-1) * 8 ))s, egress ${ns_ip:-unknown})"
+  log "VPN inside Netns is usable (waited ~$(( (i-1) * 8 ))s, egress ${_NS_PROBE_IP:-unknown})"
 
   log_info "Testing IPv4 connectivity via VPN inside Netns...";
   if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then
@@ -751,8 +843,11 @@ _start_netns_logic() {
   test_netns_ipv6 || true
 
   log_info "Starting SOCKS5 service (gost) in Netns..."
-  local gost_listen="socks5://0.0.0.0:${socks_port}"
-  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@0.0.0.0:${socks_port}"
+  # The listen address is written without a host: gost's `socks5://:PORT` listens on IPv4 and
+  # IPv6 at once (measured: ss shows *:PORT; same with credentials), while `0.0.0.0:PORT`
+  # listens on IPv4 only - and the menu/status have always claimed "(IPv4+IPv6)".
+  local gost_listen="socks5://:${socks_port}"
+  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@:${socks_port}"
   "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="${gost_listen}" >/dev/null 2>&1 &
   local gost_pid=$!; echo "$gost_pid" > "$GOST_PID_FILE"
   sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost failed to start in Netns"; return 1; fi
@@ -897,13 +992,21 @@ _fwd_setup_iptables() {
   local dst="${VETH_NS_IP}:${socks_port}"
   local R_OUT R_PRE="" R_SNAT
   R_SNAT="-p tcp -d ${VETH_NS_IP} --dport ${socks_port} -j SNAT --to-source ${VETH_HOST_IP}"
+  # Remove a stale OUTPUT rule left by an older version: the old "public bind" rule had no
+  # addrtype restriction, so if the state file is gone (/var/run cleared, or the cross-mode
+  # case above) it can neither be found nor deleted - and it sits in front of the new rule,
+  # so traffic this host sends to a remote host on the same port is still hijacked, which
+  # looks like "the fix did nothing".
+  "$IPTABLES_CMD" -t nat -D OUTPUT -p tcp --dport "${socks_port}" -j DNAT --to-destination "${dst}" 2>/dev/null || true
   if [ "$listen_addr" = "0.0.0.0" ] || [ "$listen_addr" = "::" ]; then
     # Public bind: traffic generated locally goes through OUTPUT and external traffic through
-    # PREROUTING, so both rules are needed. The OUTPUT rule deliberately does not restrict the
-    # destination: the host may connect to 127.0.0.1 or to its own LAN address, and the latter
-    # does not work with PREROUTING alone (locally generated traffic never traverses it).
-    R_OUT="-p tcp --dport ${socks_port} -j DNAT --to-destination ${dst}"
-    R_PRE="$R_OUT"
+    # PREROUTING, so both rules are needed. The OUTPUT rule uses addrtype to restrict itself to
+    # "the destination is a local address": that covers 127.0.0.1 as well as the host's own LAN
+    # addresses (the latter does not work with PREROUTING alone - locally generated traffic
+    # never traverses it) while no longer hijacking traffic the host sends to a REMOTE host on
+    # the same port. Measured: the counter rises for a local destination, stays put for 1.1.1.1.
+    R_OUT="-p tcp -m addrtype --dst-type LOCAL --dport ${socks_port} -j DNAT --to-destination ${dst}"
+    R_PRE="-p tcp --dport ${socks_port} -j DNAT --to-destination ${dst}"
   else
     # Local-only bind: restrict to 127.0.0.1 and skip PREROUTING, matching "socat bind 127.0.0.1"
     R_OUT="-p tcp -d 127.0.0.1 --dport ${socks_port} -j DNAT --to-destination ${dst}"
@@ -957,7 +1060,7 @@ stop_vpn() {
   # cleanup_ssh_protect_routes and rm, leaving a stale ip rule and state behind (measured:
   # iprule left at 4 lines; with the health cron installed it would also retry the bad
   # account every 5 minutes).
-  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ] && ! [ -f "$STATE_FILE" ]; then log_info "VPN is not running"; return; fi
+  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ] && ! [ -f "$STATE_FILE" ] && ! [ -f "$SYSCTL_STATE_FILE" ]; then log_info "VPN is not running"; return; fi
   log_info "Stopping VPN and cleaning up environment...";
   # || true: this one is especially dangerous - the assignment is the last command of an
   # `[ -f ] && ...` list, so a failure aborts stop_vpn entirely: no process killed, no temp
@@ -977,22 +1080,44 @@ stop_vpn() {
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
       if [ -f "$PID_FILE" ]; then
         local oc_pid; oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
-        kill "$oc_pid" 2>/dev/null || true
-        # Must wait for openconnect to exit before tearing down netns/veth: it has to
-        # log out to the gateway over that veth->NAT path (tearing it down first makes
-        # it hang on a TLS timeout - see _wait_pid_gone).
-        _wait_pid_gone "$oc_pid"
+        # As in default|ocproxy: the pid file can be a stale record, check identity first
+        if [ -n "$oc_pid" ] && [ "$(cat /proc/${oc_pid}/comm 2>/dev/null)" = "openconnect" ]; then
+          kill "$oc_pid" 2>/dev/null || true
+          # Must wait for openconnect to exit before tearing down netns/veth: it has to
+          # log out to the gateway over that veth->NAT path (tearing it down first makes
+          # it hang on a TLS timeout - see _wait_pid_gone).
+          _wait_pid_gone "$oc_pid"
+        fi
       fi
       cleanup_netns
       ;;
     default|ocproxy)
       log_info "Stopping ${MODE} mode..."
-      if [ -f "$PID_FILE" ]; then kill "$(cat "$PID_FILE")" 2>/dev/null || true; fi
+      # As in the netns branch: finishing immediately after kill leaves an openconnect that
+      # is still logging out (measured: still visible 1s after stop, exits on its own after
+      # ~2-3s); restarting right away then fights with it. The logout of default mode goes
+      # out via eth0 and the policy routes are still in place, so wait first, clean up after.
+      local oc_pid=""
+      [ -f "$PID_FILE" ] && oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+      # Check the identity before signalling: the pid file can be a stale record (e.g. the
+      # previous connection was killed with -9 and never unlinked it) and that pid may have
+      # been recycled to an unrelated process - killing/waiting blindly would hit it (and
+      # _wait_pid_gone escalates to SIGKILL).
+      if [ -n "$oc_pid" ] && [ "$(cat /proc/${oc_pid}/comm 2>/dev/null)" = "openconnect" ]; then
+        kill "$oc_pid" 2>/dev/null || true
+        _wait_pid_gone "$oc_pid"
+      fi
       [ "$MODE" = "default" ] && cleanup_ssh_protect_routes
       ;;
     *)
       log_warn "State file not found or mode is unknown, performing generic cleanup..."
-      [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+      # netns mode failures that happen before the state file is written land here (no MODE
+      # in state): wait for openconnect to exit before tearing down netns/veth as well.
+      local oc_pid=""; [ -f "$PID_FILE" ] && oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+      if [ -n "$oc_pid" ] && [ "$(cat /proc/${oc_pid}/comm 2>/dev/null)" = "openconnect" ]; then
+        kill "$oc_pid" 2>/dev/null || true
+        _wait_pid_gone "$oc_pid"
+      fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
@@ -1001,6 +1126,11 @@ stop_vpn() {
       ;;
   esac
   
+  # SYSCTL_STATE_FILE is NOT removed here unconditionally: it is the only evidence needed to
+  # restore the forwarding switches, and only cleanup_netns deletes it (after restoring).
+  # Otherwise a cross-mode sequence - a netns session killed with -9, then the user starts
+  # default mode, whose stop path does not call cleanup_netns - would delete the record while
+  # ip_forward stays 1, with nothing left to restore from.
   rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6"; log "All temporary files cleaned up. Operation complete."
 }
 
@@ -1032,7 +1162,11 @@ show_status() {
         echo -e "    ${C_BOLD}Host Public IPv4:${C_RESET} $(_pub_ip -4 || echo Failed)"
       ;;
       netns)
-        echo -e "    ${C_BOLD}Mode:${C_RESET} 🌐 Network Namespace Proxy ${C_GREEN}(IPv4+IPv6)${C_RESET}"
+        # The iptables double NAT backend only has an IPv4 entry point (kernel DNAT cannot
+        # cross address families), so do not claim IPv4+IPv6 here.
+        local _fam_txt="(IPv4+IPv6)"
+        [ "${FORWARDER:-}" = "iptables" ] && _fam_txt="(IPv4 entry only)"
+        echo -e "    ${C_BOLD}Mode:${C_RESET} 🌐 Network Namespace Proxy ${C_GREEN}${_fam_txt}${C_RESET}"
         local f_info; if [[ "${FORWARDER:-}" == "socat" ]]; then f_info="socat"; else f_info="iptables"; fi
         local auth_txt=""
         [ -n "${SOCKS_USER:-}" ] && auth_txt=" ${C_YELLOW}auth ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
@@ -1070,11 +1204,41 @@ show_status() {
 }
 
 # --- Cron & Uninstall ---
+# Keep a copy of the crontab before writing it: every statement below uses the
+# `... | crontab -` form, so if `crontab -l` ever returns nothing (permissions, a concurrent
+# write, a failing command) the whole crontab is replaced by empty content - and on a
+# production box that can be dozens of jobs. The backup is only taken when the crontab is
+# non-empty, and it never blocks the operation.
+_CRON_BAK="/root/.oc_master-crontab.bak"
+_backup_crontab() {
+  local cur=""
+  cur="$(crontab -l 2>/dev/null || true)"
+  [ -n "$cur" ] || return 0
+  # The crontab often holds passwords/tokens: keep the copy at 600 instead of the default umask
+  if ( umask 077; printf '%s\n' "$cur" > "$_CRON_BAK" ) 2>/dev/null; then
+    log_info "Backed up the current crontab to ${_CRON_BAK}"
+  else
+    log_warn "Could not back up the crontab (${_CRON_BAK} not writable), continuing."
+  fi
+  return 0
+}
+
 manage_cron() {
   # Same as manage_accounts: c must be local, or it clobbers the main menu's choice.
   local c
+  # Some systems (a minimal Debian 12 install, measured) have no cron package at all, so the
+  # crontab command does not exist: every action in this menu would then fail with
+  # command not found and set -e would terminate the whole script.
+  if ! command -v crontab &>/dev/null; then
+    clear 2>/dev/null || true; title "🗓️ Cron / Daemon Jobs"; sep
+    log_err "cron/crontab is not installed on this system, scheduled tasks are unavailable."
+    log_info "Install it first: apt-get install -y cron"
+    sep
+    read -n1 -s -p "Press any key to return to the main menu..." || true
+    return 0
+  fi
   while true; do
-    clear; title "🗓️ Cron / Daemon Jobs"; sep
+    clear 2>/dev/null || true; title "🗓️ Cron / Daemon Jobs"; sep
     crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || log_info "  No cron jobs found for this script."
     sep
     echo -e "  1) Set up daemon task (check every 5 mins, auto-reconnect)"
@@ -1083,12 +1247,22 @@ manage_cron() {
     echo -e "  4) Back to Main Menu"
     read -rp "Please select [1-4]: " c || { echo; log_info "Standard input ended, returning."; return 0; }
     case "$c" in
-      1) log_warn "Daemon task currently supports [Default] and [ocproxy] modes only."
-         (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * $SCRIPT_PATH _internal_check_health"; } | crontab -
+      1) log_warn "Daemon task: Default/ocproxy modes reconnect automatically after a drop; Netns mode stops and cleans up when the tunnel is really gone (no auto-reconnect)."
+         # cron's default PATH for jobs is /usr/bin:/bin (a compile-time constant of Debian's
+         # cron; verified with `strings /usr/sbin/cron`), while openconnect lives in /usr/sbin
+         # and gost in /usr/local/bin - without PATH the daemon task can never find them
+         # (measured: with PATH=/usr/bin:/bin both are MISSING). cron hands the command line to
+         # /bin/sh -c, so putting the assignment in front of the command works: it neither
+         # touches the user's existing PATH line nor depends on the target crontab having one.
+         local cron_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+         _backup_crontab
+         (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * PATH=$cron_path $SCRIPT_PATH _internal_check_health"; } | crontab -
          log "Daemon task has been set.";;
       2) read -rp "Enter cron expression (e.g., '0 2 * * *' for 2 AM daily): " exp
+         _backup_crontab
          [ -z "$exp" ] && { log_err "Expression cannot be empty"; } || { (crontab -l 2>/dev/null || true; echo "$exp $SCRIPT_PATH stop") | crontab -; log "Scheduled stop task added."; };;
-      3) crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "All related cron jobs have been cleared.";;
+      3) _backup_crontab
+         crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "All related cron jobs have been cleared.";;
       4) break;;
       *) log_err "Invalid option";;
     esac; read -n1 -s -p $'\n'"Press any key to return..."
@@ -1119,6 +1293,7 @@ uninstall() {
   read -rp "⚠️  Are you sure you want to uninstall this script and all related configurations? [y/N]: " y || y=""
   [[ "$y" =~ ^[yY]$ ]] || { log_info "Cancelled"; exit 0; }
   log_info "Starting uninstallation..."; stop_vpn
+  _backup_crontab
   crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "Cron jobs cleared"
   
   if command -v gost &>/dev/null; then
@@ -1129,7 +1304,24 @@ uninstall() {
       # then still print "uninstallation attempted" - a false success message.
       # gost is a single binary with no package-manager record, so just delete it.
       log_info "Uninstalling gost..."
-      command -v pkill &>/dev/null && pkill -x gost 2>/dev/null || true
+      # Prefer the PID recorded by this script: `pkill -x gost` matches by process name
+      # globally and would take down gost instances belonging to something else. So only when
+      # there is no usable PID record AND a gost is actually running do we ask the user.
+      local _gp=""
+      if [ -f "$GOST_PID_FILE" ]; then
+        _gp="$(cat "$GOST_PID_FILE" 2>/dev/null || echo "")"
+        if [ -n "$_gp" ] && [ "$(cat /proc/${_gp}/comm 2>/dev/null)" = "gost" ]; then
+          kill "$_gp" 2>/dev/null || true
+        else
+          _gp=""
+        fi
+      fi
+      if [ -z "$_gp" ] && command -v pgrep &>/dev/null && pgrep -x gost >/dev/null 2>&1; then
+        log_warn "A running gost process was found (not the one this script recorded); it may belong to something else."
+        local _gk=""
+        read -rp "Kill every process named gost? [y/N]: " _gk || _gk=""
+        [[ "$_gk" =~ ^[yY]$ ]] && { pkill -x gost 2>/dev/null || true; }
+      fi
       rm -f "$(command -v gost 2>/dev/null)" 2>/dev/null || true
       if command -v gost &>/dev/null; then log_warn "Failed to uninstall gost, please remove it manually."
       else log "gost has been uninstalled."; fi
@@ -1200,7 +1392,9 @@ _internal_cron_handler() {
 
 # --- Main Menu ---
 main_menu() {
-  clear
+  # A failing clear must not break the menu: with TERM unset (e.g. `ssh host ocm` without
+  # -t) clear returns 1 and set -e would kill the whole script right there.
+  clear 2>/dev/null || true
   echo -e "${C_BOLD}========================================================${C_RESET}"
   echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v7.7.7 (Final) 🚀${C_RESET}"
   echo -e "${C_BOLD}========================================================${C_RESET}"
@@ -1210,7 +1404,7 @@ main_menu() {
   echo -e "  ${C_GREEN}1) Start: 🛡️  Default Mode (Global VPN, protects SSH)${C_RESET}"
   echo -e "  ${C_GREEN}2) Start: 🔌 ocproxy Mode (SOCKS5, IPv4 only)${C_RESET}"
   echo -e "  ${C_GREEN}3) Start: 🌐 Netns Mode (SOCKS5, socat forwarding)${C_RESET}"
-  echo -e "  ${C_GREEN}4) Start: 🌐 Netns Mode (SOCKS5, iptables double NAT)${C_RESET}"
+  echo -e "  ${C_GREEN}4) Start: 🌐 Netns Mode (SOCKS5, iptables double NAT, IPv4 entry)${C_RESET}"
   echo -e "  ${C_RED}5) Stop VPN${C_RESET}"
   sep
   echo -e "  6) ⚙️  Manage VPN Accounts"

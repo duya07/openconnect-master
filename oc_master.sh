@@ -23,6 +23,8 @@ GOST_PID_FILE="/var/run/oc_gost.pid"
 SOCAT_PID_FILE="/var/run/oc_socat.pid"
 SOCAT_PID_FILE_V6="${SOCAT_PID_FILE}.v6"
 STATE_FILE="/var/run/oc_manager.state"
+# setup_netns 会打开内核转发开关；改动前的原值记在这里，cleanup_netns 据此还原
+SYSCTL_STATE_FILE="/var/run/oc_manager.sysctl"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
 SHORTCUT_PATH="/usr/local/bin/ocm"
 # 依赖标记：只记录"由本脚本安装"的依赖。卸载时据此区分——脚本装的默认删，
@@ -56,23 +58,6 @@ log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
 sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "请用 root 运行"; exit 1; }; }
-
-# 终端显示宽度：非 ASCII（中文等）按 2 列计，用于两列菜单对齐。
-# 显式指定 UTF-8 locale——脚本可能被 cron 或没有 LANG 的环境调用，
-# 那时 wc -m 会退化成字节数，宽度算错、菜单就会歪。
-_disp_w() {
-  local s="$1" c b
-  c=$(printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m)
-  b=$(printf '%s' "$s" | LC_ALL=C wc -c)
-  echo $(( c + (b - c) / 2 ))
-}
-_pad() { # 左对齐补空格到 N 列（末尾必须 return 0：本函数会作为 AND 列表的末尾被调用）
-  local s="$1" w="$2" cur
-  cur=$(_disp_w "$s")
-  printf '%s' "$s"
-  [ "$cur" -lt "$w" ] && printf '%*s' "$(( w - cur ))" ''
-  return 0
-}
 
 # --- ocm 快捷命令 ---
 # 用符号链接而不是拷贝：脚本自身用 readlink -f "$0" 解析真实路径，所以从
@@ -172,10 +157,10 @@ _DEPS_LIST=(
   "openconnect|openconnect|VPN 客户端（三种模式都要）"
   "ocproxy|ocproxy|ocproxy 模式"
   "gost|gost|Netns 模式的 SOCKS5 服务端"
-  "socat|socat|Netns 模式的端口转发（首选；缺失时自动改用 iptables 双 NAT）"
+  "socat|socat|Netns 模式的端口转发（首选，同时提供 IPv4/IPv6 入口；没有它菜单 3 无法启动，可改用菜单 4 的内核转发）"
 )
 
-# 菜单 7：先扫描现状，再决定装什么
+# 菜单 8：先扫描现状，再决定装什么
 show_deps() {
   local entry name cmd desc state
   title "📦 依赖状态:"
@@ -238,10 +223,21 @@ ensure_cmd_ss()          { command -v ss &>/dev/null || { _pkg_install iproute2 
 _install_gost_now() { # 只负责装，不询问（询问交给调用方，避免重复提问）
   log_info "正在使用官方脚本安装 gost..."
   if ! command -v curl &>/dev/null; then _pkg_install curl; fi
-  bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install || {
-    log_err "gost 安装脚本执行失败。请检查网络或尝试手动安装。"
+  # 不能写成 `bash <(curl ...) --install || {...}`：进程替换里的失败不会被 `||` 捕获——
+  # curl 因 DNS/网络/404 失败时 bash 只是读到空输入、正常退出 0，那个失败分支是死代码，
+  # 真正的失败要等下面的 command -v 才发现（而且提示会指向 PATH 而非网络）。先落盘再执行。
+  local _gi="/tmp/oc_gost_install.$$.sh"
+  if ! "$CURL_CMD" -fsSL "https://github.com/go-gost/gost/raw/master/install.sh" -o "$_gi"; then
+    log_err "下载 gost 安装脚本失败（网络/代理/404），请检查网络或手动安装。"
+    rm -f "$_gi" 2>/dev/null || true
     return 1
-  }
+  fi
+  if ! bash "$_gi" --install; then
+    log_err "gost 安装脚本执行失败，请检查脚本输出或手动安装。"
+    rm -f "$_gi" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$_gi" 2>/dev/null || true
   if ! command -v gost &>/dev/null; then
     log_err "gost 安装后仍未找到命令，请检查 PATH 环境变量或脚本输出。"
     return 1
@@ -260,12 +256,12 @@ ensure_cmd_gost() {
 }
 ensure_cmd_socat() {
   command -v socat &>/dev/null && return 0
-  log_warn "Netns 模式推荐用 'socat' 做端口转发（若没有，会自动改用 iptables 双 NAT）。"
+  log_warn "Netns 模式推荐用 'socat' 做端口转发（菜单 3 需要它；没有就去装，或改选菜单 4 走内核转发）。"
   local yn=""
   read -rp "是否立即安装 socat? [Y/n]: " yn || yn=""
-  [[ "$yn" =~ ^[nN]$ ]] && { log_info "将改用 iptables 双 NAT 作为端口转发后端。"; return 1; }
+  [[ "$yn" =~ ^[nN]$ ]] && { log_info "已取消：菜单 3 需要 socat；想走内核转发请用菜单 4。"; return 1; }
   _pkg_install socat
-  command -v socat &>/dev/null || { log_warn "socat 安装失败，将改用 iptables 双 NAT。"; return 1; }
+  command -v socat &>/dev/null || { log_warn "socat 安装失败：菜单 3 无法启动，想走内核转发请用菜单 4。"; return 1; }
   _mark_dep_installed socat
   log "socat 已安装。"
   return 0
@@ -322,12 +318,15 @@ _pub_ip() {
 # 而不是"tun0 在不在"或"ping 通不通"（那两个都会假阳性，原因见 _start_netns_logic）。
 # 返回 0 = 可用；1 = 明确不可用；2 = 无法判断（连本机出口都查不到，例如网络受限）。
 # 启动流程与守护任务共用同一个函数，避免两处判据日后漂移。
+# 探针拿到的 netns 出口地址（供调用方打印真实信息；探针返回值仍是三态）
+_NS_PROBE_IP=""
 _netns_vpn_probe() {
   local host_ip ns_ip
+  _NS_PROBE_IP=""
   host_ip="$(_pub_ip -4 2>/dev/null || true)"
   [ -n "$host_ip" ] || return 2
   ns_ip="$("$IP_CMD" netns exec "${NETNS_NAME}" "$CURL_CMD" -4 -s --max-time 6 "${_PUB_PROVIDERS4[0]}" 2>/dev/null | head -n1 || true)"
-  if [ -n "$ns_ip" ] && [ "$ns_ip" != "$host_ip" ]; then return 0; fi
+  if [ -n "$ns_ip" ] && [ "$ns_ip" != "$host_ip" ]; then _NS_PROBE_IP="$ns_ip"; return 0; fi
   return 1
 }
 
@@ -389,29 +388,63 @@ setup_ssh_protect_routes() {
   gw_dev=$("$IP_CMD" route | awk '/^default/ {print $5; exit}')
   gw4=$("$IP_CMD" route | awk '/^default/ {print $3; exit}')
   vps4=$("$IP_CMD" -4 -o addr show dev "$gw_dev" | awk '{print $4}' | cut -d/ -f1 | head -n1)
+  # 三个值缺一不可：解析不到时，下面 `ip route replace default via '' dev ''` 与
+  # `ip rule add from '' ...` 都会失败；而本函数是在 if 条件里被调用的，set -e 在那里被
+  # 抑制 —— 失败不会中断，脚本会带着"没有 SSH 保护"的状态继续把全局 VPN 启起来，正好
+  # 掐断用户用来操作的 SSH 连接。这里直接判失败，让上层走失败分支（stop_vpn + 撤保底任务）。
+  [ -n "$gw_dev" ] && [ -n "$gw4" ] && [ -n "$vps4" ] || { log_err "无法解析默认路由/本机地址 (dev='$gw_dev' via='$gw4' addr='$vps4')，放弃启动以免失去 SSH 连接"; return 1; }
 
   check_rt_conflict "$RT4_ID" "$RT4_NAME"
   log "配置 IPv4 策略路由 (SSH保护)..."
-  "$IP_CMD" route replace default via "$gw4" dev "$gw_dev" table "$RT4_ID"
+  # 必须检查这一步：保护表里若没有默认路由，而下面照样加上 from 规则，来自本机地址的
+  # 流量就会被送进空表而不可达（SSH 直接掉线）。宁可拒绝启动，也不要"只配了一半"。
+  "$IP_CMD" route replace default via "$gw4" dev "$gw_dev" table "$RT4_ID" \
+    || { log_err "写入 IPv4 保护路由失败 (table $RT4_ID)，放弃启动以免失去 SSH 连接"; return 1; }
   "$IP_CMD" rule del from "$vps4" table "$RT4_ID" priority 500 2>/dev/null || true
   "$IP_CMD" rule add from "$vps4" table "$RT4_ID" priority 500
   log "IPv4 OK (from $vps4)"
 
   default_ipv6_route=$("$IP_CMD" -6 route | awk '/^default/ && $0 !~ /tun/ {print; exit}' || true)
   vps6=$("$IP_CMD" -6 -o addr show dev "$gw_dev" scope global | awk '{print $4; exit}' | cut -d/ -f1 || true)
-  if [ -n "$default_ipv6_route" ] && [ -n "$vps6" ]; then
-    gw6_addr=$(echo "$default_ipv6_route" | awk '{print $3}')
-    gw6_if=$(echo "$default_ipv6_route" | awk '{print $5}')
-    echo "$default_ipv6_route" | grep -q " onlink " && onlink_flag="onlink" || onlink_flag=""
+  # 默认路由可能是 multipath 形式：首行只有 "default proto static metric N pref medium"，
+  # 网关与设备在随后缩进的 "nexthop via X dev Y" 行里。按固定列位置取 $3/$5 会拿到
+  # "static"/"1024"，`ip -6 route replace` 报 inet6 address is expected 而失败——但脚本
+  # 仍会继续加一条指向空表 101 的规则，该机的 IPv6 出向流量于是被丢进黑洞（走 IPv6 的
+  # SSH 会断），还打印 "IPv6 OK"（在 IPv6 默认路由是多跳 nexthop 形式的主机上必然复现）。
+  # 所以改为按 via/dev 关键字取字段（不依赖列位置），并在执行前校验；取不到就跳过。
+  local v6line="" v6_ok=""
+  v6line=$("$IP_CMD" -6 route | awk '
+    /^default/ { inblk=1; if ($0 !~ /tun/ && $0 ~ / via /) { print; exit } ; next }
+    inblk && /^[[:space:]]/ { if ($0 !~ /tun/ && $0 ~ / via /) { print; exit } ; next }
+    { inblk=0 }' || true)
+  if [ -n "$v6line" ]; then
+    gw6_addr=$(printf '%s\n' "$v6line" | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
+    gw6_if=$(printf '%s\n' "$v6line" | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    case "$v6line" in *" onlink "*|*" onlink") onlink_flag="onlink" ;; esac
+  fi
+  # 校验：网关要像 IPv6 地址（含冒号）、设备名要真实存在，且必须与 IPv4 默认路由同一个
+  # 设备——保护表里的默认路由要经本机地址所在的那张网卡出去，否则源地址与出口设备对不上。
+  [ -n "$gw6_addr" ] && [ -n "$gw6_if" ] && [ "${gw6_addr#*:}" != "$gw6_addr" ] \
+    && [ "$gw6_if" = "$gw_dev" ] \
+    && "$IP_CMD" link show dev "$gw6_if" >/dev/null 2>&1 && v6_ok=1
+  if [ -n "$default_ipv6_route" ] && [ -n "$vps6" ] && [ -n "$v6_ok" ]; then
     check_rt_conflict "$RT6_ID" "$RT6_NAME"
     log "配置 IPv6 策略路由 (SSH保护)..."
-    "$IP_CMD" -6 route replace default via "$gw6_addr" dev "$gw6_if" $onlink_flag table "$RT6_ID"
-    "$IP_CMD" -6 rule del from "$vps6" table "$RT6_ID" priority 500 2>/dev/null || true
-    "$IP_CMD" -6 rule add from "$vps6" table "$RT6_ID" priority 500
-    log "IPv6 OK (from $vps6)"
+    if "$IP_CMD" -6 route replace default via "$gw6_addr" dev "$gw6_if" $onlink_flag table "$RT6_ID"; then
+      "$IP_CMD" -6 rule del from "$vps6" table "$RT6_ID" priority 500 2>/dev/null || true
+      "$IP_CMD" -6 rule add from "$vps6" table "$RT6_ID" priority 500
+      log "IPv6 OK (from $vps6)"
+    else
+      # 与 IPv4 同理：保护表写不进去就绝不能加规则（否则 IPv6 流量被导向空表）。
+      log_warn "写入 IPv6 保护路由失败，跳过 IPv6 保护设置（IPv4 保护不受影响）"
+    fi
   else
-    log_info "无可用 IPv6 默认路由或地址，跳过 IPv6 设置"
-    vps6="" # 确报 vps6 为空
+    if [ -n "$default_ipv6_route" ] && [ -n "$vps6" ]; then
+      log_warn "IPv6 默认路由无法解析出可用网关（multipath/nexthop 形式？），跳过 IPv6 保护设置"
+    else
+      log_info "无可用 IPv6 默认路由或地址，跳过 IPv6 设置"
+    fi
+    vps6="" # 确保 vps6 为空
   fi
 
   { echo "VPS4=${vps4:-}"; echo "VPS6=${vps6:-}"; } > "$STATE_FILE"
@@ -442,6 +475,12 @@ setup_netns() {
   "$IP_CMD" netns exec "${NETNS_NAME}" "$IP_CMD" addr add "${VETH_NS_IP}/24" dev "${VETH_NS}"
   "$IP_CMD" netns exec "${NETNS_NAME}" "$IP_CMD" route add default via "${VETH_HOST_IP}"
   
+  # 先记下改动前的值：清理时只把"本来关着、被我们打开"的开关还原回去，避免影响机器上
+  # 真正依赖 forwarding=1 的其它程序（容器运行时、转发服务等）。
+  printf 'SYSCTL_IPFWD_ORIG=%s\nSYSCTL_V6FWD_ORIG=%s\n' \
+    "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo unknown)" \
+    "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo unknown)" \
+    > "$SYSCTL_STATE_FILE" 2>/dev/null || true
   log_info "启用内核 IP 转发..."
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
@@ -470,6 +509,21 @@ cleanup_netns() {
   # bind-mount 到 /etc/resolv.conf）。这里一并删掉，否则每跑一次 Netns 模式就在系统里
   # 留一个目录，脚本卸载之后也还在。
   rm -rf "/etc/netns/${NETNS_NAME}" 2>/dev/null || true
+  # 还原转发开关：只有原值是 0（也就是被本脚本打开的）才恢复为 0，其它情况一律不动。
+  if [ -f "$SYSCTL_STATE_FILE" ]; then
+    local _ipfwd_orig="" _v6fwd_orig=""
+    _ipfwd_orig=$(grep '^SYSCTL_IPFWD_ORIG=' "$SYSCTL_STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)
+    _v6fwd_orig=$(grep '^SYSCTL_V6FWD_ORIG=' "$SYSCTL_STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)
+    if [ "$_ipfwd_orig" = "0" ]; then
+      sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+      log_info "已把 net.ipv4.ip_forward 还原为 0（脚本启动前它就是 0）"
+    fi
+    if [ "$_v6fwd_orig" = "0" ]; then
+      sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+      log_info "已把 net.ipv6.conf.all.forwarding 还原为 0（脚本启动前它就是 0）"
+    fi
+    rm -f "$SYSCTL_STATE_FILE" 2>/dev/null || true
+  fi
   log "Netns 基础环境已清理。"
 }
 
@@ -484,7 +538,7 @@ EOT
   # "按任意键返回主菜单"的暂停——而且它恰好把后面要输入的选项吃掉一格。
   local c
   while true; do
-    clear; title "🔐 管理 VPN 账户 ($ACCOUNTS_FILE)"; sep
+    clear 2>/dev/null || true; title "🔐 管理 VPN 账户 ($ACCOUNTS_FILE)"; sep
     grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  文件为空。"
     sep; echo "  1) 添加  2) 删除  3) 返回"; read -rp "选择 [1-3]: " c || { echo; log_info "标准输入已结束，返回。"; return 0; }
     case "$c" in
@@ -557,8 +611,17 @@ _execute_with_safety_net() {
   # 注意 at 的时间表达式必须是英文单位：原写成 `at now + 2 分钟之前`，at 会以
   # "Garbled time" 拒绝，job 取到空值后整条保底机制静默失效（README 承诺的
   # "自动回滚保护" 因此从未生效过）。这里用标准写法。
-  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || echo "none")
-  [ "$job" != "none" ] && log_warn "已设保底清理任务 (Job $job), 2分钟内连接失败将自动回滚。"
+  # job 号必须是数字才算设置成功：at 失败（atd 未运行、时间表达式被拒）时 awk 拿到的是空串，
+  # 而原先的 `|| echo "none"` 永远不会触发——管道的末环是 awk，它自己的退出码恒为 0。
+  # 于是空 job 被当成已设任务，打印 "已设保底清理任务 (Job )" 而保底回滚静默失效
+  # （实测：at 语法错误 → at_rc=1、输出里没有 job 行 → job 为空串）。
+  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || true)
+  [[ "${job:-}" =~ ^[0-9]+$ ]] || job="none"
+  if [ "$job" != "none" ]; then
+    log_warn "已设保底清理任务 (Job $job), 2分钟内连接失败将自动回滚。"
+  else
+    log_warn "未能排上保底清理任务（at/atd 不可用）；若本次启动失败，请手动执行 stop。"
+  fi
 
   if "$func_to_run" "$@"; then
     trap - SIGINT # 成功后解除陷阱
@@ -577,8 +640,9 @@ _execute_with_safety_net() {
 
 start_default() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_openconnect; select_account || return; select_protocol || return; _execute_with_safety_net "_start_default_logic"; }
 _start_default_logic() {
-  setup_ssh_protect_routes
-  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null
+  # 保护路由是默认模式的前提：设置失败还继续启动，用户就可能把自己关在门外（SSH 断连）。
+  setup_ssh_protect_routes || return 1
+  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null || true
   log_info "连接VPN [默认模式 / 协议: ${VPN_PROTOCOL:-anyconnect}]: $VPN_HOST ..."
   local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
   [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
@@ -649,18 +713,23 @@ _start_netns_logic() {
   local socks_user="" socks_pass="" need_auth=""
   read -rp "是否为 SOCKS5 设置用户名/密码? [y/N]: " need_auth || need_auth=""
   if [[ "$need_auth" =~ ^[yY]$ ]]; then
-    # gost 是按 socks5://user:pass@host:port 解析的，用户名/密码里出现 @ : / 会把
-    # URL 拆错（实测这类写法直接导致 gost 起不来或认证形同虚设），所以这里先拦住。
     while true; do
       read -rp "  用户名: " socks_user || socks_user=""
       [ -n "$socks_user" ] || { log_err "  用户名不能为空（不启用认证就直接回车跳过上一个问题）"; continue; }
-      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  用户名不能含 @ : / 引号 反斜杠 空白（会破坏 gost 的 URL），换个写法"; continue ;; esac
+      # gost 与客户端都按 socks5://user:pass@host:port 解析 URL：`/`、空白、反斜杠、引号会
+      # 真的把它拆坏（实测：`/` 与空格让 gost 起不来并报 lookup 失败，`\` 报 invalid userinfo）。
+      # 用户名里再额外禁掉 `@` 与 `:`：实测 user=`a@b` 时两端解析出的凭据不一致（curl 侧认证
+      # 失败、http_code=000），user=`abc:` 则会把冒号切给密码——也就是"按字面填进去的凭据"与
+      # "真正生效的凭据"不同，而脚本的自检用的也是 URL 形式、恰好发现不了这种不一致。
+      # 密码里这两个字符实测可用（`p@ss`、`pa:ss` 都能通过认证），所以密码那侧放行。
+      # 官方给的 `?auth=<base64>` 替代路径实测在 base64 含 `/` 时认证会失败，因此不采用。
+      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  用户名不能含 @ : / 引号 反斜杠 空白（会让实际生效的凭据与输入不一致），换个写法"; continue ;; esac
       break
     done
     while true; do
       read -rsp "  密码: " socks_pass || socks_pass=""; echo
       [ -n "$socks_pass" ] || { log_warn "  密码为空，本次不启用认证。"; socks_user=""; break; }
-      case "$socks_pass" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  密码不能含 @ : / 引号 反斜杠 空白（会破坏 gost 的 URL），换个写法"; continue ;; esac
+      case "$socks_pass" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  密码不能含 / 引号 反斜杠 空白（会破坏 gost 的 URL 解析），换个写法"; continue ;; esac
       log_info "  已启用 SOCKS5 认证（用户名: ${socks_user}）"
       break
     done
@@ -675,7 +744,10 @@ _start_netns_logic() {
   
   log_info "等待 OpenConnect 建立 TUN 接口...";
   for ((i=0; i<20; i++)); do
-    if [ -f "$PID_FILE" ] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -F "$(cat "$PID_FILE")" && \
+    # pid 必须是非空数字再拿去匹配：`grep -F ""` 会匹配任意一行，pid 文件为空时
+    # （openconnect 写文件失败/被截断）就会恒判"进程在 netns 内"，进而误判 TUN 已就绪。
+    local _pid=""; [ -f "$PID_FILE" ] && _pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+    if [[ "$_pid" =~ ^[0-9]+$ ]] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -xF "$_pid" && \
        "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
       log "OpenConnect TUN 接口已就绪 (PID=$(cat "$PID_FILE"))"; sleep 2; break
     fi
@@ -713,7 +785,7 @@ _start_netns_logic() {
   if [ "$vpn_ready" -eq 0 ]; then
     log_err "Netns 内 VPN 在约 50 秒内仍不可用，判定启动失败（避免 gost 以本机出口对外）"; return 1
   fi
-  log "Netns 内 VPN 已可用 (等待约 $(( (i-1) * 8 )) 秒，出口 ${ns_ip:-未知})"
+  log "Netns 内 VPN 已可用 (等待约 $(( (i-1) * 8 )) 秒，出口 ${_NS_PROBE_IP:-未知})"
 
   log_info "测试 Netns 内通过 VPN 的 IPv4 网络连通性...";
   if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then
@@ -725,8 +797,11 @@ _start_netns_logic() {
   test_netns_ipv6 || true
 
   log_info "正在 Netns 中启动 SOCKS5 服务 (gost)..."
-  local gost_listen="socks5://0.0.0.0:${socks_port}"
-  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@0.0.0.0:${socks_port}"
+  # 监听地址写成"不带 host"的形式：gost 的 `socks5://:PORT` 会同时监听 IPv4 与 IPv6
+  # （实测 ss 显示 *:PORT，带认证的写法同样如此），而 `0.0.0.0:PORT` 只监听 IPv4——
+  # 主菜单与状态区一直写着 "(IPv4+IPv6)"，用 0.0.0.0 时那句话是不成立的。
+  local gost_listen="socks5://:${socks_port}"
+  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@:${socks_port}"
   "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="${gost_listen}" >/dev/null 2>&1 &
   local gost_pid=$!; echo "$gost_pid" > "$GOST_PID_FILE"
   sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost 在 Netns 中启动失败"; return 1; fi
@@ -862,12 +937,18 @@ _fwd_setup_iptables() {
   local dst="${VETH_NS_IP}:${socks_port}"
   local R_OUT R_PRE="" R_SNAT
   R_SNAT="-p tcp -d ${VETH_NS_IP} --dport ${socks_port} -j SNAT --to-source ${VETH_HOST_IP}"
+  # 清一次旧版本遗留的 OUTPUT 规则：旧版"对全网开放"那条没有 addrtype 限制，如果 state 文件
+  # 丢了（/var/run 被清、或跨模式异常），它既删不掉也发现不了——而它会排在新规则前面，
+  # 于是本机发往外部主机同端口的流量仍被劫持，表现为"升级了却没变化"。
+  "$IPTABLES_CMD" -t nat -D OUTPUT -p tcp --dport "${socks_port}" -j DNAT --to-destination "${dst}" 2>/dev/null || true
   if [ "$listen_addr" = "0.0.0.0" ] || [ "$listen_addr" = "::" ]; then
     # 对全网开放：本机产生的流量走 OUTPUT、外部来的走 PREROUTING，两条都要有。
-    # OUTPUT 这里不限定目标地址：本机既可能连 127.0.0.1，也可能连自己的内网 IP
-    # （后者实测只加 PREROUTING 是连不上的——本机流量根本不经过 PREROUTING）。
-    R_OUT="-p tcp --dport ${socks_port} -j DNAT --to-destination ${dst}"
-    R_PRE="$R_OUT"
+    # OUTPUT 这条用 addrtype 限定"目标是本机地址"：既覆盖 127.0.0.1 与本机的内网 IP
+    # （后者实测只加 PREROUTING 是连不上的——本机流量根本不经过 PREROUTING），又不会把
+    # 本机主动发往外部主机同一端口的流量也劫持进来。addrtype 实测可用：目标是本机地址
+    # 时计数增加、目标是 1.1.1.1 时计数不变。
+    R_OUT="-p tcp -m addrtype --dst-type LOCAL --dport ${socks_port} -j DNAT --to-destination ${dst}"
+    R_PRE="-p tcp --dport ${socks_port} -j DNAT --to-destination ${dst}"
   else
     # 只监听本地：限定目标为 127.0.0.1，且不加 PREROUTING —— 语义与 socat bind 127.0.0.1 一致
     R_OUT="-p tcp -d 127.0.0.1 --dport ${socks_port} -j DNAT --to-destination ${dst}"
@@ -916,7 +997,7 @@ stop_vpn() {
   # state 文件在时不能早退：失败的启动已写 state 并配好策略路由，早退会跳过
   # cleanup_ssh_protect_routes 和 rm —— 残留 ip rule 和 state（实测 iprule 4 行残留；
   # 装了守护任务还会每 5 分钟拿坏账户重连一次）。
-  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ] && ! [ -f "$STATE_FILE" ]; then log_info "VPN 未运行"; return; fi
+  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ] && ! [ -f "$STATE_FILE" ] && ! [ -f "$SYSCTL_STATE_FILE" ]; then log_info "VPN 未运行"; return; fi
   log_info "正在停止VPN并清理环境...";
   # || true：这一行尤其危险——赋值是 `[ -f ] && ...` 的最后一条命令，失败会直接终止
   # 整个 stop_vpn：进程没杀、临时文件没删、保底任务也没撤（实测 rc=1 且什么都没清）。
@@ -934,21 +1015,41 @@ stop_vpn() {
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
       if [ -f "$PID_FILE" ]; then
         local oc_pid; oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
-        kill "$oc_pid" 2>/dev/null || true
-        # 必须等 openconnect 自己退出再拆 netns/veth：它要先向网关登出，
-        # 而登出走的就是 veth→NAT 这条路（先拆掉就会卡在 TLS 超时上，见 _wait_pid_gone）。
-        _wait_pid_gone "$oc_pid"
+        # 同 default|ocproxy：pid 文件可能是过期记录，先确认身份再发信号
+        if [ -n "$oc_pid" ] && [ "$(cat /proc/${oc_pid}/comm 2>/dev/null)" = "openconnect" ]; then
+          kill "$oc_pid" 2>/dev/null || true
+          # 必须等 openconnect 自己退出再拆 netns/veth：它要先向网关登出，
+          # 而登出走的就是 veth→NAT 这条路（先拆掉就会卡在 TLS 超时上，见 _wait_pid_gone）。
+          _wait_pid_gone "$oc_pid"
+        fi
       fi
       cleanup_netns
       ;;
     default|ocproxy)
       log_info "正在停止 ${MODE} 模式..."
-      if [ -f "$PID_FILE" ]; then kill "$(cat "$PID_FILE")" 2>/dev/null || true; fi
+      # 与 netns 分支同理：kill 之后立刻收尾会留下"还在登出"的 openconnect（实测 stop 后
+      # 1 秒仍能看到该进程，约 2-3 秒后才自行退出）；用户紧接着重新启动就会和它打架。
+      # default 模式的登出走 eth0，而策略路由此刻还在，所以先等它退出、再清路由。
+      local oc_pid=""
+      [ -f "$PID_FILE" ] && oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+      # 发信号前先确认这个 pid 真的是 openconnect：pid 文件可能是过期记录（例如上一条连接
+      # 被 kill -9、来不及 unlink），而那个 pid 早已被内核复用给别的进程——照原样 kill 并
+      # 等待会误伤它（_wait_pid_gone 到最后还会升级成 SIGKILL）。
+      if [ -n "$oc_pid" ] && [ "$(cat /proc/${oc_pid}/comm 2>/dev/null)" = "openconnect" ]; then
+        kill "$oc_pid" 2>/dev/null || true
+        _wait_pid_gone "$oc_pid"
+      fi
       [ "$MODE" = "default" ] && cleanup_ssh_protect_routes
       ;;
     *)
       log_warn "状态文件不存在或模式未知，执行通用清理..."
-      [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+      # netns 模式"写 state 之前"就失败时正好落到这里（state 里没有 MODE）：同样要先等
+      # openconnect 退出再拆 netns/veth，否则它会卡在登出上（见 _wait_pid_gone）。
+      local oc_pid=""; [ -f "$PID_FILE" ] && oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+      if [ -n "$oc_pid" ] && [ "$(cat /proc/${oc_pid}/comm 2>/dev/null)" = "openconnect" ]; then
+        kill "$oc_pid" 2>/dev/null || true
+        _wait_pid_gone "$oc_pid"
+      fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
@@ -957,6 +1058,10 @@ stop_vpn() {
       ;;
   esac
   
+  # SYSCTL_STATE_FILE 不在这里无条件删除：它是"把转发开关还原回去"的唯一依据，只由
+  # cleanup_netns 在还原之后删。否则一旦出现"netns 会话被 kill -9 → 用户改用 default
+  # 模式 → 这次 stop 走 default 分支（不调 cleanup_netns）"这种跨模式序列，记录会被删掉
+  # 而 ip_forward 已经变成 1，就再也没有还原依据了。
   rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6"; log "所有临时文件已清理，操作完成。"
 }
 
@@ -988,7 +1093,10 @@ show_status() {
         echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $(_pub_ip -4 || echo 失败)"
       ;;
       netns)
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🌐 Network Namespace 代理 ${C_GREEN}(IPv4+IPv6)${C_RESET}"
+        # iptables 双 NAT 后端只有 IPv4 入口（内核 DNAT 不跨协议族），别在这里笼统写 IPv4+IPv6
+        local _fam_txt="(IPv4+IPv6)"
+        [ "${FORWARDER:-}" = "iptables" ] && _fam_txt="(仅 IPv4 入口)"
+        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🌐 Network Namespace 代理 ${C_GREEN}${_fam_txt}${C_RESET}"
         local f_info; if [[ "${FORWARDER:-}" == "socat" ]]; then f_info="socat"; else f_info="iptables"; fi
         local auth_txt=""
         [ -n "${SOCKS_USER:-}" ] && auth_txt=" ${C_YELLOW}认证 ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
@@ -1026,11 +1134,38 @@ show_status() {
 }
 
 # --- 定时与卸载 ---
+# 写 crontab 前先留一份副本：下面几处都是 `... | crontab -` 的写法，一旦 `crontab -l`
+# 因故返回空（权限、并发写、命令异常），整份 crontab 就会被空内容覆盖——生产机上那可能
+# 是几十条任务。备份只在 crontab 非空时做，写不进去也不阻断后续操作。
+_CRON_BAK="/root/.oc_master-crontab.bak"
+_backup_crontab() {
+  local cur=""
+  cur="$(crontab -l 2>/dev/null || true)"
+  [ -n "$cur" ] || return 0
+  # crontab 里常有口令/token：备份文件用 600，不要用默认 umask 落成 644
+  if ( umask 077; printf '%s\n' "$cur" > "$_CRON_BAK" ) 2>/dev/null; then
+    log_info "已备份当前 crontab 到 ${_CRON_BAK}"
+  else
+    log_warn "备份 crontab 失败（${_CRON_BAK} 不可写），继续操作。"
+  fi
+  return 0
+}
+
 manage_cron() {
   # 同 manage_accounts：c 必须 local，否则会覆盖主菜单的选项变量。
   local c
+  # 有些系统（实测 Debian 12 最小安装）没有 cron 包，crontab 命令不存在：那种环境下
+  # 本菜单的每个操作都会以 command not found 失败，而 set -e 会直接终止整个脚本。
+  if ! command -v crontab &>/dev/null; then
+    clear 2>/dev/null || true; title "🗓️ 定时/守护任务"; sep
+    log_err "系统未安装 cron/crontab，定时任务不可用。"
+    log_info "可先执行： apt-get install -y cron"
+    sep
+    read -n1 -s -p "按任意键返回主菜单..." || true
+    return 0
+  fi
   while true; do
-    clear; title "🗓️ 定时/守护任务"; sep
+    clear 2>/dev/null || true; title "🗓️ 定时/守护任务"; sep
     crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || log_info "  当前无此脚本的定时任务。"
     sep
     echo -e "  1) 设置守护任务 (每5分钟检查，断线重连)"
@@ -1039,12 +1174,21 @@ manage_cron() {
     echo -e "  4) 返回主菜单"
     read -rp "请选择 [1-4]: " c || { echo; log_info "标准输入已结束，返回。"; return 0; }
     case "$c" in
-      1) log_warn "守护任务目前仅支持 [默认] 和 [ocproxy] 模式。"
-         (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * $SCRIPT_PATH _internal_check_health"; } | crontab -
+      1) log_warn "守护任务：默认/ocproxy 模式断线后自动重连；Netns 模式探测到隧道不可用时会停止清理（不自动重连）。"
+         # cron 给任务的默认 PATH 是 /usr/bin:/bin（Debian cron 的编译期常量，实测
+         # `strings /usr/sbin/cron`），而 openconnect 在 /usr/sbin、gost 在 /usr/local/bin
+         # —— 没有 PATH 时守护任务必然找不到命令（实测 env -i PATH=/usr/bin:/bin 下这两个
+         # 都是 MISSING）。cron 会把命令行交给 /bin/sh -c，所以把赋值写在命令前面即可：
+         # 既不动用户已有的 PATH 行，也不依赖目标机器的 crontab 里恰好有 PATH 行。
+         local cron_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+         _backup_crontab
+         (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * PATH=$cron_path $SCRIPT_PATH _internal_check_health"; } | crontab -
          log "已设置守护任务。";;
       2) read -rp "请输入 cron 表达式 (例如 '0 2 * * *' 代表每天凌晨2点): " exp
+         _backup_crontab
          [ -z "$exp" ] && { log_err "表达式不能为空"; } || { (crontab -l 2>/dev/null || true; echo "$exp $SCRIPT_PATH stop") | crontab -; log "已添加定时关闭任务。"; };;
-      3) crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "已清除所有相关定时任务。";;
+      3) _backup_crontab
+         crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "已清除所有相关定时任务。";;
       4) break;;
       *) log_err "无效选项";;
     esac; read -n1 -s -p $'\n'"按任意键返回..."
@@ -1074,6 +1218,7 @@ uninstall() {
   read -rp "⚠️  确认要卸载此脚本及其所有相关配置吗？[y/N]: " y || y=""
   [[ "$y" =~ ^[yY]$ ]] || { log_info "已取消"; exit 0; }
   log_info "开始卸载..."; stop_vpn
+  _backup_crontab
   crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "定时任务已清理"
   
   if command -v gost &>/dev/null; then
@@ -1083,7 +1228,24 @@ uninstall() {
       # 而 select 在非交互下失败后旧代码仍打印"已尝试卸载"——是句假话。
       # gost 是单个二进制、无包管理器记录，所以直接删文件。
       log_info "正在卸载 gost..."
-      command -v pkill &>/dev/null && pkill -x gost 2>/dev/null || true
+      # 优先按 PID 文件停掉"本脚本启动的"那一个：pkill -x gost 是进程名全局匹配，会把
+      # 机器上别的用途的 gost 一起杀掉。所以只在没有本脚本的 PID 记录、且确实还有
+      # gost 在跑时才询问，由用户决定要不要按名字全杀。
+      local _gp=""
+      if [ -f "$GOST_PID_FILE" ]; then
+        _gp="$(cat "$GOST_PID_FILE" 2>/dev/null || echo "")"
+        if [ -n "$_gp" ] && [ "$(cat /proc/${_gp}/comm 2>/dev/null)" = "gost" ]; then
+          kill "$_gp" 2>/dev/null || true
+        else
+          _gp=""
+        fi
+      fi
+      if [ -z "$_gp" ] && command -v pgrep &>/dev/null && pgrep -x gost >/dev/null 2>&1; then
+        log_warn "检测到仍在运行的 gost 进程（不是本脚本记录的那个），可能属于别的用途。"
+        local _gk=""
+        read -rp "是否按进程名结束全部 gost? [y/N]: " _gk || _gk=""
+        [[ "$_gk" =~ ^[yY]$ ]] && { pkill -x gost 2>/dev/null || true; }
+      fi
       rm -f "$(command -v gost 2>/dev/null)" 2>/dev/null || true
       if command -v gost &>/dev/null; then log_warn "gost 卸载失败，请手动删除。"
       else log "gost 已卸载。"; fi
@@ -1151,7 +1313,9 @@ _internal_cron_handler() {
 
 # --- 主菜单 ---
 main_menu() {
-  clear
+  # clear 失败不该中断菜单：TERM 未设置时（例如 `ssh host ocm` 没带 -t）clear 返回 1，
+  # 在 set -e 下会把整个脚本当场杀掉。
+  clear 2>/dev/null || true
   echo -e "${C_BOLD}========================================================${C_RESET}"
   echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v7.7.7 (Final) 🚀${C_RESET}"
   echo -e "${C_BOLD}========================================================${C_RESET}"
@@ -1161,7 +1325,7 @@ main_menu() {
   echo -e "  ${C_GREEN}1) 启动: 🛡️  默认模式 (全局VPN, 保护SSH)${C_RESET}"
   echo -e "  ${C_GREEN}2) 启动: 🔌 ocproxy 模式 (SOCKS5, 仅IPv4)${C_RESET}"
   echo -e "  ${C_GREEN}3) 启动: 🌐 Netns 模式 (SOCKS5, socat 转发)${C_RESET}"
-  echo -e "  ${C_GREEN}4) 启动: 🌐 Netns 模式 (SOCKS5, iptables 双 NAT)${C_RESET}"
+  echo -e "  ${C_GREEN}4) 启动: 🌐 Netns 模式 (SOCKS5, iptables 双 NAT，IPv4 入口)${C_RESET}"
   echo -e "  ${C_RED}5) 停止 VPN${C_RESET}"
   sep
   echo -e "  6) ⚙️  管理 VPN 账户"
