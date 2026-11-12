@@ -4,7 +4,7 @@
 
 **[English](README_EN.md) | 简体中文**
 
-![Version](https://img.shields.io/badge/version-8.1.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.1.1-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
@@ -386,6 +386,10 @@ ip netns exec ocm_vpn_space ss -lntp            # gost 在 netns 内监听
    - 脚本会自动保护 SSH 连接；首次启动 3 分钟内若未确认成功会自动回滚
 
 ## 📊 版本历史
+
+### v8.1.1 (2026-11-12)
+
+- 🔒 **安全修复**：Netns 模式下 netns 里的 gost 原先监听全部网卡（`socks5://:端口`），其中包括 VPN 隧道网卡 tun0。tun0 的地址是 VPN 分配的公网地址，外部经 VPN 网关就能直连这个端口，在未开 SOCKS5 认证时等于一个**以你的 VPN 身份上网的开放代理**——「监听范围 = 仅本机」只限制了宿主上的转发入口。现在 gost 只监听 veth 地址 `192.168.200.2`，并在 netns 里额外拒绝从 `tun+` 进来的该端口（IPv4/IPv6）。**v8.1.0 及以前的 Netns 模式用户请尽快升级并重启 VPN**
 
 ### v8.1.0 (2026-11-12)
 

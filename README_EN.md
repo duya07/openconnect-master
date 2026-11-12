@@ -4,7 +4,7 @@
 
 **English | [简体中文](README.md)**
 
-![Version](https://img.shields.io/badge/version-8.1.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.1.1-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
@@ -387,6 +387,10 @@ ip netns exec ocm_vpn_space ss -lntp            # gost listens inside the netns
    - The script automatically protects SSH connections; if success is not confirmed within 3 minutes of the first start, it rolls back automatically
 
 ## 📊 Version History
+
+### v8.1.1 (2026-11-12)
+
+- 🔒 **Security fix**: in Netns mode, gost inside the netns used to listen on every interface (`socks5://:PORT`), including the VPN tunnel interface tun0. tun0 carries the public address assigned by the VPN, so outsiders could reach that port through the VPN gateway; without SOCKS5 auth this was an **open proxy using your VPN identity**. "Listen = localhost only" only restricted the forwarding entry on the host. gost now listens only on the veth address `192.168.200.2`, and the netns additionally drops that port arriving on `tun+` (IPv4/IPv6). **Netns mode users on v8.1.0 or earlier should upgrade and restart the VPN**
 
 ### v8.1.0 (2026-11-12)
 

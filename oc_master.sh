@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- 全局配置 ---
-VERSION="8.1.0"
+VERSION="8.1.1"
 VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
@@ -1557,10 +1557,13 @@ sup_write_state() {
 
 # netns 里的 SOCKS5（gost）+ 宿主转发：首次隧道就绪后启动，之后重连期间保持不动
 sup_start_proxy() {
-  local port="${CFG[SOCKS_PORT]}" gl="socks5://:${CFG[SOCKS_PORT]}"
-  [ -n "${CFG[SOCKS_USER]}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@:${port}"
-  # 不带 host 的 socks5://:PORT 同时监听 IPv4/IPv6（0.0.0.0 只监听 IPv4）
+  local port="${CFG[SOCKS_PORT]}" gl="socks5://${VETH_NS_IP}:${CFG[SOCKS_PORT]}" _r
+  [ -n "${CFG[SOCKS_USER]}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@${VETH_NS_IP}:${port}"
+  # 只监听 veth 地址：宿主转发（socat / iptables）都连这里。不写地址会连 tun0 也监听，而 tun0 的地址是
+  # VPN 分配的公网地址——外部经 VPN 网关就能直连，变成无认证的开放代理（v8.1.0 及以前的实测问题）。
   "$IP_CMD" netns exec "$NETNS_NAME" gost -L="$gl" >/dev/null 2>&1 &
+  # 保险：再拒绝从隧道网卡进来的这个端口（IPv4/IPv6）；规则随 netns 删除而消失
+  for _r in iptables ip6tables; do "$IP_CMD" netns exec "$NETNS_NAME" "$_r" -w -C INPUT -i tun+ -p tcp --dport "$port" -j DROP 2>/dev/null || "$IP_CMD" netns exec "$NETNS_NAME" "$_r" -w -I INPUT 1 -i tun+ -p tcp --dport "$port" -j DROP 2>/dev/null || true; done
   GOST_PID=$!; echo "$GOST_PID" > "$GOST_PID_FILE"
   sleep 1; kill -0 "$GOST_PID" 2>/dev/null || { sup_log "gost 在 netns 中启动失败"; return 1; }
   if [ -z "${_FWD_DESC:-}" ]; then

@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- Global Configuration ---
-VERSION="8.1.0"
+VERSION="8.1.1"
 VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
@@ -1557,10 +1557,13 @@ sup_write_state() {
 
 # SOCKS5 inside netns (gost) + host forwarding: started once the tunnel first comes up, then left untouched during reconnects
 sup_start_proxy() {
-  local port="${CFG[SOCKS_PORT]}" gl="socks5://:${CFG[SOCKS_PORT]}"
-  [ -n "${CFG[SOCKS_USER]}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@:${port}"
-  # socks5://:PORT without a host listens on both IPv4/IPv6 (0.0.0.0 listens on IPv4 only)
+  local port="${CFG[SOCKS_PORT]}" gl="socks5://${VETH_NS_IP}:${CFG[SOCKS_PORT]}" _r
+  [ -n "${CFG[SOCKS_USER]}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@${VETH_NS_IP}:${port}"
+  # Listen on the veth address only: host forwarding (socat / iptables) connects here. Without an address gost also
+  # listens on tun0, whose address is the public one assigned by the VPN, so outsiders could reach it through the VPN gateway as an open proxy (seen up to v8.1.0).
   "$IP_CMD" netns exec "$NETNS_NAME" gost -L="$gl" >/dev/null 2>&1 &
+  # Belt and braces: also drop this port when it arrives on the tunnel interface (IPv4/IPv6); the rule goes away with the netns
+  for _r in iptables ip6tables; do "$IP_CMD" netns exec "$NETNS_NAME" "$_r" -w -C INPUT -i tun+ -p tcp --dport "$port" -j DROP 2>/dev/null || "$IP_CMD" netns exec "$NETNS_NAME" "$_r" -w -I INPUT 1 -i tun+ -p tcp --dport "$port" -j DROP 2>/dev/null || true; done
   GOST_PID=$!; echo "$GOST_PID" > "$GOST_PID_FILE"
   sleep 1; kill -0 "$GOST_PID" 2>/dev/null || { sup_log "gost failed to start in netns"; return 1; }
   if [ -z "${_FWD_DESC:-}" ]; then
