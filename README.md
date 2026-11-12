@@ -4,16 +4,16 @@
 
 **[English](README_EN.md) | 简体中文**
 
-![Version](https://img.shields.io/badge/version-7.7.7-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.0.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
 
 **一站式 OpenConnect VPN 管理工具**
 
-支持三种运行模式 | 策略路由保护 | Network Namespace 隔离 | IPv4+IPv6 双栈
+三种运行模式 | systemd 托管 + 断线自动重连 | 内置诊断日志 | 设置菜单 + 命令行
 
-[快速开始](#-快速开始) • [功能特性](#-功能特性) • [使用文档](#-使用文档)
+[快速开始](#-快速开始) • [功能特性](#-功能特性) • [使用文档](#-使用文档) • [从旧版升级](#upgrade)
 
 </div>
 
@@ -25,41 +25,48 @@
 
 | 模式 | 图标 | 说明 | IPv4 | IPv6 | 适用场景 |
 |------|------|------|------|------|----------|
-| **默认模式** | 🛡️ | 全局 VPN + SSH 保护 | ✅ | ✅ | 需要全局代理的场景 |
-| **ocproxy 模式** | 🔌 | SOCKS5 代理（简化） | ✅ | ❌ | 轻量级代理需求 |
-| **Netns 模式** | 🌐 | Network Namespace 隔离 | ✅ | ✅ | **推荐**！完全隔离、双栈支持 |
+| **默认模式** | 🛡️ | 全局 VPN + SSH 保护 | ✅ | ✅ | 需要整机走 VPN |
+| **ocproxy 模式** | 🔌 | 用户态 SOCKS5（不建 tun） | ✅ | ❌ | 轻量级代理需求 |
+| **Netns 模式** | 🌐 | Network Namespace 隔离 + SOCKS5 | ✅ | ✅ | **推荐**！只让需要的程序走 VPN，宿主完全不受影响 |
 
 ### 🔥 核心功能
 
-- ✅ **智能策略路由**
-  - 自动保护 SSH 连接不受 VPN 影响
-  - 支持 IPv4 和 IPv6 双栈路由
-  - 精确的路由表管理和清理
+- ✅ **systemd 托管，断线自动重连**（v8 新增）
+  - openconnect 前台运行在 `ocm.service` 里，关掉 SSH 也不会连带断开
+  - 退出后按原因处理：服务器到期终止 → 约 2 秒后重连；网络错误 → 按退避间隔重试；认证失败 → 计数，达到阈值即暂停，**防止账号被锁**
+  - 重连期间 netns 与代理保持不动，客户端只感到几秒中断
+  - 「进程还在但不通」也能发现：持续不通超过阈值会主动软重连
 
-- ✅ **多账户管理**
-  - 支持多个 VPN 账户切换
-  - 账户信息以**明文**保存在 `/root/.vpn_accounts.env`（脚本会把权限收紧为 `600`，仅 root 可读；任何知道该文件的人都能读到密码，请自行按需保护）
-  - 快速选择和切换
+- ✅ **内置长期诊断日志**（v8 新增，`ocm-watch.service`）
+  - 定时采样隧道 / 代理 / 网关 / 出口 IP，记录每次状态变化与断线现场快照
+  - `ocm log report` 一条命令看断线次数、**每次断开时会话已持续多久**、自动重连记录
+  - 适合排查「隔一阵就断」这类问题（例如很多学校 / 企业 VPN 有固定会话时长）
 
-- ✅ **定时任务支持**
-  - 守护任务：默认/ocproxy 模式掉线后自动重连；Netns 模式掉线时执行停止清理，让状态如实变回"停止"（不自动重连）
-  - 定时关闭：自定义 cron 表达式（没有"定时启动"功能）
-  - 连接状态监控：主菜单实时显示模式、SOCKS 地址与出口 IP
+- ✅ **⚙️ 设置菜单 + 命令行**（v8 新增）
+  - 每个可调参数都在菜单里列出：当前值、作用、可选项与代价，不用读源码猜默认值
+  - 启动前显示设置摘要：直接启动 / 改设置并保存 / 只改本次
+  - `ocm -h`：`start / stop / restart / status / log / heal / config / accounts`，可脚本化
 
-- ✅ **安全清理机制**
-  - 完整的环境清理
-  - 自动回滚保护
-  - 优雅的中断处理
+- ✅ **智能策略路由**（默认模式）
+  - 自动保护 SSH 连接不受全局 VPN 影响，支持 IPv4 和 IPv6
+  - 首次启动带 3 分钟保底自动回滚
 
 - ✅ **Network Namespace 隔离**（Netns 模式）
-  - 完全独立的网络环境
-  - 不影响宿主机网络
-  - 支持 IPv4 和 IPv6 双栈
-  - 通过 SOCKS5 代理访问
+  - 完全独立的网络环境，通过 SOCKS5 代理访问（可选用户名/密码）
+  - 两种端口转发后端：socat（IPv4+IPv6 入口）/ iptables 双 NAT（仅 IPv4 入口）
+  - 可选**断线保护**：VPN 不通时代理直接失败，流量绝不从 VPS 自己的出口出去
+
+- ✅ **多账户管理**
+  - 账户信息以**明文**保存在 `/root/.vpn_accounts.env`（权限收紧为 `600`，仅 root 可读；请自行按需保护）
+  - 每个账户可以指定自己的协议；列表与状态区不显示密码
+
+- ✅ **安全清理机制**
+  - 停止时先让 openconnect 正常登出，再拆代理 / netns / 路由
+  - 只还原被本脚本打开过的内核转发开关；卸载时区分「本脚本装的依赖」与「本来就有的依赖」
 
 ## 📦 系统要求
 
-- **操作系统**: Debian/Ubuntu/CentOS/RHEL 或其他 Linux 发行版（**目前只在 Debian 12 上做过完整测试**，其他发行版请先自行验证）
+- **操作系统**: Debian/Ubuntu/CentOS/RHEL 等使用 **systemd** 的 Linux 发行版（**目前只在 Debian 12 上做过完整测试**，其他发行版请先自行验证）
 - **权限**: 需要 root 权限
 - **网络**: 需要能访问外网
 - **依赖**: 脚本会自动检测并安装必要依赖
@@ -70,306 +77,270 @@
 - `ocproxy` - ocproxy 模式所需
 - `gost` - Netns 模式的 SOCKS5 服务器
 - `socat` - Netns 模式的端口转发（**首选**）
-- `iptables` - 端口转发兜底方案（双 NAT）与 NAT 规则
+- `iptables` - 端口转发兜底方案（双 NAT）、netns 出口 NAT、断线保护
 - `iproute2` - 网络配置工具
-- `at` - 启动时排一个 2 分钟后的保底清理任务（atd 未运行时脚本会如实提示"未排上保底任务"）
+- `at` - 默认模式首次启动的 3 分钟保底回滚
 - `curl` - 查询公网 IP、下载 gost 安装脚本
-
-> Netns 的 **iptables 双 NAT** 后端只支持 **IPv4 入口**：内核的 DNAT 不能跨协议族，
-> 所以 `[::1]:端口` 这类 IPv6 客户端连不上；需要 IPv6 入口请用 **socat 后端**（菜单 3）。
 
 ## 🚀 快速开始
 
-### 方法一：一键安装（推荐）
+### 方法一：一键下载运行
 
 ```bash
-# 下载并直接运行
-bash <(curl -fsSL https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh)
+wget -O /root/oc_master.sh https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh
+chmod +x /root/oc_master.sh
+/root/oc_master.sh
 ```
 
-### 方法二：手动安装
+> v8 由 systemd 托管，**脚本需要放在固定位置**（例如 `/root/oc_master.sh`）——systemd 单元会记住这个路径。
+> 不要用 `bash <(curl …)` 直接运行。
+
+### 方法二：克隆仓库
 
 ```bash
-# 下载脚本
-wget https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master.sh
-
-# 添加执行权限
-chmod +x oc_master.sh
-
-# 运行脚本
-./oc_master.sh
-```
-
-### 方法三：克隆仓库
-
-```bash
-# 克隆仓库
 git clone https://github.com/duya07/openconnect-master.git
 cd openconnect-master
-
-# 运行脚本
 chmod +x oc_master.sh
 ./oc_master.sh
 ```
+
+首次运行会自动创建快捷命令 `ocm`，之后直接输入 `ocm` 即可。
 
 ## 📖 使用文档
 
-### 首次运行
+### 首次运行（三步）
 
-1. 运行脚本后，选择 `6) 管理 VPN 账户`
-2. 添加您的 VPN 账户信息：
-   - 显示名称（方便识别）
-   - VPN 用户名
-   - VPN 密码
-   - VPN 服务器地址
-   - 认证组（可选）
+1. `6) 管理 VPN 账户` → 添加账户：显示名、用户名、密码、VPN 服务器地址、认证组（可选）、协议（可选）
+2. `5) 设置` → 至少确认 **运行模式**、**VPN 协议**（必须与网关一致）、**SOCKS5 端口**
+3. `1) 启动 VPN` → 检查摘要，回车启动
 
-### 选择 OpenConnect 协议
+命令行等价写法：
 
-启动任意模式时，选完账户之后会询问使用哪种协议。**必须与你的 VPN 网关类型一致**，选错会在认证阶段就失败（脚本无法替你判断网关是哪一种）：
+```bash
+ocm config set PROTOCOL nc          # 协议：anyconnect / pulse / nc / gp / fortinet / array
+ocm config set MODE netns
+ocm config set SOCKS_PORT 8585
+ocm start
+```
 
-| 选项 | 传给 `openconnect` 的值 | 适用网关 |
+启动成功后会显示 SOCKS5 地址与 VPN 出口 IP。在自己电脑上使用（监听仅本机时）：
+
+```bash
+ssh -N -L 8585:127.0.0.1:8585 root@你的VPS
+# 然后把浏览器 / 应用的代理设为 SOCKS5 127.0.0.1:8585
+```
+
+### ⚙️ 设置项一览
+
+设置保存在 `/etc/oc-master/settings.conf`（`600`）。菜单 `5) 设置` 里每一项都有详细说明；也可用 `ocm config list -v` 查看。
+
+| 分组 | 项（KEY） | 可选值 | 说明 |
+|---|---|---|---|
+| 连接 | 运行模式 `MODE` | `netns` / `default` / `ocproxy` | 见上方模式表 |
+| 连接 | VPN 协议 `PROTOCOL` | `anyconnect` `pulse` `nc` `gp` `fortinet` `array` | 必须与网关一致；账户第 6 列可单独覆盖 |
+| 连接 | 数据通道 `DATA_CHANNEL` | `dtls` / `tls` | `dtls`：约 1 分钟后数据改走 UDP，快但丢包网络更不稳；`tls`：全程 TLS/TCP（`--no-dtls`），丢包网络里通常更稳 |
+| 连接 | 断网续连时长 `RECONNECT_TIMEOUT` | 60 / 300 / 900 秒 | 网络闪断时 openconnect 自己续连多久；对服务器主动终止无效 |
+| 连接 | 隧道 MTU `MTU` | `auto` / 1400 / 1300 / … | 大文件或个别站点卡住时调小 |
+| 连接 | 附加参数 `OC_EXTRA` | 自由文本 | 原样追加给 openconnect，例如 `--useragent=…` |
+| 代理 | SOCKS5 端口 `SOCKS_PORT` | 数字 | netns / ocproxy 模式 |
+| 代理 | 监听范围 `LISTEN` | `127.0.0.1` / `0.0.0.0` | 对外开放时务必设置认证 |
+| 代理 | SOCKS5 认证 `SOCKS_USER`/`SOCKS_PASS` | — | 仅 netns 模式 |
+| 代理 | 端口转发方式 `FORWARDER` | `socat` / `iptables` | socat 有 IPv4+IPv6 入口；iptables 仅 IPv4 入口 |
+| 安全 | 断线保护 `KILL_SWITCH` | `off` / `on` | `on`：VPN 不通时代理直接失败，绝不改走 VPS 出口（仅 netns） |
+| 网络 | DNS 超时策略 `DNS_FAST` | `off` / `on` | `on`：VPN 内 DNS 丢包后 1 秒重试并轮换服务器，减少「卡 5 秒」（仅 netns） |
+| 网络 | 宿主 IPv6 转发 `IPV6_FORWARD` | `off` / `on` | 只有需要经代理走 IPv6 时才开 |
+| 守护 | 自动重连 `AUTO_RECONNECT` | `on` / `off` | 关闭后掉线即停止并清理 |
+| 守护 | 重连退避 `BACKOFF` | 例如 `5 30 60 120 300 600 900` | 网络类失败的重试间隔序列 |
+| 守护 | 每小时最多重连 `MAX_PER_HOUR` | 数字 | 防止异常时疯狂重试 |
+| 守护 | 认证失败暂停阈值 `AUTH_FAIL_PAUSE` | 数字 | 连续认证失败达到此数即暂停（首次启动就失败会立即停止） |
+| 守护 | 软重连等待 `DEGRADED_WAIT` | 30 / 60 / 90 / 180 秒 | 进程在但代理持续不通多久后主动重连 |
+| 守护 | 开机自动连接 `AUTOSTART` | `off` / `on` | 启用 `ocm.service` 开机自启 |
+| 日志 | 诊断日志 `WATCH` | `on` / `off` | `ocm-watch.service` |
+| 日志 | 采样间隔 `SAMPLE_INTERVAL` | 15 / 30 / 60 秒 | 状态变化后自动加密到 5 秒，持续 3 分钟 |
+| 日志 | 日志总量上限 `LOG_MAX_MB` | 100 / 300 / 1000 | 超出时删最旧的轮转文件 |
+| 日志 | 额外探测 URL `EXTRA_PROBE_URL` | URL | 例如校内资源入口，确认其可达 |
+
+### ⌨️ 命令行
+
+```text
+ocm                      打开交互菜单
+ocm start [选项]         按保存的设置启动；选项只影响本次，加 --save 保存为默认
+    -a/--account N|名称  -m/--mode netns|default|ocproxy  -p/--proto nc|pulse|anyconnect|…
+    -P/--port N  --listen 127.0.0.1|0.0.0.0  --tls-only|--dtls  --fwd socat|iptables
+    --kill-switch on|off  --dns fast|system  --mtu N|auto  --oc-args "…"  --save  -i
+ocm stop | restart [选项] | status [-v]
+ocm log report [天数] | log tail | log snapshot [标签] | log mark <文字>
+ocm heal on|off|status
+ocm config list [-v] | get KEY | set KEY VALUE
+ocm accounts
+ocm install-service | uninstall-service
+ocm -V | -h
+```
+
+退出码：`0` 成功、`1` 失败、`2` 用法错误、`3` 已在运行 / 状态冲突。
+
+### 🔁 自动重连是怎么工作的
+
+`ocm start` 把会话交给 `ocm.service`（supervisor）。openconnect 每次退出，supervisor 根据退出码和输出判断原因：
+
+| 判定 | 依据 | 处理 |
 |---|---|---|
-| 1 | `anyconnect` | Cisco AnyConnect、ocserv（默认） |
-| 2 | `pulse` | Pulse Secure / Ivanti Secure Access |
-| 3 | `nc` | Juniper Network Connect |
+| `server-terminated` | 输出含 `Server terminated connection` / `Session terminated by server` | 约 2 秒后重连（不走退避） |
+| `watch-request` | 诊断服务发现「进程在但不通」并请求软重连 | 约 2 秒后重连 |
+| `auth` | 退出码 2（cookie/认证被拒）或登录失败字样 | 计数；首次启动即失败或连续达到阈值 → 暂停 |
+| `session-confirm` | 服务器要求确认已有会话等交互页面 | 按退避重试 |
+| `network` | 其他（DNS、TCP、TLS 失败，进程崩溃等） | 按 `BACKOFF` 退避重试，受 `MAX_PER_HOUR` 限制 |
 
-### 模式选择指南
+> openconnect 收到服务器的终止通知（例如会话到期）时会**直接退出**，`--reconnect-timeout` 管不到这种情况——这正是需要外部重连的原因。
+> 重连前 supervisor 会把 netns 的默认路由和 resolv.conf 恢复到基线，即使 openconnect 是被强杀、没来得及清理也能连回来。
 
-#### 🛡️ 默认模式
+### 📊 诊断日志与报告
 
-**适用场景**：
-- 需要全局 VPN 代理
-- 所有流量都要通过 VPN
-- 需要访问内网资源
+日志目录 `/var/log/oc-master/`：
 
-**特点**：
-- 所有流量通过 VPN
-- 自动保护 SSH 连接
-- 支持 IPv4 和 IPv6
+| 文件 | 内容 |
+|---|---|
+| `events.log` | 只记变化：状态迁移、supervisor 事件（启动/退出原因/重连）、openconnect 关键句、人工标记 |
+| `samples.log` | 定时采样：进程、tun、默认路由、SOCKS 探针、隧道内 ping、网关 TCP/ping、出口 IP、TCP 重传… |
+| `openconnect.log` | openconnect 全部输出（已脱敏） |
+| `incidents/` | 每次离开正常状态时的现场快照（路由、NAT、进程、内核消息…） |
+| `launch/` | 每次 `ocm start` 的完整启动输出 |
 
-**使用方法**：
+全部按大小轮转并 gzip，总量受 `LOG_MAX_MB` 限制，磁盘余量低于 400MB 时暂停写采样。
+
 ```bash
-# 运行脚本后选择
-1) 启动: 🛡️  默认模式 (全局VPN, 保护SSH)
+ocm log report 7
 ```
 
-#### 🔌 ocproxy 模式
+报告示例（节选）：
 
-**适用场景**：
-- 只需要 SOCKS5 代理
-- 不需要 IPv6 支持
-- 轻量级使用
+```text
+会话结束时间轴（离开 UP 时距认证多久；≈2h = 1h55m–2h05m）：
+  2026-01-01T19:34:13+0800  →DOWN      会话时长 2h00m      [≈2h!]   openconnect-gone(state-file-still-present)
+  2026-01-01T21:34:47+0800  →DOWN      会话时长 2h00m      [≈2h!]   openconnect-gone(state-file-still-present)
+  非人工结束 2 次，其中落在 ≈2h 区间 2 次
 
-**特点**：
-- 提供 SOCKS5 代理接口
-- 仅支持 IPv4
-- 默认监听本地 127.0.0.1
-
-**使用方法**：
-```bash
-# 运行脚本后选择
-2) 启动: 🔌 ocproxy 模式 (SOCKS5, 仅IPv4)
-# 输入监听端口（例如 1080）
+自动重连：openconnect 退出 2 次（server-terminated=2），重新就绪 2 次，软重连请求 0 次，暂停或限速 0 次
 ```
 
-#### 🌐 Netns 模式（推荐）
-
-**适用场景**：
-- 需要完全隔离的网络环境
-- 需要同时支持 IPv4 和 IPv6
-- 追求最佳的稳定性和兼容性
-
-**特点**：
-- 使用 Network Namespace 完全隔离
-- 不影响宿主机网络
-- 支持 IPv4 和 IPv6 双栈
-- 通过 SOCKS5 代理访问
-- 可选择本地或远程监听
-- 端口转发有两条后端，各对应一个菜单项：**3) Netns 模式 (socat 转发)** 与 **4) Netns 模式 (iptables 双 NAT)**；前者是进程级中继（推荐，同时提供 IPv4/IPv6 入口），后者用内核 DNAT + SNAT（**只有 IPv4 入口**）
-- 可选 **SOCKS5 用户名/密码**：启动时询问，留空即匿名；启用后主菜单会显示认证信息
-
-**使用方法**：
-```bash
-# 运行脚本后选择
-3) 启动: 🌐 Netns 模式 (SOCKS5, socat 转发)
-# 想用内核转发就选 4) 启动: 🌐 Netns 模式 (SOCKS5, iptables 双 NAT，IPv4 入口)
-# 输入监听端口（例如 8585）
-# 选择是否允许远程连接
-```
+断开时刻都落在同一个会话时长上，就说明是服务器的固定会话时长，而不是网络问题。
 
 ### 账户配置文件格式
 
-账户信息存储在 `/root/.vpn_accounts.env`，格式如下：
+账户信息存储在 `/root/.vpn_accounts.env`：
 
 ```
-显示名|用户名|密码|VPN主机|认证组(可选)
+显示名|用户名|密码|VPN主机|认证组(可选)|协议(可选)
 ```
 
 示例：
 ```
 示例网关A|user001|your_password|vpn.example.com|DefaultGroup
-示例网关B|user002|your_password|vpn2.example.com|
+示例网关B|user002|your_password|vpn2.example.com||nc
 ```
 
-也可以参考 [examples/vpn_accounts.example](examples/vpn_accounts.example)
+任何字段都不能包含 `|`。也可以参考 [examples/vpn_accounts.example](examples/vpn_accounts.example)。
 
 ### 定时任务
 
-#### 设置守护进程（自动重连）
-
-```bash
-# 在脚本主菜单选择
-7) 设置定时/守护任务
-1) 设置守护任务 (每5分钟检查，断线重连)
-```
-
-这会在 crontab 中添加下面这行（行内的 `PATH=...` 由脚本写入：cron 给任务的默认
-`PATH=/usr/bin:/bin` 不含 openconnect 与 gost 所在目录，不写就会"命令找不到"）：
-
-```cron
-*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /path/to/oc_master.sh _internal_check_health
-```
-
-⚠️ **注意**：守护任务在**默认模式**与 **ocproxy 模式**下断线会自动重连；**Netns 模式不自动重连**——它会在探测到隧道确实不可用（判据：netns 内的出口已等于本机出口）时执行停止清理，让状态如实变回"停止"，由你自己决定何时重连
-
-#### 设置定时关闭
-
-```bash
-# 例如：每天凌晨 2 点自动关闭 VPN
-7) 设置定时/守护任务
-2) 添加定时关闭任务
-# 输入: 0 2 * * *
-```
+菜单 `7) 定时启动 / 关闭`：按 cron 表达式添加 `ocm start` 或 `ocm stop`。
+断线重连已由 systemd supervisor 负责，**不再需要旧版的 cron 守护任务**。
 
 ### 停止 VPN
 
 ```bash
-# 方法1: 在脚本菜单中
-5) 停止 VPN
-
-# 方法2: 直接命令行
-./oc_master.sh stop
-
-# 方法3: 装过快捷命令之后
-ocm stop
+ocm stop            # 或菜单 3
 ```
 
 ### 卸载
 
-在主菜单选择 `10) 🗑️ 卸载`，它会依次：
+菜单 `10) 🗑️ 卸载`：停止 VPN 并清理 → 移除 systemd 单元 → 询问是否删除设置与诊断日志 → 清理本脚本的 crontab 条目（先备份到 `/root/.oc_master-crontab.bak`）→ 逐个询问是否删除依赖 → 删除账户文件、快捷命令与脚本自身。
 
-1. 停止 VPN 并清理 netns / veth / iptables 规则 / 策略路由 / `/etc/netns/<名字>/`；若本次把内核转发开关从 0 打开过，也会还原为 0
-2. 清理本脚本写入的所有 crontab 条目（写之前会先把原 crontab 备份到 `/root/.oc_master-crontab.bak`）
-3. 询问是否删除依赖：`gost` / `socat` 逐个询问，并区分"本脚本装的"（默认删）与"机器上本来就有"（默认保留）；`openconnect` 与 `ocproxy` 是**一条合并询问**、**固定默认保留**（它们是常用软件包，别的程序也可能在用）
-4. 删除账户文件 `/root/.vpn_accounts.env`、依赖标记目录 `/var/lib/oc-master`、快捷命令 `/usr/local/bin/ocm`
-5. 删除脚本自身
-
-> ⚠️ 第 4、5 步不可撤销——账户文件（含明文密码）与脚本本体都会被删除，需要保留请先自行备份。
-
-### ocm 快捷命令
-
-脚本每次启动都会自动确保快捷命令就绪（它不占菜单项）：若 `/usr/local/bin/ocm` 不存在、或是指向本脚本的悬空链接，就建一个指向本脚本的符号链接，之后不必再记脚本路径：
-
-```bash
-ocm          # 打开主菜单
-ocm stop     # 停止 VPN
-```
-
-- 只接管已经指向本脚本的链接；若该位置已被别的真实文件占用，会拒绝覆盖并提示。
-- 若脚本本身缺执行权限会自动补上（否则符号链接无法执行）。
-- 卸载脚本时该快捷命令会一并移除。
+> ⚠️ 账户文件（含明文密码）与脚本本体会被删除，需要保留请先自行备份。
 
 ### IPv6 连通性测试
 
-对于 Netns 模式，可以测试 IPv6 连通性：
+Netns 模式运行中可选菜单 `9) 🧪 测试 Netns IPv6 连通性`：检查全局 IPv6 地址、ping Google IPv6 DNS、HTTP IPv6 访问。
 
-```bash
-# 在脚本主菜单选择
-9) 🧪 测试 Netns IPv6 连通性
-```
+<a id="upgrade"></a>
 
-测试项目包括：
-1. ✓ 检查 Netns 内的全局 IPv6 地址
-2. ✓ Ping Google IPv6 DNS (2001:4860:4860::8888)
-3. ✓ HTTP IPv6 连接测试
+## ⬆️ 从 v7 升级
+
+1. 先用旧版停止 VPN（或升级后直接 `ocm stop`，v8 会清理旧版启动的会话）
+2. 用新脚本覆盖原文件（快捷命令 `ocm` 指向的路径不变）
+3. `ocm` → `5) 设置` 确认模式、协议、端口（v7 每次启动时询问的内容，现在保存在设置里）
+4. 如果配置过旧版守护任务（`_internal_check_health`），在菜单 `7` 选 `3` 清除；它已被 systemd 自动重连取代
+5. `ocm start`
+
+行为变化：netns 模式默认**不再**打开宿主 `net.ipv6.conf.all.forwarding`（需要时设置 `IPV6_FORWARD=on`）。
 
 ## 🔧 高级配置
 
-### 自定义配置参数
-
-脚本内的关键配置变量（可根据需要修改）：
+### 文件位置
 
 ```bash
-# Network Namespace 配置
-NETNS_NAME="ocm_vpn_space"
-VETH_HOST="veth_ocm_h"
-VETH_NS="veth_ocm_ns"
-VETH_HOST_IP="192.168.200.1"
-VETH_NS_IP="192.168.200.2"
+/etc/oc-master/settings.conf          # 设置（600）
+/root/.vpn_accounts.env               # 账户（600，明文）
+/var/log/oc-master/                   # 诊断日志
+/run/oc-master/                       # 运行时（阶段、本次生效设置）
+/etc/systemd/system/ocm.service       # supervisor
+/etc/systemd/system/ocm-watch.service # 诊断日志
+/var/run/oc_manager.state             # 当前会话状态（v7 兼容格式）
+/var/lib/oc-master/                   # 依赖标记、诊断服务状态
+```
 
-# 路由表 ID
-RT4_ID=100  # IPv4 路由表
-RT6_ID=101  # IPv6 路由表
+脚本内的网络常量（如需修改请直接编辑脚本顶部）：
 
-# 文件位置
-PID_FILE="/var/run/oc_manager.pid"
-GOST_PID_FILE="/var/run/oc_gost.pid"
-SOCAT_PID_FILE="/var/run/oc_socat.pid"           # 其 .v6 兄弟文件保存 IPv6 那条 socat 的 PID
-STATE_FILE="/var/run/oc_manager.state"
-SYSCTL_STATE_FILE="/var/run/oc_manager.sysctl"   # netns 模式记录转发开关原值
-ACCOUNTS_FILE="/root/.vpn_accounts.env"
-SHORTCUT_PATH="/usr/local/bin/ocm"
-DEPS_STATE_DIR="/var/lib/oc-master"              # 记录"由本脚本安装"的依赖
+```bash
+NETNS_NAME="ocm_vpn_space"; VETH_HOST="veth_ocm_h"; VETH_NS="veth_ocm_ns"
+VETH_HOST_IP="192.168.200.1"; VETH_NS_IP="192.168.200.2"
+RT4_ID=100; RT6_ID=101          # 默认模式 SSH 保护路由表
+OC_TUN_DEFAULT="ocmtun0"        # 默认模式的隧道网卡名
 ```
 
 ### 手动调试命令
 
 ```bash
-# 查看 Network Namespace
-ip netns list
-
-# 查看 Netns 内的网络配置
-ip netns exec ocm_vpn_space ip addr
-ip netns exec ocm_vpn_space ip route
-
-# 在 Netns 内测试连接
-ip netns exec ocm_vpn_space ping 8.8.8.8
+ocm status -v                                   # 运行状态 + 最新采样
+journalctl -u ocm -n 100                        # supervisor 输出
+ocm log tail                                    # 实时事件 + openconnect 输出
+ip netns exec ocm_vpn_space ip route            # netns 内路由
 ip netns exec ocm_vpn_space curl https://api.ipify.org
-
-# 查看 SOCKS5 监听端口
-ss -tlnp | grep socat                                  # socat 后端在主机上监听
-ip netns exec ocm_vpn_space ss -lntp                   # gost 在 netns 内监听（宿主上看不到）
-iptables -t nat -S | grep DNAT                         # iptables 双 NAT 后端没有监听进程，只有规则
-
-# 查看 OpenConnect 进程
-ps aux | grep openconnect
+ss -tlnp | grep socat                           # socat 后端在宿主上监听
+ip netns exec ocm_vpn_space ss -lntp            # gost 在 netns 内监听
 ```
 
 ## 🐛 故障排除
 
-### 常见问题
-
 1. **VPN 连接失败**
-   - 检查账户信息是否正确
-   - 确认 VPN 服务器地址可访问
-   - 查看 OpenConnect 日志
+   - `ocm status -v` 看阶段；完整启动输出在 `/var/log/oc-master/launch/`
+   - 阶段显示 `failed:auth`：账号或密码错误 / 被拒，确认后重新 `ocm start`（自动重连已暂停，防止账号被锁）
+   - 协议是否与网关一致（设置 → VPN 协议）
 
-2. **SOCKS5 代理不工作**（Netns 模式）
-   - 测试 Netns 内网络连通性：`ip netns exec ocm_vpn_space ping 8.8.8.8`
-   - 检查 gost 进程是否运行：`ps aux | grep gost`
-   - 检查端口转发：`ss -tlnp | grep socat`（socat 后端）或 `iptables -t nat -S | grep DNAT`（iptables 双 NAT 后端，它没有监听进程）
+2. **每隔固定时间就断一次**
+   - `ocm log report 7` 看「会话结束时间轴」。断开时刻都落在同一会话时长上，通常是服务器的会话上限，客户端无法延长；自动重连会在几秒内接上
 
-3. **IPv6 不工作**
-   - 确认 VPN 服务器支持 IPv6
-   - 使用 Netns 模式（默认和 ocproxy 模式对 IPv6 支持有限）
-   - 运行 IPv6 连通性测试（菜单选项 9）
+3. **SOCKS5 代理时好时坏**（Netns 模式）
+   - 看报告里的「会话内短暂故障」与采样里的 `tping`（隧道内丢包）、`socks` 字段
+   - 丢包网络可试 `DATA_CHANNEL=tls`；VPN 内 DNS 丢包导致的「卡 5 秒」可试 `DNS_FAST=on`
 
 4. **SSH 连接中断**（默认模式）
-   - 脚本会自动保护 SSH 连接
-   - 如果仍然中断，检查策略路由配置
+   - 脚本会自动保护 SSH 连接；首次启动 3 分钟内若未确认成功会自动回滚
 
 ## 📊 版本历史
+
+### v8.0.0 (2026-11-12)
+
+- ✨ **新增**：systemd 托管（`ocm.service`）。openconnect 改为前台运行，退出后按原因自动重连（服务器终止 / 网络错误 / 认证失败分别处理），重连期间 netns 与代理保持不动；关闭 SSH 不再影响 VPN
+- ✨ **新增**：内置长期诊断日志（`ocm-watch.service`）：采样、事件、断线现场快照、`ocm log report`（会话结束时间轴、自动重连统计）；「进程在但不通」时主动软重连
+- ✨ **新增**：⚙️ 设置菜单与 `/etc/oc-master/settings.conf`，每个参数都有说明与可选项；启动前显示摘要，可只改本次
+- ✨ **新增**：命令行接口 `ocm -h`（start / stop / restart / status / log / heal / config / accounts）
+- ✨ **新增**：数据通道选择（`--no-dtls`）、MTU、断网续连时长、附加参数、断线保护（kill switch）、DNS 快速重试、开机自动连接
+- ✨ **新增**：账户第 6 列可指定协议；协议新增 GlobalProtect / Fortinet / Array 选项
+- 🔧 **修复**：openconnect 被强杀后 netns 默认路由与 resolv.conf 未还原导致无法重连——重连前恢复网络基线
+- 🔧 **变更**：netns 模式默认不再打开宿主 IPv6 全局转发；VPN 密码不再 `export` 进子进程环境；账户列表与状态区不再显示明文密码；主菜单状态区不再发网络请求，秒开
+- 🔧 **变更**：旧版 cron 守护任务由 systemd 自动重连取代（旧条目运行时只提示，不再动作）
+- 📝 **调研参考**：openconnect 源码（退出码与服务器终止原因）、wazum/openconnect-proxy（前台运行 + 重试循环）、telekom-mms/oc-daemon、f3flight/openconnect-ns（systemd 托管）
 
 ### v7.7.7 (2025-10-25) - Final
 
@@ -428,7 +399,7 @@ ps aux | grep openconnect
 - 保持代码风格一致
 - 添加必要的注释
 - 更新相关文档
-- 测试所有三种模式
+- 测试所有三种模式（至少 netns），并跑一次 `bash -n` 与 shellcheck
 
 ## 📄 许可证
 
@@ -439,6 +410,7 @@ ps aux | grep openconnect
 - [OpenConnect](https://www.infradead.org/openconnect/)
 - [GOST](https://github.com/go-gost/gost)
 - [ocproxy](https://github.com/cernekee/ocproxy)
+- 设计参考：[openconnect-proxy](https://github.com/wazum/openconnect-proxy)、[oc-daemon](https://github.com/telekom-mms/oc-daemon)、[openconnect-ns](https://github.com/f3flight/openconnect-ns)
 - 所有使用和反馈的用户
 
 ---

@@ -1,22 +1,22 @@
 #!/bin/bash
 # =================================================================
-#   OpenConnect Master Manager - v7.7.7 (Final)
-#   - 定稿: 简化 ocproxy 模式，移除远程连接选项，默认监听本地。
-#   - 修复(Netns): 增强 show_status 中的 IPv6 检测，通过多种方式(增加超时、
-#     备用检测点、netns内部直连)提高检测成功率。
-#   - 增强(Netns): socat 转发支持 IPv4 和 IPv6 双栈监听。
-#   - 新增(Netns): 启动时和菜单中增加 IPv6 连通性主动测试功能。
-#   - 新增: OpenConnect 协议选择，支持 AnyConnect / Pulse(Ivanti) / NC(Juniper)。
-#   - 新增(Netns): 端口转发拆成两个启动项——3) socat 转发 / 4) iptables 双 NAT；
-#     后者启动时需放开 veth 的 route_localnet（本机流量经 DNAT 后源地址仍是
-#     127.0.0.1，默认不允许从该接口出去，包会被当 martian 丢掉）。
-#   - 改进: ocm 快捷命令改为启动时自动安装、状态区显示（不再占一个菜单项）；
-#     主菜单保持一列 + emoji 图标 + 整行颜色。
+#   OpenConnect Master Manager - v8.0.0
+#   - 新增: systemd 托管（ocm.service）。openconnect 改为前台运行，退出后按原因自动重连
+#     （服务器到期终止 / 网络错误 / 认证失败分别处理），netns 与代理在重连期间保持不动；
+#     关闭 SSH 不再影响 VPN。
+#   - 新增: 内置长期诊断日志（ocm-watch.service）：定时采样、事件、断线现场快照、报告。
+#   - 新增: ⚙️ 设置菜单 + /etc/oc-master/settings.conf —— 每个可调参数都有说明与可选项，
+#     启动前显示摘要，可直接启动 / 先改设置 / 只改本次。
+#   - 新增: 命令行接口（ocm -h）：start / stop / restart / status / log / heal / config / accounts。
+#   - 变更: netns 模式默认不再打开宿主 IPv6 全局转发（设置里可开）；VPN 密码不再 export
+#     进子进程环境；账户列表与状态区不再明文显示密码。
+#   - 保留: 默认全局 / ocproxy / Netns 三种模式；SSH 保护路由；socat / iptables 两种转发后端。
 # =================================================================
 set -euo pipefail
 
 # --- 全局配置 ---
-VR_TAG="OC-Master-v7.7.7-Final"
+VERSION="8.0.0"
+VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
 GOST_PID_FILE="/var/run/oc_gost.pid"
@@ -27,11 +27,30 @@ STATE_FILE="/var/run/oc_manager.state"
 SYSCTL_STATE_FILE="/var/run/oc_manager.sysctl"
 ACCOUNTS_FILE="/root/.vpn_accounts.env"
 SHORTCUT_PATH="/usr/local/bin/ocm"
-# 依赖标记：只记录"由本脚本安装"的依赖。卸载时据此区分——脚本装的默认删，
-# 用户自己装的默认保留并提醒，避免顺手删掉别的用途在用的东西。
-# 老版本升上来的机器没有这个文件，于是所有依赖都算"用户自己的"（偏保守）。
+# 依赖标记：只记录"由本脚本安装"的依赖（卸载时据此区分默认删/默认留）
 DEPS_STATE_DIR="/var/lib/oc-master"
 DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
+
+# --- v8: 设置 / 运行时 / 日志 ---
+CONF_DIR="/etc/oc-master"
+SETTINGS_FILE="${CONF_DIR}/settings.conf"
+RUN_DIR="/run/oc-master"
+RUN_PROFILE="${RUN_DIR}/run.conf"        # 本次启动的生效设置（600；不含 VPN 密码）
+PHASE_FILE="${RUN_DIR}/phase"            # supervisor 阶段：starting/connecting/up/reconnecting/stopping/stopped/failed:<原因>
+RESTART_REQ="${RUN_DIR}/restart-request" # 观察进程请求软重连
+SESSION_LOG="${RUN_DIR}/oc-session.log"  # 当前这次 openconnect 的输出（判断退出原因用）
+LOG_DIR="/var/log/oc-master"
+EVENTS="${LOG_DIR}/events.log"
+SAMPLES="${LOG_DIR}/samples.log"
+OCLOG="${LOG_DIR}/openconnect.log"
+INC_DIR="${LOG_DIR}/incidents"
+LAUNCH_DIR="${LOG_DIR}/launch"
+WATCH_LIB="${DEPS_STATE_DIR}/watch"
+SVC_MAIN="ocm.service"
+SVC_WATCH="ocm-watch.service"
+UNIT_DIR="/etc/systemd/system"
+START_TIMEOUT=90                         # ocm start 等待隧道就绪的最长时间（秒）
+OC_TUN_DEFAULT="ocmtun0"                 # 默认全局模式的隧道网卡名（netns 模式在命名空间里，仍是 tun0）
 
 # --- 路由与网络配置 ---
 RT4_ID=100; RT4_NAME="vps_return4"
@@ -51,6 +70,8 @@ CURL_CMD="$(command -v curl || echo /usr/bin/curl)"
 # --- 样式与日志 ---
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_GREY='\033[90m'
 C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_CYAN='\033[36m'
+# 非终端（systemd / 管道）时不输出颜色码，日志文件保持干净
+if [ ! -t 1 ]; then C_RESET=''; C_BOLD=''; C_GREY=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; fi
 log()      { echo -e "${C_GREEN}✅ [$VR_TAG] $1${C_RESET}"; }
 log_err()  { echo -e "${C_RED}❌ [$VR_TAG] $1${C_RESET}" >&2; }
 log_info() { echo -e "${C_CYAN}ℹ️  [$VR_TAG] $1${C_RESET}"; }
@@ -58,6 +79,28 @@ log_warn() { echo -e "${C_YELLOW}⚠️  [$VR_TAG] $1${C_RESET}"; }
 title()    { echo -e "${C_BOLD}$1${C_RESET}"; }
 sep()      { echo -e "${C_GREY}--------------------------------------------------------${C_RESET}"; }
 check_root(){ [ "$EUID" -eq 0 ] || { log_err "请用 root 运行"; exit 1; }; }
+
+# 事件日志：一行一事件，纯内建取时间（停止时 SIGTERM 发给整个 cgroup，$(...) 有竞态）
+ev() {
+  local _t _e
+  printf -v _t '%(%Y-%m-%dT%H:%M:%S%z)T' -1; printf -v _e '%(%s)T' -1
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s e=%s %s\n' "$_t" "$_e" "$*" >> "$EVENTS" 2>/dev/null || true
+  return 0
+}
+now_s() { printf '%(%s)T' -1; }
+fmt_dur() { # 秒 → 1d02h03m / 1h02m03s / 2m03s / 5s
+  local s=${1:-0} d h m; [[ "$s" =~ ^[0-9]+$ ]] || { echo "$s"; return; }
+  d=$((s/86400)); h=$((s%86400/3600)); m=$((s%3600/60)); s=$((s%60))
+  if [ $d -gt 0 ]; then printf '%dd%02dh%02dm' $d $h $m
+  elif [ $h -gt 0 ]; then printf '%dh%02dm%02ds' $h $m $s
+  elif [ $m -gt 0 ]; then printf '%dm%02ds' $m $s
+  else printf '%ds' $s; fi
+}
+# 脱敏：密码/口令/cookie/会话令牌一律替换（openconnect 的 HTTP 交互里可能出现 DSID 等）
+redact() {
+  sed -E 's/((pass(word|wd)?|cookie|DSID|DSFirstAccess|DSLastAccess|DSSignInURL|token|secret|authorization|SOCKS_PASS)[[:space:]]*[:=][[:space:]]*)[^[:space:];&]+/\1<redacted>/Ig'
+}
 
 # --- ocm 快捷命令 ---
 # 用符号链接而不是拷贝：脚本自身用 readlink -f "$0" 解析真实路径，所以从
@@ -131,13 +174,6 @@ _shortcut_state() {
     echo "ocm 未安装"
   fi
   return 0
-}
-
-# --- 中断处理 ---
-cleanup_on_interrupt() {
-  log_err "\n操作被用户中断 (Ctrl+C)。正在紧急清理..."
-  stop_vpn
-  exit 1
 }
 
 # --- 依赖检查 ---
@@ -483,7 +519,8 @@ setup_netns() {
     > "$SYSCTL_STATE_FILE" 2>/dev/null || true
   log_info "启用内核 IP 转发..."
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+  # v8：IPv6 转发默认不开（netns 没有 IPv6 出口时用不到，全局开启还可能影响宿主接受 RA）；设置 IPV6_FORWARD=on 才开
+  if [ "${OCM_IPV6_FORWARD:-0}" = 1 ]; then sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null; fi
 
   log_info "为 Netns 出口流量配置 MASQUERADE..."
   local gw_dev; gw_dev=$("$IP_CMD" route | awk '/^default/ {print $5; exit}')
@@ -530,7 +567,7 @@ cleanup_netns() {
 # --- 账户管理 ---
 manage_accounts() {
   [ -f "$ACCOUNTS_FILE" ] || { tee "$ACCOUNTS_FILE" >/dev/null <<'EOT'
-# 格式: 显示名|用户名|密码|VPN主机|认证组(可选)
+# 格式: 显示名|用户名|密码|VPN主机|认证组(可选)|协议(可选)
 EOT
     chmod 600 "$ACCOUNTS_FILE" || true; }
   # c 必须是 local：否则子菜单会把主菜单的选项变量覆盖成自己的选择，返回主菜单后
@@ -539,12 +576,15 @@ EOT
   local c
   while true; do
     clear 2>/dev/null || true; title "🔐 管理 VPN 账户 ($ACCOUNTS_FILE)"; sep
-    grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE" | nl -ba || log_info "  文件为空。"
+    accounts_list   # v8：列表不再显示密码列
     sep; echo "  1) 添加  2) 删除  3) 返回"; read -rp "选择 [1-3]: " c || { echo; log_info "标准输入已结束，返回。"; return 0; }
     case "$c" in
-      1) read -rp "显示名: " d; read -rp "用户: " u; read -sp "密码: " p; echo; read -rp "主机: " h; read -rp "认证组(可选): " g
+      1) read -rp "显示名: " d; read -rp "用户: " u; read -sp "密码: " p; echo; read -rp "主机: " h; read -rp "认证组(可选): " g; read -rp "协议(可选，留空=用设置里的全局协议；anyconnect/pulse/nc/gp/fortinet/array): " pr
+         case "${pr:-}" in ""|anyconnect|pulse|nc|gp|fortinet|array) ;; *) log_err "未知协议：$pr"; read -n1 -s -p "按任意键继续"; continue;; esac
          [ -z "$d" ] || [ -z "$u" ] || [ -z "$p" ] || [ -z "$h" ] && { log_err "必填项不能为空"; read -n1 -s -p "按任意键继续"; continue; }
-         echo "$d|$u|$p|$h|$g" >> "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已添加 $d"; read -n1 -s -p "按任意键继续";;
+         # 账户文件用 | 分字段（cut -d'|'），任一字段含 | 都会错位（密码 pa|ss 会被读成 pa）
+         case "$d$u$p$h$g$pr" in *"|"*) log_err "任何字段都不能包含 | 字符"; read -n1 -s -p "按任意键继续"; continue;; esac
+         echo "$d|$u|$p|$h|$g${pr:+|$pr}" >> "$ACCOUNTS_FILE"; chmod 600 "$ACCOUNTS_FILE" || true; log "已添加 $d"; read -n1 -s -p "按任意键继续";;
       2) mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ ${#A[@]} -eq 0 ] && { log_info "无账户"; sleep 1; continue; }
          read -rp "输入要删除的序号: " i; [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#A[@]}" ] || { log_err "无效序号"; continue; }
          # 按"过滤后列表里的第 i 条"精确删除一行。原先用 grep -vF 删整行字符串有两个坑：
@@ -559,276 +599,210 @@ EOT
     esac
   done
 }
-select_account() {
-  mapfile -t ACC < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE")
-  [ ${#ACC[@]} -gt 0 ] || { log_err "账户文件为空或无效"; manage_accounts; return 1; }
-  log_info "请选择VPN账号："; local i=0; for a in "${ACC[@]}"; do i=$((i+1)); echo "  $i) $(echo "$a" | cut -d'|' -f1)"; done; echo "  99) 返回"
-  read -rp "输入序号: " idx; [ "$idx" = "99" ] && return 1
-  [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#ACC[@]}" ] || { log_err "无效选择"; return 1; }
-  local choice="${ACC[$((idx-1))]}"; export ACCOUNT_INDEX="$((idx-1))"
-  export VPN_DESC=$(echo "$choice" | cut -d'|' -f1)
-  export VPN_USER=$(echo "$choice" | cut -d'|' -f2)
-  export VPN_PASS=$(echo "$choice" | cut -d'|' -f3)
-  export VPN_HOST=$(echo "$choice" | cut -d'|' -f4)
-  export VPN_GROUP=$(echo "$choice" | cut -d'|' -f5)
-  log_info "已加载: $VPN_DESC"
-}
 
-select_protocol() {
-  local p=""
-  echo
-  title "🔌 请选择 OpenConnect 协议："
-  echo "  1) AnyConnect  - Cisco AnyConnect（默认）"
-  echo "  2) Pulse       - Pulse Secure / Ivanti Secure Access"
-  echo "  3) NC          - Juniper Network Connect"
-  echo "  99) 返回"
-  read -rp "选择 [1-3，默认 1]: " p
-  case "${p:-1}" in
-    1) export VPN_PROTOCOL="anyconnect"; export VPN_PROTOCOL_DESC="Cisco AnyConnect" ;;
-    2) export VPN_PROTOCOL="pulse";      export VPN_PROTOCOL_DESC="Pulse / Ivanti" ;;
-    3) export VPN_PROTOCOL="nc";         export VPN_PROTOCOL_DESC="Juniper NC" ;;
-    99) return 1 ;;
-    *) log_err "无效协议选择"; return 1 ;;
+# ============================================================================
+#  设置（/etc/oc-master/settings.conf，600）
+# ----------------------------------------------------------------------------
+#  注册表每行：KEY|类型|默认值|可选项|标题|分组
+#    类型：choice（只能选可选项）、int（数字，可选项只是常用预设）、text（自由文本，
+#          可选项为预设）、account（账户序号）、auth（SOCKS 用户名+密码）
+#    可选项：逗号分隔的 值:说明
+#  说明文字在 _set_help 里，菜单与 `ocm config list -v` 共用。
+# ============================================================================
+SET_REGISTRY=(
+  "ACCOUNT|account|1||VPN 账户|连接"
+  "MODE|choice|netns|netns:Netns 隔离代理（推荐）,default:默认全局模式,ocproxy:ocproxy 用户态代理|运行模式|连接"
+  "PROTOCOL|choice|anyconnect|anyconnect:Cisco AnyConnect,pulse:Pulse / Ivanti Secure Access,nc:Juniper Network Connect,gp:Palo Alto GlobalProtect,fortinet:Fortinet SSL VPN,array:Array Networks|VPN 协议|连接"
+  "DATA_CHANNEL|choice|dtls|dtls:ESP/DTLS（UDP，openconnect 默认）,tls:仅 TLS（--no-dtls）|数据通道|连接"
+  "RECONNECT_TIMEOUT|int|300|60:1 分钟,300:5 分钟（openconnect 默认）,900:15 分钟|断网续连时长（秒）|连接"
+  "MTU|text|auto|auto:自动,1400:1400,1300:1300,1200:1200|隧道 MTU|连接"
+  "OC_EXTRA|text|||openconnect 附加参数|连接"
+  "SOCKS_PORT|int|1080|1080:1080,8585:8585|SOCKS5 端口|代理"
+  "LISTEN|choice|127.0.0.1|127.0.0.1:仅本机（经 SSH 隧道访问）,0.0.0.0:全部网卡（对外开放）|监听范围|代理"
+  "SOCKS_AUTH|auth|||SOCKS5 认证|代理"
+  "FORWARDER|choice|socat|socat:socat 进程转发（IPv4+IPv6 入口）,iptables:iptables 双 NAT（仅 IPv4 入口）|端口转发方式|代理"
+  "KILL_SWITCH|choice|off|off:关（掉线期间代理改走 VPS 出口）,on:开（掉线期间代理直接失败）|断线保护|安全"
+  "DNS_FAST|choice|off|off:系统默认（每次等 5 秒）,on:快速重试（1 秒 × 3 次，轮换服务器）|DNS 超时策略|网络"
+  "IPV6_FORWARD|choice|off|off:关,on:开|宿主 IPv6 转发|网络"
+  "AUTO_RECONNECT|choice|on|on:开,off:关|自动重连|守护"
+  "BACKOFF|text|5 30 60 120 300 600 900|5 30 60 120 300 600 900:默认,10 60 300 900:保守|重连退避（秒）|守护"
+  "MAX_PER_HOUR|int|12|6:6 次,12:12 次,30:30 次|每小时最多重连|守护"
+  "AUTH_FAIL_PAUSE|int|3|1:1 次,3:3 次,5:5 次|认证失败暂停阈值|守护"
+  "DEGRADED_WAIT|int|90|30:30 秒,60:60 秒,90:90 秒,180:180 秒|隧道不通多久后软重连|守护"
+  "AUTOSTART|choice|off|off:关,on:开|开机自动连接|守护"
+  "WATCH|choice|on|on:开,off:关|诊断日志|日志"
+  "SAMPLE_INTERVAL|int|30|15:15 秒,30:30 秒,60:60 秒|采样间隔（秒）|日志"
+  "LOG_MAX_MB|int|300|100:100 MB,300:300 MB,1000:1 GB|日志总量上限（MB）|日志"
+  "EXTRA_PROBE_URL|text|||额外探测 URL|日志"
+)
+# 存储键（SOCKS_AUTH 是两项的组合，实际存 SOCKS_USER / SOCKS_PASS）
+declare -A CFG=() SET_TYPE=() SET_DEF=() SET_CHOICES=() SET_TITLE=() SET_GROUP=()
+SET_KEYS=()
+for _e in "${SET_REGISTRY[@]}"; do
+  IFS='|' read -r _k _t _d _c _ti _g <<<"$_e"
+  SET_KEYS+=("$_k"); SET_TYPE[$_k]=$_t; SET_DEF[$_k]=$_d; SET_CHOICES[$_k]=$_c; SET_TITLE[$_k]=$_ti; SET_GROUP[$_k]=$_g
+done
+unset _e _k _t _d _c _ti _g
+# 修改后需要重启 VPN 才生效的键（守护/日志类在运行中即时读取）
+SET_NEEDS_RESTART=" ACCOUNT MODE PROTOCOL DATA_CHANNEL RECONNECT_TIMEOUT MTU OC_EXTRA SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST IPV6_FORWARD "
+
+_set_help() {
+  case "$1" in
+    ACCOUNT) echo "使用账户文件（${ACCOUNTS_FILE}）里的第几个账户。账户的增删在主菜单「管理 VPN 账户」。";;
+    MODE) cat <<'EOT'
+netns   ：VPN 关在独立网络命名空间里，对外提供 SOCKS5 代理；本机 SSH 与其他服务完全不受影响。
+          适合"只让部分程序走学校/公司网络"。需要 gost（SOCKS5 服务端）与 socat 或 iptables。
+default ：整机流量走 VPN（自动配置 SSH 保护路由，避免失联）。会影响本机所有服务的出口，
+          首次启动带 3 分钟保底自动回滚。
+ocproxy ：用户态 SOCKS5（不建内核 tun），仅 IPv4、无认证、只监听本机；最轻量。
+EOT
+;;
+    PROTOCOL) echo "VPN 服务器的类型，必须与服务器一致（不确定就看学校/公司的 VPN 说明页或客户端名称）。
+单个账户可在账户文件第 6 列指定自己的协议，优先于这里的全局值。";;
+    DATA_CHANNEL) echo "dtls：先用 TLS 建连，约 1 分钟后数据改走 UDP（ESP/DTLS），延迟低、吞吐高；
+      但在丢包或限制 UDP 的网络里会更不稳定。
+tls ：所有流量都走 TLS/TCP 隧道（--no-dtls）。稍多一点开销，丢包网络里通常更稳。
+      实测：某 Juniper 网关白天 UDP 丢包严重时，改 tls 后代理失败率减半。";;
+    RECONNECT_TIMEOUT) echo "网络闪断时 openconnect 自己尝试续连多久才放弃（--reconnect-timeout）。
+注意：服务器主动结束会话（例如会话到期）时 openconnect 会直接退出，这个值管不到，由下面的「自动重连」负责。";;
+    MTU) echo "隧道最大包长。auto 由 openconnect 与服务器协商；网页能开但大文件/某些站点卡住时可试 1400 或 1300。";;
+    OC_EXTRA) echo "原样追加给 openconnect 的参数（空格分隔），例如 --useragent=xxx 或 --os=win。
+留空即不加。高级选项：填错会导致连接失败。";;
+    SOCKS_PORT) echo "SOCKS5 代理监听端口（netns / ocproxy 模式）。必须未被占用。";;
+    LISTEN) echo "127.0.0.1：只有本机能连；从自己电脑使用时走 SSH 隧道：ssh -L 端口:127.0.0.1:端口 你的VPS。
+0.0.0.0  ：任何人都能连到这个端口——务必同时开启 SOCKS5 认证，并用防火墙限制来源。
+（ocproxy 模式始终只监听本机。）";;
+    SOCKS_AUTH) echo "为 SOCKS5 设置用户名/密码（仅 netns 模式）。对外开放监听时强烈建议开启。
+用户名不能含 @ : / 引号 反斜杠 空白；密码不能含 / 引号 反斜杠 空白（会破坏 URL 解析）。";;
+    FORWARDER) echo "把宿主端口转进 netns 里的 SOCKS5：
+socat   ：进程级中继，宿主侧 IPv4+IPv6 都可接入，最稳妥（默认）。
+iptables：内核双 NAT，不多一个进程，但只有 IPv4 入口。";;
+    KILL_SWITCH) echo "关：VPN 掉线/重连的那几秒里，代理仍有响应，但流量出口是 VPS 自己的 IP。
+开：VPN 不通时代理直接失败（netns 内防火墙只放行隧道），保证流量绝不从 VPS 出口出去；
+    代价是重连期间访问会报错。仅 netns 模式有效。";;
+    DNS_FAST) echo "VPN 下发的 DNS 若经常丢包，程序每丢一次查询要干等 5 秒，表现为网页时不时卡住。
+on：在 netns 的 resolv.conf 加 options timeout:1 attempts:3 rotate，丢包后 1 秒就重试并轮换服务器。
+仅 netns 模式；每次（重）连接后自动补上（vpnc-script 每次连接都会重写该文件）。";;
+    IPV6_FORWARD) echo "netns 模式需要宿主开启 IPv4 转发（自动开、停止后按原值还原）。IPv6 转发只有在 VPN 下发了
+IPv6 且你要经代理走 IPv6 时才需要；全局开启可能让宿主不再接受 IPv6 路由通告（RA）。不确定就保持关。";;
+    AUTO_RECONNECT) echo "openconnect 退出后自动重新连接（服务器到期终止 → 约 2 秒后重连；网络错误 → 按退避间隔重试；
+认证失败 → 计数，达到阈值即暂停，防止账号被锁）。关闭后掉线即停止并清理。";;
+    BACKOFF) echo "网络类失败时的重试间隔序列（秒），第 N 次失败用第 N 个值，超出用最后一个。服务器到期终止不走退避。";;
+    MAX_PER_HOUR) echo "1 小时内最多重连几次，超过则等到窗口滑出再试。防止异常时疯狂重试触发服务器风控。";;
+    AUTH_FAIL_PAUSE) echo "连续几次认证失败（密码错误/账号被拒）后暂停自动重连，避免把账号锁掉。
+首次启动就认证失败会立即停止。恢复：确认账号后 ocm heal on 或重新启动。";;
+    DEGRADED_WAIT) echo "openconnect 进程还在、但经代理访问持续失败多少秒后，主动断开重连（软重连）。
+太短会被 UDP 通道切换、短暂抖动误触发；太长则卡死的连接要更久才恢复。";;
+    AUTOSTART) echo "开机后自动按当前设置连接（启用 systemd 单元 ocm.service）。";;
+    WATCH) echo "后台诊断服务（ocm-watch.service）：定时采样隧道/代理/网关状态，记录状态变化与断线现场，
+并负责「进程在但不通」时的软重连。日志在 ${LOG_DIR}，ocm log report 查看汇总。";;
+    SAMPLE_INTERVAL) echo "诊断采样间隔。状态变化后会自动加密到 5 秒持续 3 分钟，平时用这个值。";;
+    LOG_MAX_MB) echo "诊断日志目录总量上限，超出时从最旧的轮转文件开始删。磁盘剩余低于 400MB 时暂停写采样。";;
+    EXTRA_PROBE_URL) echo "除公网探测外，额外经代理访问的 URL（例如图书馆数据库入口），用来确认校内资源可达。留空不测。";;
   esac
-  log_info "已选择协议: ${VPN_PROTOCOL_DESC} (--protocol=${VPN_PROTOCOL})"
 }
 
-_load_account_by_index() {
-  local idx="$1"; mapfile -t ACC < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE")
-  [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -lt "${#ACC[@]}" ] || { log_err "无效账户索引: $idx"; exit 1; }
-  local choice="${ACC[$idx]}"; export ACCOUNT_INDEX="$idx"
-  export VPN_DESC=$(echo "$choice" | cut -d'|' -f1); export VPN_USER=$(echo "$choice" | cut -d'|' -f2);
-  export VPN_PASS=$(echo "$choice" | cut -d'|' -f3); export VPN_HOST=$(echo "$choice" | cut -d'|' -f4);
-  export VPN_GROUP=$(echo "$choice" | cut -d'|' -f5);
+settings_defaults() { local k; for k in "${SET_KEYS[@]}"; do CFG[$k]=${SET_DEF[$k]}; done; CFG[SOCKS_USER]=""; CFG[SOCKS_PASS]=""; }
+_is_cfg_key() { case " ${SET_KEYS[*]} SOCKS_USER SOCKS_PASS " in *" $1 "*) [ "$1" != SOCKS_AUTH ];; *) return 1;; esac; }
+
+# 读取 KEY=<printf %q 值> 形式的文件到 CFG（只认白名单键；文件仅 root 可写）
+_load_kv_file() {
+  local f="$1" line k v
+  [ -r "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+    k=${BASH_REMATCH[1]}; _is_cfg_key "$k" || continue
+    eval "v=${BASH_REMATCH[2]}" 2>/dev/null || continue
+    CFG[$k]=$v
+  done < "$f"
 }
+settings_load() { settings_defaults; _load_kv_file "$SETTINGS_FILE"; }
 
-# --- 启动/停止核心逻辑 ---
-_execute_with_safety_net() {
-  local func_to_run="$1"; shift   # 其余参数原样透传给被调函数（菜单 3/4 用它传转发后端）
-  trap cleanup_on_interrupt SIGINT
-  check_atd
-  # 保底回滚：先排一个 2 分钟后执行的 stop，连接稳定后再取消它（见下方 atrm）。
-  # 注意 at 的时间表达式必须是英文单位：原写成 `at now + 2 分钟之前`，at 会以
-  # "Garbled time" 拒绝，job 取到空值后整条保底机制静默失效（README 承诺的
-  # "自动回滚保护" 因此从未生效过）。这里用标准写法。
-  # job 号必须是数字才算设置成功：at 失败（atd 未运行、时间表达式被拒）时 awk 拿到的是空串，
-  # 而原先的 `|| echo "none"` 永远不会触发——管道的末环是 awk，它自己的退出码恒为 0。
-  # 于是空 job 被当成已设任务，打印 "已设保底清理任务 (Job )" 而保底回滚静默失效
-  # （实测：at 语法错误 → at_rc=1、输出里没有 job 行 → job 为空串）。
-  local job; job=$(echo "$SCRIPT_PATH stop" | at now + 2 minutes 2>&1 | awk '/job/{print $2}' || true)
-  [[ "${job:-}" =~ ^[0-9]+$ ]] || job="none"
-  if [ "$job" != "none" ]; then
-    log_warn "已设保底清理任务 (Job $job), 2分钟内连接失败将自动回滚。"
-  else
-    log_warn "未能排上保底清理任务（at/atd 不可用）；若本次启动失败，请手动执行 stop。"
-  fi
-
-  if "$func_to_run" "$@"; then
-    trap - SIGINT # 成功后解除陷阱
-    [ "$job" != "none" ] && atrm "$job" && log "连接稳定, 已取消保底任务"
-    show_status || true
-  else
-    trap - SIGINT # 失败后解除陷阱
-    log_err "启动过程失败，请检查日志。"
-    stop_vpn # 确保在函数内部失败时也执行清理
-    # 清理已经做过了，必须把保底任务撤掉：否则它 2 分钟后会准时执行一次 stop，
-    # 而那时用户很可能已经重新连上了——于是"上一次失败"把"这一次成功"的连接杀掉
-    # （实测连续启动时就是这样互相打架的）。
-    [ "$job" != "none" ] && atrm "$job" 2>/dev/null || true
-  fi
-}
-
-start_default() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_openconnect; select_account || return; select_protocol || return; _execute_with_safety_net "_start_default_logic"; }
-_start_default_logic() {
-  # 保护路由是默认模式的前提：设置失败还继续启动，用户就可能把自己关在门外（SSH 断连）。
-  setup_ssh_protect_routes || return 1
-  { echo "MODE=default"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; } | tee -a "$STATE_FILE" >/dev/null || true
-  log_info "连接VPN [默认模式 / 协议: ${VPN_PROTOCOL:-anyconnect}]: $VPN_HOST ..."
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
-  [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
-  echo "$VPN_PASS" | "${oc_cmd[@]}"
-  log_info "等待 TUN 接口就绪..."; for ((i=0;i<15;i++)); do if is_vpn_running && ip link show 2>/dev/null | _gq 'tun.*UP'; then log "VPN 连接成功 (PID=$(cat "$PID_FILE"))"; return 0; fi; sleep 1; done
-  log_err "VPN 连接失败或超时"; return 1
-}
-
-start_ocproxy_mode() { is_vpn_running && { log_err "VPN 已在运行"; return; }; ensure_pkg_openconnect; ensure_pkg_ocproxy; select_account || return; select_protocol || return; _execute_with_safety_net "_start_ocproxy_logic"; }
-_start_ocproxy_logic() {
-  local socks_port
-  local listen_addr="127.0.0.1" # [Final] 简化: 默认且仅监听本地，移除远程选项
-  # 守护重连没有终端（cron 的 stdin 是关的）：read 会 EOF 并被 set -e 杀掉整个
-  # 重连流程（实测 rc=1、0 秒退出，菜单 6 声称的 ocproxy 守护因此完全不可用）。
-  # 调用方传 reconnect 时改用 state 里保存的 SOCKS_PORT：跳过交互；端口被占就
-  # 放弃本次（下个周期再试），不能掉进交互循环。
-  if [ "${1:-}" = "reconnect" ] && [[ "${SOCKS_PORT:-}" =~ ^[0-9]+$ ]]; then
-    socks_port="$SOCKS_PORT"
-    _check_port_free "$socks_port" || { log_err "重连端口 ${socks_port} 当前被占用，本次放弃重连"; return 1; }
-  else
-    while true;do read -rp "请输入SOCKS5监听端口 (e.g. 1080): " socks_port || { echo; log_err "标准输入已结束，取消启动。"; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port"||{ log_err "端口已被占用";continue; }; break; done
-  fi
-  
-  log_info "正在启动 ocproxy 模式 (协议: ${VPN_PROTOCOL:-anyconnect}, 监听地址: $listen_addr)...";
-  # ocproxy 的 -D 只接受端口，本身没有认证选项，所以这个模式加不了用户名/密码
-  log_info "提示: ocproxy 模式不支持用户名/密码认证，需要认证请用 Netns 模式。";
-  # [Final] 简化: 移除了无效的 allow_arg 变量
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin --script-tun --script "ocproxy -k 30 -D $socks_port" -b --pid-file="$PID_FILE")
-  [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
-  echo "$VPN_PASS" | "${oc_cmd[@]}"
-  
-  log_info "等待 ocproxy 启动..."; for ((i=0;i<10;i++)); do if is_vpn_running; then log "ocproxy 连接成功 (PID=$(cat "$PID_FILE"))"; echo "MODE=ocproxy">"$STATE_FILE";echo "ACCOUNT_INDEX=$ACCOUNT_INDEX" >> "$STATE_FILE";echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}" >> "$STATE_FILE";echo "SOCKS_PORT=$socks_port" >> "$STATE_FILE";echo "LISTEN_ADDR=$listen_addr" >> "$STATE_FILE"; return 0; fi; sleep 1; done
-  log_err "ocproxy 连接失败或超时"; return 1
-}
-
-# 菜单 3/4：Netns 模式，转发后端由菜单项直接指定（不再有"切换偏好"这一步）。
-# $1 = socat 或 iptables
-start_netns_mode() {
-  local want_fwd="${1:-socat}"
-  is_vpn_running && { log_err "VPN 已在运行"; return; }
-  ensure_pkg_openconnect
-  ensure_cmd_gost || return
-  if [ "$want_fwd" = "socat" ]; then
-    # 选了 socat 就必须有 socat：装不上就明确拒绝，不悄悄换成别的后端
-    ensure_cmd_socat || { log_err "socat 不可用，Netns(socat) 无法启动。想走内核转发请用菜单 4。"; return; }
-  fi
-  select_account || return
-  select_protocol || return
-  _execute_with_safety_net "_start_netns_logic" "$want_fwd"
-}
-_start_netns_logic() {
-  local want_fwd="${1:-socat}"
-  local socks_port
-  while true;do read -rp "请输入SOCKS5监听端口 (e.g. 8585): " socks_port || { echo; log_err "标准输入已结束，取消启动。"; return 1; }; [[ "$socks_port" =~ ^[0-9]+$ ]]&&[ "$socks_port" -ge 1 ]&&[ "$socks_port" -le 65535 ]||{ log_err "端口无效";continue; }; _check_port_free "$socks_port" || { log_err "端口已被占用"; continue; }; break; done
-  
-  local listen_addr="127.0.0.1"
-  # || yn=""：非交互调用（管道/无终端）时 read 会 EOF 并返回非 0，裸 read 会被 set -e
-  # 直接杀掉整个启动流程；统一按"不住默认值"处理。
-  local yn=""
-  read -rp "是否允许远程连接 (监听 0.0.0.0)? [y/N]: " yn || yn=""
-  if [[ "$yn" =~ ^[yY]$ ]]; then
-    listen_addr="0.0.0.0"
-  fi
-
-  # SOCKS5 用户名/密码（可选）。gost 的形式是 socks5://user:pass@host:port；
-  # 留空即匿名。密码用隐藏输入（与 VPN 账户密码一致），但会明文写进 state
-  # 文件并按设置在主菜单里显示——这是使用方明确要求的行为。
-  local socks_user="" socks_pass="" need_auth=""
-  read -rp "是否为 SOCKS5 设置用户名/密码? [y/N]: " need_auth || need_auth=""
-  if [[ "$need_auth" =~ ^[yY]$ ]]; then
-    while true; do
-      read -rp "  用户名: " socks_user || socks_user=""
-      [ -n "$socks_user" ] || { log_err "  用户名不能为空（不启用认证就直接回车跳过上一个问题）"; continue; }
-      # gost 与客户端都按 socks5://user:pass@host:port 解析 URL：`/`、空白、反斜杠、引号会
-      # 真的把它拆坏（实测：`/` 与空格让 gost 起不来并报 lookup 失败，`\` 报 invalid userinfo）。
-      # 用户名里再额外禁掉 `@` 与 `:`：实测 user=`a@b` 时两端解析出的凭据不一致（curl 侧认证
-      # 失败、http_code=000），user=`abc:` 则会把冒号切给密码——也就是"按字面填进去的凭据"与
-      # "真正生效的凭据"不同，而脚本的自检用的也是 URL 形式、恰好发现不了这种不一致。
-      # 密码里这两个字符实测可用（`p@ss`、`pa:ss` 都能通过认证），所以密码那侧放行。
-      # 官方给的 `?auth=<base64>` 替代路径实测在 base64 含 `/` 时认证会失败，因此不采用。
-      case "$socks_user" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  用户名不能含 @ : / 引号 反斜杠 空白（会让实际生效的凭据与输入不一致），换个写法"; continue ;; esac
-      break
-    done
-    while true; do
-      read -rsp "  密码: " socks_pass || socks_pass=""; echo
-      [ -n "$socks_pass" ] || { log_warn "  密码为空，本次不启用认证。"; socks_user=""; break; }
-      case "$socks_pass" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "  密码不能含 / 引号 反斜杠 空白（会破坏 gost 的 URL 解析），换个写法"; continue ;; esac
-      log_info "  已启用 SOCKS5 认证（用户名: ${socks_user}）"
-      break
-    done
-  fi
-
-  setup_netns
-  
-  log_info "正在 Netns 中启动 OpenConnect (协议: ${VPN_PROTOCOL:-anyconnect})...";
-  local oc_cmd=("openconnect" "$VPN_HOST" --protocol="${VPN_PROTOCOL:-anyconnect}" --user="$VPN_USER" --passwd-on-stdin -b --pid-file="$PID_FILE")
-  [ -n "$VPN_GROUP" ] && oc_cmd+=("--authgroup=$VPN_GROUP")
-  echo "$VPN_PASS" | "$IP_CMD" netns exec "${NETNS_NAME}" "${oc_cmd[@]}"
-  
-  log_info "等待 OpenConnect 建立 TUN 接口...";
-  for ((i=0; i<20; i++)); do
-    # pid 必须是非空数字再拿去匹配：`grep -F ""` 会匹配任意一行，pid 文件为空时
-    # （openconnect 写文件失败/被截断）就会恒判"进程在 netns 内"，进而误判 TUN 已就绪。
-    local _pid=""; [ -f "$PID_FILE" ] && _pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
-    if [[ "$_pid" =~ ^[0-9]+$ ]] && "$IP_CMD" netns pids "${NETNS_NAME}" | _gq -xF "$_pid" && \
-       "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
-      log "OpenConnect TUN 接口已就绪 (PID=$(cat "$PID_FILE"))"; sleep 2; break
-    fi
-    sleep 1
-  done
-  
-  if ! "$IP_CMD" netns exec "${NETNS_NAME}" ip link show 2>/dev/null | _gq 'tun.*UP'; then
-    log_err "OpenConnect 在 Netns 中启动失败或 TUN 接口未能正常启动"; return 1
-  fi
-
-  # 光看 tun0 存在还不够：实测出现过"TUN 已就绪"但 VPN 的默认路由还没生效的情况，
-  # 那时脚本继续往下走，gost 就以宿主出口（本机公网 IP）对外了——主菜单显示"运行中"，
-  # 实际完全没走 VPN。这里改成先等路由真的生效，等不到就判定启动失败，交给
-  # _execute_with_safety_net 走失败分支（它会 stop_vpn 并撤掉保底任务）。
-  # 只等"TUN 存在 + 默认路由指向 tun"是不够的：实测遇到过 openconnect 先建好 tun0 与
-  # 路由、随后连接中断又把 tun0 删掉的情形——那一瞬间静态判据全都成立，但流量已经
-  # 回落到 veth→宿主，gost 于是以本机公网 IP 对外（主菜单显示运行中，实际没走 VPN）。
-  # 所以以后者的直接证据为准：netns 内的实际出口不再等于本机出口。
-  local vpn_ready=0 i probe_rc=1
-  log_info "等待 Netns 内 VPN 真正可用..."
-  for ((i=1; i<=6; i++)); do
-    probe_rc=0; _netns_vpn_probe || probe_rc=$?
-    [ "$probe_rc" -eq 0 ] && { vpn_ready=1; break; }
-    [ "$probe_rc" -eq 2 ] && break   # 宿主出口都查不到，交给下面的路由判据
-    sleep 2
-  done
-  # 宿主出口查不到（网络受限）时退回静态判据，总比完全不判强
-  if [ "$vpn_ready" -eq 0 ] && [ "$probe_rc" -eq 2 ]; then
-    log_warn "无法取得宿主出口 IP，改用路由判据"
-    for ((i=1; i<=6; i++)); do
-      if "$IP_CMD" netns exec "${NETNS_NAME}" ip route show default 2>/dev/null | _gq "dev tun"; then vpn_ready=1; break; fi
-      sleep 2
-    done
-  fi
-  if [ "$vpn_ready" -eq 0 ]; then
-    log_err "Netns 内 VPN 在约 50 秒内仍不可用，判定启动失败（避免 gost 以本机出口对外）"; return 1
-  fi
-  log "Netns 内 VPN 已可用 (等待约 $(( (i-1) * 8 )) 秒，出口 ${_NS_PROBE_IP:-未知})"
-
-  log_info "测试 Netns 内通过 VPN 的 IPv4 网络连通性...";
-  if "$IP_CMD" netns exec "${NETNS_NAME}" ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1; then
-    log "Netns 内 VPN IPv4 网络连通性正常"
-  else
-    log_warn "Netns 内 VPN IPv4 网络连通性测试失败，但仍将继续..."
-  fi
-  
-  test_netns_ipv6 || true
-
-  log_info "正在 Netns 中启动 SOCKS5 服务 (gost)..."
-  # 监听地址写成"不带 host"的形式：gost 的 `socks5://:PORT` 会同时监听 IPv4 与 IPv6
-  # （实测 ss 显示 *:PORT，带认证的写法同样如此），而 `0.0.0.0:PORT` 只监听 IPv4——
-  # 主菜单与状态区一直写着 "(IPv4+IPv6)"，用 0.0.0.0 时那句话是不成立的。
-  local gost_listen="socks5://:${socks_port}"
-  [ -n "$socks_user" ] && gost_listen="socks5://${socks_user}:${socks_pass}@:${socks_port}"
-  "$IP_CMD" netns exec "${NETNS_NAME}" gost -L="${gost_listen}" >/dev/null 2>&1 &
-  local gost_pid=$!; echo "$gost_pid" > "$GOST_PID_FILE"
-  sleep 1; if ! kill -0 "$gost_pid" 2>/dev/null; then log_err "gost 在 Netns 中启动失败"; return 1; fi
-  log "SOCKS5 服务 (gost) 已在 Netns 中启动 (PID: $gost_pid)"
-  
-  log_info "配置主机到 Netns 的端口转发 (后端: ${want_fwd})..."
-  # 后端由菜单项指定（3=socat / 4=iptables）；OCM_FORWARDER 仍可一次性覆盖，供脚本化调用
-  local fwd="$want_fwd"
-  if [ -n "${OCM_FORWARDER:-}" ] && _fwd_avail "$OCM_FORWARDER"; then fwd="$OCM_FORWARDER"; fi
-  _fwd_avail "$fwd" || { log_err "转发后端 '$fwd' 不可用，Netns 模式无法启动。"; return 1; }
-  _FWD_DESC=""; _FWD_STATE=""
-  _fwd_setup "$fwd" "$socks_port" "$listen_addr" || return 1
-
+settings_save() {
+  local k tmp
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  tmp=$(mktemp "${SETTINGS_FILE}.XXXXXX")
   {
-    echo "MODE=netns"; echo "ACCOUNT_INDEX=$ACCOUNT_INDEX"; echo "VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}"; echo "SOCKS_PORT=$socks_port";
-    echo "LISTEN_ADDR=$listen_addr"; echo "GOST_PID=$gost_pid"; echo "FORWARDER=${_FWD_DESC}";
-    # %q 转义：这两行会被 . "$STATE_FILE" 读回来，值里若含空格/引号，不转义的话
-    # source 会把它当命令执行（实测 state 里出现 `SOCKS_PASS=p@ss word` 就报
-    # "word: command not found"，密码直接读坏）。
-    if [ -n "$socks_user" ]; then printf 'SOCKS_USER=%q\nSOCKS_PASS=%q\n' "$socks_user" "$socks_pass"; fi
-    if [ -n "$_FWD_STATE" ]; then printf '%s\n' "$_FWD_STATE"; fi
-  } > "$STATE_FILE"
-  # state 里现在可能含 SOCKS 密码，默认 umask 会落成 644，收紧一次
-  if [ -n "$socks_user" ]; then chmod 600 "$STATE_FILE" 2>/dev/null || true; fi
-  
+    echo "# oc-master 设置（由 ocm 生成；可用 ocm 菜单「设置」或 ocm config set 修改）"
+    for k in "${SET_KEYS[@]}" SOCKS_USER SOCKS_PASS; do
+      [ "$k" = SOCKS_AUTH ] && continue
+      printf '%s=%q\n' "$k" "${CFG[$k]:-}"
+    done
+  } > "$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$SETTINGS_FILE"
+}
+
+# 校验：成功返回 0；失败打印原因返回 1
+settings_validate() {
+  local k="$1" v="$2" c ok=0 n
+  case "$k" in
+    SOCKS_PORT) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || { log_err "端口应为 1-65535"; return 1; }; return 0;;
+    MTU) [ "$v" = auto ] || { [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 576 ] && [ "$v" -le 9000 ]; } || { log_err "MTU 应为 auto 或 576-9000"; return 1; }; return 0;;
+    BACKOFF) [[ "$v" =~ ^[0-9]+([[:space:]]+[0-9]+)*$ ]] || { log_err "退避序列应为空格分隔的秒数，例如 5 30 60"; return 1; }; return 0;;
+    ACCOUNT) n=$(accounts_count); [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le "${n:-0}" ] || { log_err "账户序号应为 1-${n:-0}"; return 1; }; return 0;;
+    SOCKS_USER) [ -z "$v" ] && return 0
+      case "$v" in *@*|*:*|*/*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "用户名不能含 @ : / 引号 反斜杠 空白"; return 1;; esac; return 0;;
+    SOCKS_PASS) [ -z "$v" ] && return 0
+      case "$v" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "密码不能含 / 引号 反斜杠 空白"; return 1;; esac; return 0;;
+    OC_EXTRA|EXTRA_PROBE_URL) case "$v" in *$'\n'*) log_err "不能含换行"; return 1;; esac; return 0;;
+  esac
+  case "${SET_TYPE[$k]:-}" in
+    choice) IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]}"
+            for c in "${_cs[@]}"; do [ "${c%%:*}" = "$v" ] && ok=1; done
+            [ $ok = 1 ] || { log_err "$k 只能是：$(for c in "${_cs[@]}"; do printf '%s ' "${c%%:*}"; done)"; return 1; } ;;
+    int) [[ "$v" =~ ^[0-9]+$ ]] || { log_err "$k 应为整数"; return 1; } ;;
+    "") log_err "未知设置项：$k"; return 1;;
+  esac
   return 0
 }
+
+# 显示用：值 → 说明
+cfg_label() {
+  local k="$1" v="${2-${CFG[$1]:-}}" c
+  case "$k" in
+    SOCKS_AUTH) if [ -n "${CFG[SOCKS_USER]:-}" ]; then echo "${CFG[SOCKS_USER]}:****"; else echo "无"; fi; return;;
+    ACCOUNT) echo "${v}) $(account_field "$v" 1 2>/dev/null || echo '?')"; return;;
+    OC_EXTRA|EXTRA_PROBE_URL) echo "${v:-（空）}"; return;;
+  esac
+  IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]:-}"
+  for c in "${_cs[@]}"; do [ "${c%%:*}" = "$v" ] && { echo "${c#*:}"; return; }; done
+  echo "$v"
+}
+
+# ============================================================================
+#  账户（/root/.vpn_accounts.env）
+#  格式：显示名|用户名|密码|VPN主机|认证组(可选)|协议(可选，覆盖全局 PROTOCOL)
+#  密码只在 supervisor 里读取并经 stdin 交给 openconnect，不 export、不打印。
+# ============================================================================
+_accounts_lines() { grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$ACCOUNTS_FILE" 2>/dev/null || true; }
+accounts_count() { _accounts_lines | wc -l; }
+# account_field <序号> <列号>（只取需要的列，绝不取第 3 列给显示用）
+account_field() { _accounts_lines | awk -F'|' -v n="$1" -v c="$2" 'NR==n{print $c; f=1} END{exit !f}'; }
+# 按名称或序号解析为序号
+account_resolve() {
+  local a="$1"
+  if [[ "$a" =~ ^[0-9]+$ ]]; then [ "$a" -ge 1 ] && [ "$a" -le "$(accounts_count)" ] && { echo "$a"; return 0; }; return 1; fi
+  _accounts_lines | awk -F'|' -v a="$a" '$1==a{print NR; f=1; exit} END{exit !f}'
+}
+# 载入账户到全局变量（不 export）
+account_load() {
+  local line
+  line=$(_accounts_lines | sed -n "${1}p")
+  [ -n "$line" ] || { log_err "账户 #$1 不存在（${ACCOUNTS_FILE}）"; return 1; }
+  IFS='|' read -r VPN_DESC VPN_USER VPN_PASS VPN_HOST VPN_GROUP VPN_ACC_PROTO <<<"$line"
+  [ -n "$VPN_USER" ] && [ -n "$VPN_PASS" ] && [ -n "$VPN_HOST" ] || { log_err "账户 #$1 缺少用户名/密码/主机"; return 1; }
+  return 0
+}
+accounts_list() {
+  local n=0 name user host grp proto
+  [ -f "$ACCOUNTS_FILE" ] || { echo "  （账户文件不存在：$ACCOUNTS_FILE）"; return 0; }
+  while IFS='|' read -r name user _ host grp proto; do
+    n=$((n+1)); printf '  %d) %s  用户:%s  主机:%s%s%s\n' "$n" "$name" "$user" "$host" \
+      "${grp:+  认证组:$grp}" "${proto:+  协议:$proto}"
+  done < <(_accounts_lines)
+  [ $n -gt 0 ] || echo "  （无账户）"
+}
+gw_host_of() { local h; h=$(account_field "$1" 4 2>/dev/null || true); h=${h#https://}; h=${h#http://}; h=${h%%/*}; h=${h%%:*}; printf '%s' "$h"; }
 
 # --- 停止与清理 ---
 cleanup_ssh_protect_routes() {
@@ -993,7 +967,8 @@ _fwd_teardown_iptables() {
   return 0
 }
 
-stop_vpn() {
+# v7 的 stop_vpn 原样保留为底层清理函数（按 state 拆除各模式的进程、路由、netns）。
+_teardown_session() {
   # state 文件在时不能早退：失败的启动已写 state 并配好策略路由，早退会跳过
   # cleanup_ssh_protect_routes 和 rm —— 残留 ip rule 和 state（实测 iprule 4 行残留；
   # 装了守护任务还会每 5 分钟拿坏账户重连一次）。
@@ -1065,73 +1040,1207 @@ stop_vpn() {
   rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6"; log "所有临时文件已清理，操作完成。"
 }
 
-# --- 状态显示 ---
-show_status() {
-  sep
-  if ! is_vpn_running && ! [ -f "$GOST_PID_FILE" ] && ! [ -f "$SOCAT_PID_FILE" ]; then
-    title "  VPN 状态: ${C_RED}🔴 停止${C_RESET}"
-    echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $(_pub_ip -4 || echo "查询失败")"
-    echo -e "    ${C_BOLD}本机公网 IPv6:${C_RESET} $(_pub_ip -6 || echo "无/查询失败")"
-    echo -e "    ${C_BOLD}快捷命令:${C_RESET} $(_shortcut_state)"
-  else
-    local ACCOUNT_INDEX MODE SOCKS_PORT LISTEN_ADDR VPN_PROTOCOL SOCKS_USER SOCKS_PASS; [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null || true
-    title "  VPN 状态: ${C_GREEN}🟢 运行中${C_RESET} (OpenConnect PID: $(cat "$PID_FILE" 2>/dev/null || echo N/A))"
-    if [ -n "${ACCOUNT_INDEX:-}" ]; then mapfile -t A < <(grep -vE '^\s*#|^\s*$' "$ACCOUNTS_FILE"); [ "$ACCOUNT_INDEX" -lt "${#A[@]}" ] && echo -e "    ${C_BOLD}使用账户:${C_RESET} $(echo "${A[$ACCOUNT_INDEX]}" | cut -d'|' -f1)"; fi
-    echo -e "    ${C_BOLD}VPN 协议:${C_RESET} ${C_CYAN}${VPN_PROTOCOL:-anyconnect}${C_RESET}"
-    
-    case "${MODE:-}" in
-      default)
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🛡️  默认全局模式"
-        echo -e "    ${C_BOLD}VPN 出口 IPv4:${C_RESET} ${C_YELLOW}$(_pub_ip -4 || echo 失败)${C_RESET}"
-        echo -e "    ${C_BOLD}VPN 出口 IPv6:${C_RESET} ${C_YELLOW}$(_pub_ip -6 || echo 无/失败)${C_RESET}"
-      ;;
-      ocproxy)
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🔌 ocproxy 代理 ${C_GREY}(仅 IPv4)${C_RESET}"
-        echo -e "    ${C_BOLD}SOCKS 地址:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}"
-        local sip4; sip4=$(_pub_ip -4 "socks5h://127.0.0.1:${SOCKS_PORT}" || echo "查询失败")
-        echo -e "    ${C_BOLD}SOCKS 出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
-        echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $(_pub_ip -4 || echo 失败)"
-      ;;
-      netns)
-        # iptables 双 NAT 后端只有 IPv4 入口（内核 DNAT 不跨协议族），别在这里笼统写 IPv4+IPv6
-        local _fam_txt="(IPv4+IPv6)"
-        [ "${FORWARDER:-}" = "iptables" ] && _fam_txt="(仅 IPv4 入口)"
-        echo -e "    ${C_BOLD}运行模式:${C_RESET} 🌐 Network Namespace 代理 ${C_GREEN}${_fam_txt}${C_RESET}"
-        local f_info; if [[ "${FORWARDER:-}" == "socat" ]]; then f_info="socat"; else f_info="iptables"; fi
-        local auth_txt=""
-        [ -n "${SOCKS_USER:-}" ] && auth_txt=" ${C_YELLOW}认证 ${SOCKS_USER}:${SOCKS_PASS:-}${C_RESET}"
-        echo -e "    ${C_BOLD}SOCKS 地址:${C_RESET} ${LISTEN_ADDR}:${SOCKS_PORT}${auth_txt} ${C_GREY}(gost PID: $(cat "$GOST_PID_FILE" 2>/dev/null), by ${f_info})${C_RESET}"
-        
-        local socks_proxy="socks5h://127.0.0.1:${SOCKS_PORT}"
-        [ -n "${SOCKS_USER:-}" ] && socks_proxy="socks5h://${SOCKS_USER}:${SOCKS_PASS:-}@127.0.0.1:${SOCKS_PORT}"
-        
-        local sip4; sip4=$(_pub_ip -4 "$socks_proxy" || echo "查询失败")
-        echo -e "    ${C_BOLD}SOCKS 出口 IPv4:${C_RESET} ${C_YELLOW}${sip4}${C_RESET}"
-        
-        local sip6=""
-        # 必须有 || true：_pub_ip 在无 IPv6 时返回非 0，裸赋值失败会触发 set -e
-        # 把整个脚本杀掉（表现为菜单渲染到"出口"就没了、返回码 1）。
-        sip6="$(_pub_ip -6 "$socks_proxy" || true)"
-        
-        if [ -z "$sip6" ] && [ -n "${NETNS_NAME:-}" ]; then
-          sip6=$("$IP_CMD" netns exec "${NETNS_NAME}" curl -6 -s --connect-timeout 5 --max-time 10 "${_PUB_PROVIDERS6[0]}" 2>/dev/null | head -n1 | tr -d '\r\n[:space:]' || echo "")
-          [ -n "$sip6" ] && sip6="${sip6} ${C_GREY}(Netns内检测)${C_RESET}"
-        fi
-        
-        if [ -n "$sip6" ]; then
-          echo -e "    ${C_BOLD}SOCKS 出口 IPv6:${C_RESET} ${C_YELLOW}${sip6}${C_RESET}"
-        else
-          echo -e "    ${C_BOLD}SOCKS 出口 IPv6:${C_RESET} ${C_YELLOW}检测超时或不可用${C_RESET}"
-        fi
-        
-        echo -e "    ${C_BOLD}本机公网 IPv4:${C_RESET} $(_pub_ip -4 2>/dev/null || echo 失败)"
-      ;;
-      *) echo -e "    ${C_BOLD}运行模式:${C_RESET} 未知";;
-    esac
-    echo -e "    ${C_BOLD}快捷命令:${C_RESET} $(_shortcut_state)"
-  fi
-  sep
+# ============================================================================
+#  systemd 托管
+# ----------------------------------------------------------------------------
+#  ocm.service       → `ocm _supervise`：建 netns/路由 → 前台运行 openconnect → 退出后按原因重连。
+#                      KillMode=mixed：停止时只给 supervisor 发 SIGTERM，由它先让 openconnect
+#                      登出、再拆代理与 netns（顺序反了 openconnect 会卡在登出上）。
+#  ocm-watch.service → `ocm _watch`：只读诊断采样 + 「进程在但不通」时请求软重连。
+#  VPN 进程属于 systemd，与登录会话无关：关掉 SSH 不会连带杀掉 gost/socat/openconnect。
+# ============================================================================
+svc_active() { systemctl is-active --quiet "$SVC_MAIN" 2>/dev/null; }
+set_phase() { mkdir -p "$RUN_DIR"; printf '%s %s\n' "$1" "$(now_s)" > "$PHASE_FILE.tmp" && mv -f "$PHASE_FILE.tmp" "$PHASE_FILE"; }
+get_phase() { awk '{print $1; exit}' "$PHASE_FILE" 2>/dev/null || true; }
+get_phase_since() { awk '{print $2; exit}' "$PHASE_FILE" 2>/dev/null || true; }
+
+_unit_main() { cat <<EOF
+[Unit]
+Description=OpenConnect Master (ocm) VPN supervisor
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=${SCRIPT_PATH} _supervise
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
+_unit_watch() { cat <<EOF
+[Unit]
+Description=OpenConnect Master (ocm) diagnostic logger
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${SCRIPT_PATH} _watch
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=96M
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_units() {
+  case "$SCRIPT_PATH" in /tmp/*|/var/tmp/*) log_err "脚本位于临时目录（$SCRIPT_PATH），先移到固定位置（如 /root/oc_master.sh）再使用 systemd 托管。"; return 1;; esac
+  command -v systemctl >/dev/null 2>&1 || { log_err "本系统没有 systemd，v8 的托管模式不可用。"; return 1; }
+  local changed=0 u content
+  for u in main watch; do
+    local path="$UNIT_DIR/$SVC_MAIN"; [ $u = watch ] && path="$UNIT_DIR/$SVC_WATCH"
+    content="$(_unit_$u)"
+    if [ "$(cat "$path" 2>/dev/null)" != "$content" ]; then printf '%s\n' "$content" > "$path"; changed=1; fi
+  done
+  [ $changed = 1 ] && systemctl daemon-reload
+  apply_service_prefs
+  return 0
+}
+uninstall_units() {
+  systemctl disable --now "$SVC_WATCH" >/dev/null 2>&1 || true
+  systemctl stop "$SVC_MAIN" >/dev/null 2>&1 || true
+  systemctl disable "$SVC_MAIN" >/dev/null 2>&1 || true
+  rm -f "$UNIT_DIR/$SVC_MAIN" "$UNIT_DIR/$SVC_WATCH"
+  systemctl daemon-reload 2>/dev/null || true
+}
+# 诊断服务与开机自启按设置同步（只在状态不一致时动作）
+apply_service_prefs() {
+  [ -f "$UNIT_DIR/$SVC_WATCH" ] || return 0
+  if [ "${CFG[WATCH]:-on}" = on ]; then
+    systemctl is-enabled --quiet "$SVC_WATCH" 2>/dev/null || systemctl enable "$SVC_WATCH" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "$SVC_WATCH" 2>/dev/null || systemctl start "$SVC_WATCH" >/dev/null 2>&1 || true
+  else
+    systemctl disable --now "$SVC_WATCH" >/dev/null 2>&1 || true
+  fi
+  if [ "${CFG[AUTOSTART]:-off}" = on ]; then
+    systemctl is-enabled --quiet "$SVC_MAIN" 2>/dev/null || systemctl enable "$SVC_MAIN" >/dev/null 2>&1 || true
+  else
+    systemctl is-enabled --quiet "$SVC_MAIN" 2>/dev/null && systemctl disable "$SVC_MAIN" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# ============================================================================
+#  supervisor（由 systemd 以 `ocm _supervise` 运行，不要手动调用）
+# ============================================================================
+SUP_STOP=0; OC_PID=""; GOST_PID=""; SESSION_N=0; EVER_UP=0; OC_START=0; PAUSED_REASON=""
+GW_NAME=""; GW_IP=""; LAUNCH_LOG=""
+declare -A LIVE=()
+OC_ARGS=(); OC_PREFIX=()
+OC_KEY_RE='dead peer|DPD|reconnect|terminat|closed|fail|error|expired|exiting|cancel|establish|unexpected|time ?out|rekey|lost|disconnect|logout|refused|unauthor|denied|ESP|DTLS|keepalive|idle|session|killed|signal|Configured as'
+
+sup_log() {
+  local t; printf -v t '%(%F %T)T' -1
+  printf '[%s] %s\n' "$t" "$*"
+  [ -n "$LAUNCH_LOG" ] && printf '[%s] %s\n' "$t" "$*" >> "$LAUNCH_LOG" 2>/dev/null
+  return 0
+}
+# 守护类设置在运行中即时生效：每轮从设置文件重读，不影响本次连接参数
+live_reload() {
+  local k; local -A bak=()
+  for k in "${!CFG[@]}"; do bak[$k]=${CFG[$k]}; done
+  settings_load
+  for k in AUTO_RECONNECT BACKOFF MAX_PER_HOUR AUTH_FAIL_PAUSE; do LIVE[$k]=${CFG[$k]}; done
+  for k in "${!bak[@]}"; do CFG[$k]=${bak[$k]}; done
+}
+sup_proto() { echo "${VPN_ACC_PROTO:-${CFG[PROTOCOL]}}"; }
+
+sup_build_oc() {
+  OC_ARGS=(openconnect "$VPN_HOST" "--protocol=$(sup_proto)" "--user=$VPN_USER" --passwd-on-stdin --non-inter)
+  [ -n "${VPN_GROUP:-}" ] && OC_ARGS+=("--authgroup=$VPN_GROUP")
+  [ "${CFG[DATA_CHANNEL]}" = tls ] && OC_ARGS+=(--no-dtls)
+  [[ "${CFG[RECONNECT_TIMEOUT]}" =~ ^[0-9]+$ ]] && OC_ARGS+=("--reconnect-timeout=${CFG[RECONNECT_TIMEOUT]}")
+  [ "${CFG[MTU]}" != auto ] && OC_ARGS+=("--mtu=${CFG[MTU]}")
+  [ "${CFG[MODE]}" = ocproxy ] && OC_ARGS+=(--script-tun --script "ocproxy -k 30 -D ${CFG[SOCKS_PORT]}")
+  # 默认全局模式用固定网卡名：宿主上可能已有别的 tun0（组网/其他 VPN），不能靠"任意 tun"判断
+  [ "${CFG[MODE]}" = default ] && OC_ARGS+=("--interface=$OC_TUN_DEFAULT")
+  [ "${CFG[MODE]}" = netns ] && [ "${CFG[KILL_SWITCH]}" = on ] && [ -n "$GW_IP" ] && OC_ARGS+=("--resolve=${GW_NAME}:${GW_IP}")
+  if [ -n "${CFG[OC_EXTRA]}" ]; then local -a _x; read -r -a _x <<<"${CFG[OC_EXTRA]}"; OC_ARGS+=("${_x[@]}"); fi
+  OC_PREFIX=(); [ "${CFG[MODE]}" = netns ] && OC_PREFIX=("$IP_CMD" netns exec "$NETNS_NAME")
+  return 0
+}
+
+# openconnect 输出 → openconnect.log（带时间）、当前会话文件、journald；关键句进 events.log
+oc_log_pipe() { # $1=会话号 $2=是否写入启动日志
+  local line t e
+  while IFS= read -r line; do
+    line=$(printf '%s' "$line" | redact)
+    printf -v t '%(%Y-%m-%dT%H:%M:%S%z)T' -1; printf -v e '%(%s)T' -1
+    printf '%s openconnect[s%s] %s\n' "$t" "$1" "$line" >> "$OCLOG" 2>/dev/null
+    printf '%s\n' "$line" >> "$SESSION_LOG" 2>/dev/null
+    printf 'openconnect: %s\n' "$line"
+    [ "$2" = 1 ] && [ -n "$LAUNCH_LOG" ] && printf '    %s\n' "$line" >> "$LAUNCH_LOG" 2>/dev/null
+    [[ "$line" =~ $OC_KEY_RE ]] && printf '%s e=%s OC s=%s msg=%s\n' "$t" "$e" "$1" "$line" >> "$EVENTS" 2>/dev/null
+  done
+  return 0
+}
+
+sup_launch_oc() {
+  SESSION_N=$((SESSION_N+1)); : > "$SESSION_LOG"
+  local first=0; [ "$EVER_UP" = 0 ] && first=1
+  # 密码只经 stdin 交给 openconnect；$! 是管线最后一个进程（openconnect 本身；ip netns exec 会 exec 成它）
+  printf '%s\n' "$VPN_PASS" | "${OC_PREFIX[@]}" "${OC_ARGS[@]}" > >(oc_log_pipe "$SESSION_N" "$first") 2>&1 &
+  OC_PID=$!; OC_START=$(now_s)
+  echo "$OC_PID" > "$PID_FILE"
+}
+
+sup_tunnel_up() {
+  case "${CFG[MODE]}" in
+    netns)   "$IP_CMD" -n "$NETNS_NAME" route show default 2>/dev/null | _gq 'dev tun' && "$IP_CMD" -n "$NETNS_NAME" link show 2>/dev/null | _gq 'tun.*UP' ;;
+    default) "$IP_CMD" link show dev "$OC_TUN_DEFAULT" 2>/dev/null | _gq 'UP' ;;
+    ocproxy) ss -Hlnt "sport = :${CFG[SOCKS_PORT]}" 2>/dev/null | _gq . ;;
+  esac
+}
+
+sup_write_state() {
+  local vps; vps=$(grep -E '^VPS[46]=' "$STATE_FILE" 2>/dev/null || true)
+  {
+    [ -n "$vps" ] && printf '%s\n' "$vps"
+    echo "MODE=${CFG[MODE]}"; echo "ACCOUNT_INDEX=$(( CFG[ACCOUNT] - 1 ))"; echo "VPN_PROTOCOL=$(sup_proto)"
+    if [ "${CFG[MODE]}" != default ]; then
+      echo "SOCKS_PORT=${CFG[SOCKS_PORT]}"
+      if [ "${CFG[MODE]}" = netns ]; then echo "LISTEN_ADDR=${CFG[LISTEN]}"; else echo "LISTEN_ADDR=127.0.0.1"; fi
+    fi
+    if [ "${CFG[MODE]}" = netns ]; then
+      echo "GOST_PID=${GOST_PID:-}"; echo "FORWARDER=${_FWD_DESC:-}"
+      [ -n "${CFG[SOCKS_USER]}" ] && printf 'SOCKS_USER=%q\nSOCKS_PASS=%q\n' "${CFG[SOCKS_USER]}" "${CFG[SOCKS_PASS]}"
+      [ -n "${_FWD_STATE:-}" ] && printf '%s\n' "$_FWD_STATE"
+    fi
+    echo "KILL_SWITCH=${CFG[KILL_SWITCH]}"
+  } > "$STATE_FILE.tmp"
+  chmod 600 "$STATE_FILE.tmp"; mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# netns 里的 SOCKS5（gost）+ 宿主转发：首次隧道就绪后启动，之后重连期间保持不动
+sup_start_proxy() {
+  local port="${CFG[SOCKS_PORT]}" gl="socks5://:${CFG[SOCKS_PORT]}"
+  [ -n "${CFG[SOCKS_USER]}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@:${port}"
+  # 不带 host 的 socks5://:PORT 同时监听 IPv4/IPv6（0.0.0.0 只监听 IPv4）
+  "$IP_CMD" netns exec "$NETNS_NAME" gost -L="$gl" >/dev/null 2>&1 &
+  GOST_PID=$!; echo "$GOST_PID" > "$GOST_PID_FILE"
+  sleep 1; kill -0 "$GOST_PID" 2>/dev/null || { sup_log "gost 在 netns 中启动失败"; return 1; }
+  if [ -z "${_FWD_DESC:-}" ]; then
+    _FWD_DESC=""; _FWD_STATE=""
+    _fwd_setup "${CFG[FORWARDER]}" "$port" "${CFG[LISTEN]}" >/dev/null || { sup_log "端口转发（${CFG[FORWARDER]}）配置失败"; return 1; }
+  fi
+  sup_write_state
+  sup_log "SOCKS5 已就绪：${CFG[LISTEN]}:${port}（gost pid $GOST_PID，转发 ${_FWD_DESC}）"
+  return 0
+}
+# gost / socat 意外退出时就地拉起
+sup_check_children() {
+  [ "${CFG[MODE]}" = netns ] || return 0
+  if [ -n "$GOST_PID" ] && ! kill -0 "$GOST_PID" 2>/dev/null; then
+    ev "SUP child-died gost pid=$GOST_PID → restart"; sup_log "gost 已退出，重新启动"; sup_start_proxy || true
+  fi
+  if [ "${_FWD_DESC:-}" = socat ]; then
+    local sp; sp=$(cat "$SOCAT_PID_FILE" 2>/dev/null || true)
+    if [[ "$sp" =~ ^[0-9]+$ ]] && ! kill -0 "$sp" 2>/dev/null; then
+      ev "SUP child-died socat pid=$sp → restart"; sup_log "socat 已退出，重新配置转发"
+      _FWD_STATE=""; _fwd_setup socat "${CFG[SOCKS_PORT]}" "${CFG[LISTEN]}" >/dev/null && sup_write_state
+    fi
+  fi
+  [ "${CFG[DNS_FAST]}" = on ] && dns_fast_apply
+  return 0
+}
+
+# DNS 快速重试（仅 netns）：vpnc-script 每次连接都会重写 resolv.conf，所以每次就绪后补一行
+dns_fast_apply() {
+  local f="/etc/netns/${NETNS_NAME}/resolv.conf"
+  [ -f "$f" ] && grep -q 'VPNC_GENERATED' "$f" 2>/dev/null || return 0
+  grep -q '^options .*timeout:1' "$f" 2>/dev/null || { printf 'options timeout:1 attempts:3 rotate\n' >> "$f"; ev "SUP dns-fast applied"; }
+  return 0
+}
+
+# 断线保护（仅 netns）：netns 内只允许走隧道；VPN 网关本身与 veth 回包例外
+ks_apply() {
+  local NSX=("$IP_CMD" netns exec "$NETNS_NAME")
+  GW_IP=$(getent ahostsv4 "$GW_NAME" 2>/dev/null | awk 'NR==1{print $1}')
+  [ -n "$GW_IP" ] || { sup_log "断线保护：解析不到网关 $GW_NAME"; return 1; }
+  "${NSX[@]}" iptables -w -A OUTPUT -o lo -j ACCEPT &&
+  "${NSX[@]}" iptables -w -A OUTPUT -o tun+ -j ACCEPT &&
+  "${NSX[@]}" iptables -w -A OUTPUT -o "$VETH_NS" -d "$VETH_SUBNET" -j ACCEPT &&
+  "${NSX[@]}" iptables -w -A OUTPUT -d "$GW_IP" -j ACCEPT &&
+  "${NSX[@]}" iptables -w -A OUTPUT -j REJECT || { sup_log "断线保护：netns 内 iptables 规则写入失败"; return 1; }
+  if command -v ip6tables >/dev/null 2>&1; then
+    "${NSX[@]}" ip6tables -w -A OUTPUT -o lo -j ACCEPT 2>/dev/null
+    "${NSX[@]}" ip6tables -w -A OUTPUT -o tun+ -j ACCEPT 2>/dev/null
+    "${NSX[@]}" ip6tables -w -A OUTPUT -j REJECT 2>/dev/null
+  fi
+  sup_log "断线保护已开启（网关 $GW_NAME → $GW_IP）"
+  return 0
+}
+
+# 重连前恢复网络基线。openconnect 被 kill -9 / 崩溃时来不及运行 vpnc-script 的 disconnect：
+# netns 里默认路由还指向已消失的 tun、resolv.conf 还是 VPN 的 DNS，下一次连接连网关域名都解析不了
+# （实测 kill -9 后重连报 getaddrinfo failed）。正常退出时 vpnc-script 自己会还原，这里幂等补一次。
+sup_reset_net() {
+  case "${CFG[MODE]}" in
+    netns)
+      "$IP_CMD" -n "$NETNS_NAME" route show default 2>/dev/null | _gq "via ${VETH_HOST_IP}" \
+        || { "$IP_CMD" -n "$NETNS_NAME" route replace default via "$VETH_HOST_IP" dev "$VETH_NS" 2>/dev/null && ev "SUP net-reset netns default route"; }
+      local rf="/etc/netns/${NETNS_NAME}/resolv.conf"
+      if grep -q 'VPNC_GENERATED' "$rf" 2>/dev/null; then
+        { [ -r /etc/resolv.conf ] && cp /etc/resolv.conf "$rf"; } || echo "nameserver 8.8.8.8" > "$rf"
+        ev "SUP net-reset netns resolv.conf"
+      fi ;;
+    default)
+      if [ -n "${ORIG_DEF4:-}" ] && ! "$IP_CMD" -4 route show default 2>/dev/null | _gq .; then
+        # shellcheck disable=SC2086
+        "$IP_CMD" route replace $ORIG_DEF4 2>/dev/null && ev "SUP net-reset host default route"
+      fi ;;
+  esac
+  return 0
+}
+
+# 根据退出码与本次输出判断 openconnect 为什么退出
+# （openconnect 源码 main.c：2=cookie/认证被拒，1=服务器终止或网络错误，0=收到 SIGTERM/SIGHUP）
+sup_classify() {
+  local rc="$1" up="$2" req=0
+  [ -f "$RESTART_REQ" ] && { req=1; rm -f "$RESTART_REQ"; }
+  # 先看 openconnect 自己说了什么（服务器终止优先于软重连标志，避免过期标志误判）
+  if grep -qiE 'Server terminated connection|Session terminated by server|session expired|session timed out' "$SESSION_LOG" 2>/dev/null; then echo server-terminated; return; fi
+  if [ $req = 1 ]; then echo watch-request; return; fi
+  if [ "$rc" = 2 ] || grep -qiE 'login failed|authentication failed|invalid (user|pass|cred)|incorrect (user|pass)|password (has )?expired|account (is )?(locked|disabled)|cookie was rejected|failed to authenticate' "$SESSION_LOG" 2>/dev/null; then echo auth; return; fi
+  if grep -qiE 'frmConfirmation|already (logged|signed) in|maximum number of (open )?(sessions|users)|session limit' "$SESSION_LOG" 2>/dev/null; then echo session-confirm; return; fi
+  if [ "$up" = 0 ] && [ "$(grep -c frmLogin "$SESSION_LOG" 2>/dev/null)" -ge 4 ]; then echo auth; return; fi
+  echo network
+}
+
+# 可被 SIGTERM 打断的 sleep
+sup_sleep() { local n="$1"; while [ "$n" -gt 0 ] && [ "$SUP_STOP" = 0 ]; do sleep 1 & wait $! 2>/dev/null; n=$((n-1)); done; }
+
+sup_on_up() {
+  local first=0 took=$(( $(now_s) - OC_START )); [ "$EVER_UP" = 0 ] && first=1
+  EVER_UP=1
+  if [ "${CFG[MODE]}" = netns ]; then
+    [ "${CFG[DNS_FAST]}" = on ] && dns_fast_apply
+    if [ $first = 1 ] || ! kill -0 "${GOST_PID:-0}" 2>/dev/null; then
+      sup_start_proxy || { ev "SUP proxy-failed"; SUP_STOP=1; PAUSED_REASON="failed:proxy"; return 1; }
+    fi
+  fi
+  set_phase up
+  ev "SUP up session=$SESSION_N took=${took}s pid=$OC_PID"
+  sup_log "隧道已就绪（第 $SESSION_N 次连接，用时 ${took}s）"
+  return 0
+}
+
+_supervise() {
+  check_root
+  set +e   # 守护循环里单次探测失败不能让整个 supervisor 退出
+  mkdir -p "$RUN_DIR" "$LOG_DIR" "$LAUNCH_DIR"; chmod 700 "$RUN_DIR" 2>/dev/null; chmod 750 "$LOG_DIR" 2>/dev/null
+  settings_load; _load_kv_file "$RUN_PROFILE"
+  LAUNCH_LOG=$(sed -n 's/^#LAUNCH_LOG=//p' "$RUN_PROFILE" 2>/dev/null | head -n1)
+  [ -n "$LAUNCH_LOG" ] || LAUNCH_LOG="$LAUNCH_DIR/$(date +%Y%m%d-%H%M%S)-autostart.log"
+  live_reload
+  trap 'SUP_STOP=1' TERM INT HUP
+  set_phase starting
+  ev "SUP start v$VERSION mode=${CFG[MODE]} account=${CFG[ACCOUNT]} channel=${CFG[DATA_CHANNEL]} port=${CFG[SOCKS_PORT]} kill_switch=${CFG[KILL_SWITCH]}"
+
+  # 上次异常退出（崩溃、kill -9、断电）留下的残留先清掉，否则端口/netns 冲突
+  if [ -f "$STATE_FILE" ] || is_vpn_running || [ -e "/run/netns/$NETNS_NAME" ]; then
+    sup_log "发现上次会话的残留，先清理"; _teardown_session >/dev/null 2>&1
+  fi
+  GOST_PID=""; _FWD_DESC=""; _FWD_STATE=""   # 清理时 source 过旧 state，避免沿用旧值
+  if ! account_load "${CFG[ACCOUNT]}"; then set_phase failed:account; ev "SUP fail reason=account"; exit 3; fi
+  GW_NAME=$(gw_host_of "${CFG[ACCOUNT]}")
+  sup_log "账户：${VPN_DESC}（协议 $(sup_proto)）  模式：${CFG[MODE]}  数据通道：${CFG[DATA_CHANNEL]}"
+
+  case "${CFG[MODE]}" in
+    netns)
+      if [ "${CFG[IPV6_FORWARD]}" = on ]; then OCM_IPV6_FORWARD=1; else OCM_IPV6_FORWARD=0; fi
+      setup_netns >/dev/null || { set_phase failed:netns; ev "SUP fail reason=netns"; _teardown_session >/dev/null 2>&1; exit 3; }
+      sup_log "Netns ${NETNS_NAME} 已就绪"
+      if [ "${CFG[KILL_SWITCH]}" = on ]; then ks_apply || { set_phase failed:kill-switch; _teardown_session >/dev/null 2>&1; exit 3; }; fi ;;
+    default)
+      ORIG_DEF4=$("$IP_CMD" -4 route show default 2>/dev/null | grep -v ' dev tun\| dev ocmtun' | head -n1)
+      setup_ssh_protect_routes >/dev/null || { set_phase failed:routes; ev "SUP fail reason=ssh-protect-routes"; _teardown_session >/dev/null 2>&1; exit 3; }
+      sup_log "SSH 保护路由已配置" ;;
+    ocproxy) : ;;
+  esac
+  _FWD_DESC=""; _FWD_STATE=""
+  sup_write_state
+  sup_build_oc
+
+  local fails=0 authfails=0 rc kind age delay idx up t0 interval
+  local -a attempts=() B=()
+  while [ "$SUP_STOP" = 0 ]; do
+    live_reload
+    read -r -a B <<<"${LIVE[BACKOFF]}"; [ ${#B[@]} -gt 0 ] || B=(30)
+    if [ "$EVER_UP" = 1 ]; then set_phase reconnecting; else set_phase connecting; fi
+    attempts+=("$(now_s)")
+    [ "$SESSION_N" -gt 0 ] && sup_reset_net
+    sup_launch_oc
+    sup_log "启动 openconnect（第 $SESSION_N 次，pid $OC_PID）"
+    up=0; t0=$(now_s)
+    while kill -0 "$OC_PID" 2>/dev/null && [ "$SUP_STOP" = 0 ]; do
+      if [ $up = 0 ]; then
+        if sup_tunnel_up; then up=1; sup_on_up || break
+        elif [ $(( $(now_s) - t0 )) -ge 75 ]; then sup_log "75 秒内隧道未就绪，结束本次尝试"; kill -TERM "$OC_PID" 2>/dev/null; fi
+        interval=1
+      else
+        sup_check_children; interval=3
+      fi
+      sleep "$interval" & wait $! 2>/dev/null
+    done
+    [ "$SUP_STOP" = 1 ] && break
+    wait "$OC_PID" 2>/dev/null; rc=$?
+    [ "$SUP_STOP" = 1 ] && break
+    set_phase reconnecting   # 立刻反映掉线，不要在判断原因的这几秒里仍显示 up
+    rm -f "$PID_FILE"
+    sleep 1   # 让日志管道把 openconnect 最后几行写完，再判断退出原因
+    age=$(( $(now_s) - OC_START )); kind=$(sup_classify "$rc" "$up")
+    ev "SUP exit session=$SESSION_N rc=$rc kind=$kind session_age=$age session_age_h=$(fmt_dur $age) was_up=$up"
+    sup_log "openconnect 已退出（rc=$rc，原因：$kind，本次会话 $(fmt_dur $age)）"
+    tail -n 4 "$SESSION_LOG" 2>/dev/null | while IFS= read -r l; do ev "OCLAST $l"; done
+
+    case "$kind" in
+      server-terminated|watch-request) delay=2; fails=0 ;;
+      auth) authfails=$((authfails+1)); fails=$((fails+1)) ;;
+      *) fails=$((fails+1)) ;;
+    esac
+    [ "$up" = 1 ] && [ "$kind" != auth ] && authfails=0
+    if [ "$kind" != server-terminated ] && [ "$kind" != watch-request ]; then
+      idx=$((fails-1)); [ $idx -ge ${#B[@]} ] && idx=$(( ${#B[@]} - 1 )); [ $idx -lt 0 ] && idx=0; delay=${B[$idx]}
+    fi
+
+    if [ "${LIVE[AUTO_RECONNECT]}" != on ]; then sup_log "自动重连已关闭，停止"; ev "SUP no-reconnect (AUTO_RECONNECT=off)"; PAUSED_REASON="stopped:no-reconnect"; break; fi
+    if [ "$kind" = auth ] && { [ "$EVER_UP" = 0 ] || [ "$authfails" -ge "${LIVE[AUTH_FAIL_PAUSE]}" ]; }; then
+      sup_log "认证失败（连续 $authfails 次），为防止账号被锁已停止。确认账号密码后重新启动。"
+      ev "SUP paused reason=auth authfails=$authfails"; PAUSED_REASON="failed:auth"; break
+    fi
+    # 每小时上限
+    local -a recent=(); local t
+    for t in "${attempts[@]}"; do [ $(( $(now_s) - t )) -lt 3600 ] && recent+=("$t"); done
+    attempts=("${recent[@]}")
+    if [ "${#attempts[@]}" -ge "${LIVE[MAX_PER_HOUR]}" ]; then
+      local w=$(( attempts[0] + 3600 - $(now_s) )); [ $w -lt $delay ] || delay=$w
+      ev "SUP rate-limited attempts_last_hour=${#attempts[@]} wait=${delay}s"; sup_log "1 小时内已重连 ${#attempts[@]} 次，等待 ${delay}s"
+    fi
+    ev "SUP retry kind=$kind delay=${delay}s fails=$fails"
+    sup_log "${delay}s 后重连"
+    set_phase reconnecting
+    sup_sleep "$delay"
+  done
+
+  # --- 停止：先让 openconnect 登出，再拆代理与网络 ---
+  set_phase stopping
+  if [ -n "$OC_PID" ] && kill -0 "$OC_PID" 2>/dev/null; then
+    sup_log "正在登出 openconnect..."; kill -TERM "$OC_PID" 2>/dev/null; _wait_pid_gone "$OC_PID"
+  fi
+  _teardown_session >/dev/null 2>&1
+  rm -f "$RESTART_REQ" "$PID_FILE"
+  ev "SUP stop reason=${PAUSED_REASON:-requested} sessions=$SESSION_N"
+  set_phase "${PAUSED_REASON:-stopped}"
+  sup_log "已停止（${PAUSED_REASON:-requested}）"
+  exit 0
+}
+
+# ============================================================================
+#  启动 / 停止（前端）
+# ============================================================================
+declare -A OVR=()     # 命令行或「只改本次」的临时覆盖
+OPT_SAVE=0
+
+show_summary() {
+  local k
+  title "📋 本次启动设置"
+  for k in ACCOUNT MODE PROTOCOL DATA_CHANNEL; do printf '    %-14s %s\n' "${SET_TITLE[$k]}" "$(cfg_label "$k")"; done
+  local acc_proto; acc_proto=$(account_field "${CFG[ACCOUNT]}" 6 2>/dev/null || true)
+  [ -n "$acc_proto" ] && printf '    %-14s %s\n' "" "（账户自带协议 ${acc_proto}，优先于上一行）"
+  case "${CFG[MODE]}" in
+    netns) for k in SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST; do printf '    %-14s %s\n' "${SET_TITLE[$k]}" "$(cfg_label "$k")"; done ;;
+    ocproxy) printf '    %-14s %s\n' "${SET_TITLE[SOCKS_PORT]}" "127.0.0.1:${CFG[SOCKS_PORT]}" ;;
+  esac
+  printf '    %-14s %s\n' "${SET_TITLE[AUTO_RECONNECT]}" "$(cfg_label AUTO_RECONNECT)"
+  [ "${CFG[MTU]}" != auto ] && printf '    %-14s %s\n' "MTU" "${CFG[MTU]}"
+  [ -n "${CFG[OC_EXTRA]}" ] && printf '    %-14s %s\n' "附加参数" "${CFG[OC_EXTRA]}"
+  return 0
+}
+
+start_preflight() {
+  local n; n=$(accounts_count)
+  [ "${n:-0}" -gt 0 ] || { log_err "还没有 VPN 账户，先在菜单「管理 VPN 账户」添加。"; return 1; }
+  settings_validate ACCOUNT "${CFG[ACCOUNT]}" || return 1
+  ensure_pkg_openconnect
+  case "${CFG[MODE]}" in
+    netns)
+      ensure_pkg_iptables
+      ensure_cmd_gost || return 1
+      if [ "${CFG[FORWARDER]}" = socat ]; then ensure_cmd_socat || return 1; fi
+      _check_port_free "${CFG[SOCKS_PORT]}" || { log_err "端口 ${CFG[SOCKS_PORT]} 已被占用，换一个（设置 → SOCKS5 端口）。"; return 1; }
+      [ "${CFG[LISTEN]}" = 0.0.0.0 ] && [ -z "${CFG[SOCKS_USER]}" ] && log_warn "SOCKS5 对全部网卡开放且没有认证——任何人都能用你的代理。建议设置认证。"
+      ;;
+    ocproxy)
+      ensure_pkg_ocproxy
+      _check_port_free "${CFG[SOCKS_PORT]}" || { log_err "端口 ${CFG[SOCKS_PORT]} 已被占用。"; return 1; } ;;
+    default) check_atd ;;
+  esac
+  return 0
+}
+
+run_profile_write() {
+  local k
+  mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"
+  ( umask 077
+    { printf '#LAUNCH_LOG=%s\n' "$LAUNCH_LOG"
+      for k in "${SET_KEYS[@]}" SOCKS_USER SOCKS_PASS; do [ "$k" = SOCKS_AUTH ] && continue; printf '%s=%q\n' "$k" "${CFG[$k]:-}"; done
+    } > "$RUN_PROFILE" )
+}
+
+# 把 OVR 合入 CFG（已在解析时校验）
+apply_overrides() { local k; for k in "${!OVR[@]}"; do CFG[$k]=${OVR[$k]}; done; }
+
+# 交互确认：直接启动 / 改设置 / 只改本次 / 取消
+start_confirm() {
+  local a
+  while true; do
+    echo; show_summary; sep
+    read -rp "回车=启动   s=修改并保存设置   t=只改本次   q=取消 : " a || { echo; return 1; }
+    case "$a" in
+      "") return 0 ;;
+      s|S) settings_menu; settings_load; apply_overrides ;;
+      t|T) settings_menu ovr; apply_overrides ;;
+      q|Q) log_info "已取消"; return 1 ;;
+    esac
+  done
+}
+
+cmd_start() { # $1=1 交互确认
+  local interactive="${1:-0}" rc=0
+  check_root
+  if svc_active; then log_err "VPN 已在运行（阶段：$(get_phase)）。要换设置请用 ocm restart。"; return 3; fi
+  if is_vpn_running; then log_err "检测到不受 systemd 托管的 openconnect（pid $(cat "$PID_FILE" 2>/dev/null)，可能是旧版启动的）。先 ocm stop 清理。"; return 3; fi
+  settings_load; apply_overrides
+  if [ "$interactive" = 1 ]; then start_confirm || return 1; fi
+  start_preflight || return 1
+  if [ "$OPT_SAVE" = 1 ]; then settings_save; log "已把本次设置保存为默认。"; fi
+  mkdir -p "$LAUNCH_DIR"
+  LAUNCH_LOG="$LAUNCH_DIR/$(date +%Y%m%d-%H%M%S)-start.log"; : > "$LAUNCH_LOG"; chmod 640 "$LAUNCH_LOG"
+  run_profile_write
+  install_units || return 1
+  rm -f "$PHASE_FILE" "$RESTART_REQ"
+  ev "MARK ocm start mode=${CFG[MODE]} account=${CFG[ACCOUNT]} channel=${CFG[DATA_CHANNEL]} port=${CFG[SOCKS_PORT]} by=${SUDO_USER:-$(id -un)}"
+
+  # 默认全局模式：保底回滚（路由出错导致 SSH 失联时，3 分钟后自动 stop）
+  local job="none"
+  if [ "${CFG[MODE]}" = default ]; then
+    job=$(echo "$SCRIPT_PATH stop" | at now + 3 minutes 2>&1 | awk '/job/{print $2}' || true)
+    [[ "${job:-}" =~ ^[0-9]+$ ]] || job="none"
+    if [ "$job" != none ]; then log_warn "已设保底任务（at Job $job）：3 分钟内未确认成功将自动停止。"; else log_warn "未能排上保底任务（at/atd 不可用）。"; fi
+  fi
+
+  log_info "交给 systemd 启动（${SVC_MAIN}）..."
+  systemctl reset-failed "$SVC_MAIN" >/dev/null 2>&1 || true
+  systemctl start "$SVC_MAIN" || { log_err "systemctl start 失败：journalctl -u $SVC_MAIN -n 50"; return 1; }
+  start_follow || rc=$?
+  sep
+  case $rc in
+    0) [ "$job" != none ] && atrm "$job" 2>/dev/null && log "连接稳定，已取消保底任务"
+       start_result; return 0 ;;
+    2) log_warn "${START_TIMEOUT} 秒内还没连上，后台仍在按退避策略重试。查看：ocm status / ocm log tail；放弃：ocm stop"
+       [ "$job" != none ] && atrm "$job" 2>/dev/null; return 1 ;;
+    *) log_err "启动失败（$(get_phase)）。完整输出：$LAUNCH_LOG"
+       [ "$job" != none ] && atrm "$job" 2>/dev/null; return 1 ;;
+  esac
+}
+
+# 跟随启动日志直到 up / 失败 / 超时
+start_follow() {
+  local off=0 t0 ph sz
+  t0=$(now_s)
+  while :; do
+    sz=$(stat -c%s "$LAUNCH_LOG" 2>/dev/null || echo 0)
+    if [ "$sz" -gt "$off" ]; then tail -c +$((off+1)) "$LAUNCH_LOG" | head -c $((sz-off)); off=$sz; fi
+    ph=$(get_phase)
+    case "$ph" in up) return 0;; failed:*|stopped*) return 1;; esac
+    if ! svc_active && [ $(( $(now_s) - t0 )) -gt 5 ]; then return 1; fi
+    [ $(( $(now_s) - t0 )) -ge "$START_TIMEOUT" ] && return 2
+    sleep 1
+  done
+}
+
+start_result() {
+  local proxy code eg
+  case "${CFG[MODE]}" in
+    netns|ocproxy)
+      proxy="socks5h://127.0.0.1:${CFG[SOCKS_PORT]}"
+      [ "${CFG[MODE]}" = netns ] && [ -n "${CFG[SOCKS_USER]}" ] && proxy="socks5h://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@127.0.0.1:${CFG[SOCKS_PORT]}"
+      code=$("$CURL_CMD" -s -o /dev/null -w '%{http_code}' --max-time 10 -x "$proxy" http://www.gstatic.com/generate_204 2>/dev/null || true)
+      eg=$(_pub_ip -4 "$proxy" 2>/dev/null || echo "查询失败")
+      log "VPN 已连接：SOCKS5 ${CFG[LISTEN]}:${CFG[SOCKS_PORT]}  探针 ${code:-无}  VPN 出口 ${eg}"
+      [ "${CFG[LISTEN]}" = 127.0.0.1 ] && log_info "从自己电脑使用：ssh -N -L ${CFG[SOCKS_PORT]}:127.0.0.1:${CFG[SOCKS_PORT]} <你的VPS>，再把浏览器代理设为 SOCKS5 127.0.0.1:${CFG[SOCKS_PORT]}"
+      ;;
+    default) log "VPN 已连接（全局模式），本机出口：$(_pub_ip -4 2>/dev/null || echo 查询失败)" ;;
+  esac
+  ev "MARK ocm start result=ok egress=${eg:-?}"
+}
+
+cmd_stop() {
+  check_root
+  ev "MARK ocm stop: 人工停止 by=${SUDO_USER:-$(id -un)}"
+  if svc_active || [ "$(get_phase)" = reconnecting ]; then
+    log_info "正在停止（openconnect 登出可能需要几秒）..."
+    systemctl stop "$SVC_MAIN" 2>/dev/null || true
+  fi
+  # 兜底：旧版（非托管）启动的会话或异常残留
+  if is_vpn_running || [ -f "$STATE_FILE" ] || [ -f "$GOST_PID_FILE" ] || [ -f "$SOCAT_PID_FILE" ] || [ -e "/run/netns/$NETNS_NAME" ]; then
+    _teardown_session
+  fi
+  rm -f "$RESTART_REQ"
+  log "VPN 已停止。"
+}
+stop_vpn() { cmd_stop; }   # 兼容旧调用名（卸载流程等）
+
+# ============================================================================
+#  诊断日志（ocm-watch.service → `ocm _watch`）
+# ----------------------------------------------------------------------------
+#  只读采样：不启停 VPN、不改路由/iptables/sysctl；唯一的「动作」是在 openconnect 还活着
+#  但代理持续不通（DEGRADED ≥ DEGRADED_WAIT）或出口回落宿主（FALLBACK ≥ 20s）时，写
+#  restart-request 并 TERM openconnect，交给 supervisor 重连。
+#  文件（${LOG_DIR}）：
+#    samples.log      每 SAMPLE_INTERVAL 秒一行客观指标（状态变化后加密到 5 秒，持续 3 分钟）
+#    events.log       只记变化：STATUS 迁移、CHANGE 字段变化、SUP（supervisor）、OC（openconnect 关键句）、MARK
+#    openconnect.log  openconnect 全部输出（supervisor 写入）
+#    incidents/       每次离开 UP / 进入异常时的现场快照
+#    launch/          每次 ocm start 的完整启动输出
+#  全部按大小轮转并 gzip，总量受 LOG_MAX_MB 限制；分区剩余 < 400MB 时暂停写采样。
+# ============================================================================
+INTERVAL=30; FAST_INTERVAL=5; FAST_WINDOW=180; IDLE_INTERVAL=120; WATCH_STEP=5
+STARTUP_GRACE=90; BAD_CONFIRM=2
+PROBE_URL=http://www.gstatic.com/generate_204; EXTRA_PROBE_URL=""
+TUN_PING_TARGET=1.1.1.1; EGRESS_EVERY=10; HOST_EGRESS_TTL=1800; HEARTBEAT_EVERY=21600
+ROTATE_BYTES=2097152; KEEP_SAMPLES=150; KEEP_EVENTS=60; KEEP_OCLOG=60; KEEP_INCIDENTS=400
+MAX_TOTAL_MB=300; MIN_FREE_MB=400
+NAT_SUBNET="$VETH_SUBNET"
+# 会话时间轴：会话年龄跨过这些秒数时记 SESSION 里程碑；[FROM,TO] 区间强制 5 秒采样；
+# 报告把落在 [LO,HI] 的非人工会话结束标为「≈2h」（不少学校/企业 VPN 有固定会话时长）
+AGE_MARKS="3600 6600 7080 7200 7320 7800 10800"
+AGE_WATCH_FROM=7080; AGE_WATCH_TO=7500; AGE_SUSPECT_LO=6900; AGE_SUSPECT_HI=7500
+LAST_KICK=0
+
+now_ts() { printf '%(%Y-%m-%dT%H:%M:%S%z)T' -1; }
+ms_now() { local n; n=$(date +%s%N); echo $(( n / 1000000 )); }
+watch_dirs() { mkdir -p "$LOG_DIR" "$INC_DIR" "$LAUNCH_DIR" "$WATCH_LIB" 2>/dev/null; chmod 750 "$LOG_DIR" 2>/dev/null || true; }
+watch_reload_cfg() {
+  settings_load
+  [[ "${CFG[SAMPLE_INTERVAL]}" =~ ^[0-9]+$ ]] && [ "${CFG[SAMPLE_INTERVAL]}" -ge 5 ] && INTERVAL=${CFG[SAMPLE_INTERVAL]}
+  [[ "${CFG[LOG_MAX_MB]}" =~ ^[0-9]+$ ]] && MAX_TOTAL_MB=${CFG[LOG_MAX_MB]}
+  EXTRA_PROBE_URL=${CFG[EXTRA_PROBE_URL]}
+  return 0
+}
+_watch() {
+  check_root
+  set +e
+  watch_reload_cfg
+  _watch_loop
+}
+
+# ---------------- 状态 ----------------
+cmd_status() {
+  local verbose="${1:-}" ph since st wsince rest
+  [ "$EUID" -eq 0 ] || { log_err "请用 root 运行"; return 1; }
+  settings_load
+  title "== OpenConnect Master v${VERSION} =="
+  ph=$(get_phase); since=$(get_phase_since)
+  printf 'VPN 服务  : %s' "$(systemctl is-active "$SVC_MAIN" 2>/dev/null || true)"
+  [ -n "$ph" ] && printf '   阶段 %s（%s）' "$ph" "$( [[ "$since" =~ ^[0-9]+$ ]] && fmt_dur $(( $(now_s) - since )) || echo ?)"
+  local en; en=$(systemctl is-enabled "$SVC_MAIN" 2>/dev/null || true)
+  printf '   开机自启 %s\n' "${en:-未安装}"
+  printf '诊断日志  : %s   自动重连 %s\n' "$(systemctl is-active "$SVC_WATCH" 2>/dev/null || true)" "$(cfg_label AUTO_RECONNECT)"
+  if [ -f "$STATE_FILE" ]; then
+    local MODE="" ACCOUNT_INDEX="" VPN_PROTOCOL="" SOCKS_PORT="" LISTEN_ADDR="" FORWARDER="" SOCKS_USER="" SOCKS_PASS="" KILL_SWITCH=""
+    # shellcheck disable=SC1090
+    . "$STATE_FILE" 2>/dev/null || true
+    printf '当前会话  : 账户 %s  模式 %s  协议 %s' "$(account_field $(( ${ACCOUNT_INDEX:-0} + 1 )) 1 2>/dev/null || echo '?')" "${MODE:-?}" "${VPN_PROTOCOL:-?}"
+    [ -n "$SOCKS_PORT" ] && printf '  SOCKS5 %s:%s%s' "${LISTEN_ADDR:-127.0.0.1}" "$SOCKS_PORT" "${SOCKS_USER:+（认证 ${SOCKS_USER}:****）}"
+    [ -n "$FORWARDER" ] && printf '  转发 %s' "$FORWARDER"
+    echo
+    is_vpn_running && printf 'openconnect: pid %s，已运行 %s\n' "$(cat "$PID_FILE")" "$(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
+  else
+    echo "当前会话  : 无"
+  fi
+  if [ -r "$WATCH_LIB/current" ]; then
+    read -r st wsince rest < "$WATCH_LIB/current"
+    printf '诊断判定  : %s（已持续 %s）\n' "$st" "$(fmt_dur $(( $(now_s) - wsince )))"
+    local eg; eg=$(grep -o ' eg=[0-9.]*' "$SAMPLES" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
+    [ -n "$eg" ] && printf '最近测得出口: %s\n' "$eg"
+    [ "$verbose" = -v ] && printf '最新采样  : %s\n' "$rest"
+  fi
+  printf '日志目录  : %s（%s）\n' "$LOG_DIR" "$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1)"
+  echo "最近事件："
+  grep -aE ' (STATUS|SUP|WATCH restart|MARK|RECOVERED) ' "$EVENTS" 2>/dev/null | grep -v ' HEARTBEAT ' | tail -n "$([ "$verbose" = -v ] && echo 25 || echo 8)" | cut -c1-200 | sed 's/^/  /' || true
+  return 0
+}
+
+cmd_log() {
+  local sub="${1:-report}"; shift || true
+  case "$sub" in
+    report)   cmd_report "${1:-7}" ;;
+    tail)     exec tail -n 40 -F "$EVENTS" "$OCLOG" ;;
+    snapshot) check_root; watch_dirs; settings_load; read_state; local f; f=$(snapshot "${1:-manual}"); ev "INCIDENT saved $f (manual)"; echo "$f" ;;
+    mark)     check_root; [ $# -gt 0 ] || { log_err "用法：ocm log mark <文字>"; return 2; }; ev "MARK $*"; echo "已记录" ;;
+    dir)      echo "$LOG_DIR" ;;
+    *) log_err "未知子命令：log $sub（可用 report|tail|snapshot|mark|dir）"; return 2 ;;
+  esac
+}
+
+rotate_file() { # 文件 保留份数
+  local f="$1" keep="$2" sz dst
+  sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  [ "$sz" -ge "$ROTATE_BYTES" ] || return 0
+  dst="$f.$(printf '%(%Y%m%d-%H%M%S)T' -1)"
+  mv -f "$f" "$dst" 2>/dev/null || return 0
+  nice -n 19 gzip -f "$dst" 2>/dev/null || true
+  ls -1 "$f".*.gz 2>/dev/null | sort | head -n -"$keep" | xargs -r rm -f
+}
+
+# 磁盘保护：分区余量 + 目录总量上限
+LOW_DISK=0
+disk_guard() {
+  local free used
+  free=$(df -Pm "$LOG_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+  if [[ "${free:-}" =~ ^[0-9]+$ ]] && [ "$free" -lt "$MIN_FREE_MB" ]; then
+    [ "$LOW_DISK" = 0 ] && ev "DISK low free=${free}MB min=${MIN_FREE_MB}MB -> 暂停写 samples"
+    LOW_DISK=1
+  else
+    [ "$LOW_DISK" = 1 ] && ev "DISK ok free=${free:-?}MB -> 恢复写 samples"
+    LOW_DISK=0
+  fi
+  used=$(du -sm "$LOG_DIR" 2>/dev/null | awk '{print $1}')
+  local guard=0
+  while [[ "${used:-0}" =~ ^[0-9]+$ ]] && [ "$used" -gt "$MAX_TOTAL_MB" ] && [ $guard -lt 50 ]; do
+    local victim
+    victim=$(ls -1tr "$SAMPLES".*.gz "$OCLOG".*.gz 2>/dev/null | head -n1)
+    [ -z "$victim" ] && victim=$(ls -1tr "$INC_DIR"/* 2>/dev/null | head -n1)
+    [ -z "$victim" ] && break
+    rm -f "$victim"; guard=$((guard+1))
+    used=$(du -sm "$LOG_DIR" 2>/dev/null | awk '{print $1}')
+  done
+  [ $guard -gt 0 ] && ev "DISK cap ${MAX_TOTAL_MB}MB 超限，删除最旧轮转文件 ${guard} 个"
+  return 0
+}
+
+gw_host() { # 当前会话所用账户的网关主机（无会话时用设置里的账户）
+  local idx
+  idx=$(grep -a '^ACCOUNT_INDEX=' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+  if [[ "$idx" =~ ^[0-9]+$ ]]; then idx=$((idx+1)); else idx=${CFG[ACCOUNT]:-1}; fi
+  gw_host_of "$idx"
+}
+
+# ping 解析：输出 "loss%/avg_ms"
+ping_stat() { # 原始 ping -q 输出
+  local out="$1" loss rtt
+  loss=$(sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' <<<"$out" | head -n1)
+  rtt=$(sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p' <<<"$out" | head -n1)
+  printf '%s%%/%sms' "${loss:-?}" "${rtt:--}"
+}
+
+# ---------------- 读取 ocm 状态 ----------------
+read_state() {
+  ST_HAVE=0; ST_MODE=""; ST_PROTO=""; ST_PORT=""; ST_FWD=""; ST_USER=""; ST_PASS=""; ST_LISTEN=""
+  [ -r "$STATE_FILE" ] || return 0
+  ST_HAVE=1
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      MODE) ST_MODE=$v ;; VPN_PROTOCOL) ST_PROTO=$v ;; SOCKS_PORT) ST_PORT=$v ;;
+      FORWARDER) ST_FWD=$v ;; LISTEN_ADDR) ST_LISTEN=$v ;;
+    esac
+  done < <(grep -aE '^(MODE|VPN_PROTOCOL|SOCKS_PORT|FORWARDER|LISTEN_ADDR)=' "$STATE_FILE" 2>/dev/null)
+  if grep -aq '^SOCKS_USER=' "$STATE_FILE" 2>/dev/null; then
+    # 值经 %q 转义，ocm 自己就是 source 这个文件的；在子 shell 里 source，只取这两项
+    ST_USER=$( . "$STATE_FILE" >/dev/null 2>&1; printf '%s' "${SOCKS_USER:-}" )
+    ST_PASS=$( . "$STATE_FILE" >/dev/null 2>&1; printf '%s' "${SOCKS_PASS:-}" )
+  fi
+  [[ "$ST_PORT" =~ ^[0-9]+$ ]] || ST_PORT=""
+}
+
+# ---------------- 采样 ----------------
+declare -A PREV=()
+TICK=0
+OC_START=0; OC_START_PID=""; S_SESS="-"
+HOST_EG="-"; HOST_EG_AT=0
+LAST_SOCKS_EG="-"; FALLBACK=0
+BAD_STREAK=0
+GW_HOST=""
+
+# 采一次样：设置 S_* 变量与 LINE、CAND（候选状态）、REASON
+sample() {
+  TICK=$((TICK+1))
+  S_TS=$(now_ts); S_E=$(now_s)
+  read_state
+
+  # --- openconnect 进程 ---
+  S_OCPID="-"; S_OCAGE="-"
+  local p; p=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [[ "$p" =~ ^[0-9]+$ ]] && [ "$(cat /proc/$p/comm 2>/dev/null)" = openconnect ]; then
+    S_OCPID=$p; S_OCAGE=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')
+  fi
+  # 记住会话起点（≈认证时刻）：进程退出后仍能算出"断开时会话已持续多久"
+  if [ "$S_OCPID" != "-" ] && [[ "$S_OCAGE" =~ ^[0-9]+$ ]]; then OC_START=$((S_E - S_OCAGE)); OC_START_PID=$S_OCPID; fi
+  if [ "${OC_START:-0}" -gt 0 ]; then S_SESS=$((S_E - OC_START)); else S_SESS="-"; fi
+  S_OCN=$(pgrep -c -x openconnect 2>/dev/null || true); S_OCN=${S_OCN:-0}
+  S_GOST=$(pgrep -c -x gost 2>/dev/null || true); S_GOST=${S_GOST:-0}
+  S_SOCAT=$(pgrep -c -x socat 2>/dev/null || true); S_SOCAT=${S_SOCAT:-0}
+
+  # --- 隧道接口（netns 模式在命名空间里，default 模式在宿主上） ---
+  local IPN=(ip); S_NS=0 want_tun=1
+  if [ -e "/run/netns/$NETNS_NAME" ]; then S_NS=1; fi
+  if [ "$ST_MODE" = netns ] || { [ -z "$ST_MODE" ] && [ $S_NS = 1 ]; }; then IPN=(ip -n "$NETNS_NAME"); fi
+  # ocproxy 不建内核 tun；宿主上别的程序的 tun（组网等）不能算成 VPN 的
+  case "$ST_MODE" in ocproxy|"") [ $S_NS = 1 ] || want_tun=0 ;; esac
+  S_TUN="-"; S_TUNST="-"; S_TUNIP="-"; S_RX="-"; S_TX="-"; S_DEFTUN=0
+  if [ $want_tun = 1 ] && { [ "${IPN[1]:-}" != "-n" ] || [ $S_NS = 1 ]; }; then
+    local links; links=$(timeout 3 "${IPN[@]}" -o link show 2>/dev/null)
+    if [ "$ST_MODE" = default ]; then S_TUN=$(grep -o "$OC_TUN_DEFAULT" <<<"$links" | head -n1)
+    else S_TUN=$(grep -o 'tun[0-9]\+' <<<"$links" | head -n1); fi
+    S_TUN=${S_TUN:--}
+    if [ "$S_TUN" != "-" ]; then
+      if grep -m1 " $S_TUN:" <<<"$links" | grep -q 'LOWER_UP'; then S_TUNST=UP; else S_TUNST=DOWN; fi
+      S_TUNIP=$(timeout 3 "${IPN[@]}" -4 -o addr show dev "$S_TUN" 2>/dev/null | awk '{print $4; exit}'); S_TUNIP=${S_TUNIP:--}
+      local rx tx
+      read -r rx tx < <(timeout 3 "${IPN[@]}" -s link show dev "$S_TUN" 2>/dev/null | awk '/RX:/{getline; r=$1} /TX:/{getline; t=$1} END{print r+0, t+0}')
+      if [[ "${rx:-}" =~ ^[0-9]+$ ]] && [[ "${PREV[rx]:-}" =~ ^[0-9]+$ ]] && [ "$rx" -ge "${PREV[rx]}" ]; then
+        S_RX="+$((rx - PREV[rx]))"; S_TX="+$((tx - PREV[tx]))"
+      else S_RX="new"; S_TX="new"; fi
+      PREV[rx]=${rx:-}; PREV[tx]=${tx:-}
+    else
+      PREV[rx]=""; PREV[tx]=""
+    fi
+    timeout 3 "${IPN[@]}" route show default 2>/dev/null | grep -q 'dev tun' && S_DEFTUN=1
+  fi
+
+  # --- SOCKS 可用性（经代理真实发起一次 HTTP） ---
+  S_LISTEN="-"; S_SOCKS="-"; S_SOCKSMS="-"; S_XPROBE="-"
+  local proxy=""
+  if [ -n "$ST_PORT" ]; then
+    S_LISTEN=$(ss -Hlnt "sport = :$ST_PORT" 2>/dev/null | wc -l)
+    local auth=""; [ -n "$ST_USER" ] && auth="${ST_USER}:${ST_PASS}@"
+    proxy="socks5h://${auth}127.0.0.1:${ST_PORT}"
+    local out
+    out=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --connect-timeout 5 --max-time 10 -x "$proxy" "$PROBE_URL" 2>/dev/null)
+    S_SOCKS=${out%% *}; S_SOCKS=${S_SOCKS:-000}
+    S_SOCKSMS=$(awk -v t="${out##* }" 'BEGIN{printf "%d", t*1000}')
+    if [ -n "$EXTRA_PROBE_URL" ]; then
+      S_XPROBE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 12 -x "$proxy" "$EXTRA_PROBE_URL" 2>/dev/null); S_XPROBE=${S_XPROBE:-000}
+    fi
+  fi
+
+  # --- 隧道内 ping（netns 内默认路由走 tun） ---
+  S_TPING="-"
+  if [ "$S_OCPID" != "-" ] && [ $S_NS = 1 ] && [ "$ST_MODE" = netns ]; then
+    S_TPING=$(ping_stat "$(timeout 6 ip netns exec "$NETNS_NAME" ping -n -q -c 3 -i 0.3 -w 4 "$TUN_PING_TARGET" 2>/dev/null)")
+  fi
+
+  # --- 宿主侧：到 VPN 网关的 DNS / TCP 握手 / ping，宿主自身出网 ---
+  { [ -z "$GW_HOST" ] || [ $((TICK % 120)) -eq 0 ]; } && GW_HOST=$(gw_host)
+  S_GWIP="-"; S_GWTCP="-"; S_GWPING="-"; S_HPING="-"
+  if [ -n "$GW_HOST" ]; then
+    S_GWIP=$(timeout 4 getent ahostsv4 "$GW_HOST" 2>/dev/null | awk 'NR==1{print $1}'); S_GWIP=${S_GWIP:-DNSFAIL}
+    if [ "$S_GWIP" != DNSFAIL ]; then
+      local a b; a=$(ms_now)
+      if timeout 4 bash -c ">/dev/tcp/$S_GWIP/443" 2>/dev/null; then b=$(ms_now); S_GWTCP="$((b-a))ms"; else S_GWTCP=FAIL; fi
+      S_GWPING=$(ping_stat "$(ping -n -q -c 3 -i 0.3 -w 4 "$S_GWIP" 2>/dev/null)")
+    fi
+  fi
+  S_HPING=$(ping_stat "$(ping -n -q -c 2 -i 0.3 -w 3 1.1.1.1 2>/dev/null)")
+
+  # --- netns 出网依赖：MASQUERADE 规则、ip_forward、veth ---
+  S_NAT=$(timeout 4 iptables -w 2 -t nat -S POSTROUTING 2>/dev/null | grep -c -- "-s $NAT_SUBNET")
+  S_FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "?")
+  S_VETH=0; ip link show veth_ocm_h >/dev/null 2>&1 && S_VETH=1
+
+  # --- netns 内 TCP 重传/超时增量（代理流量的实际质量） ---
+  S_RETR="-"; S_TMO="-"
+  if [ $S_NS = 1 ]; then
+    local r t
+    read -r r t < <(timeout 4 ip netns exec "$NETNS_NAME" nstat -asz 2>/dev/null | awk '$1=="TcpRetransSegs"{r=$2} $1=="TcpExtTCPTimeouts"{t=$2} END{print r+0, t+0}')
+    if [[ "${PREV[retr]:-}" =~ ^[0-9]+$ ]] && [ "${r:-0}" -ge "${PREV[retr]}" ]; then
+      S_RETR="+$((r - PREV[retr]))"; S_TMO="+$((t - PREV[tmo]))"
+    fi
+    PREV[retr]=${r:-0}; PREV[tmo]=${t:-0}
+  else PREV[retr]=""; PREV[tmo]=""; fi
+
+  S_MEM=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)
+
+  # --- 出口 IP（低频）：经 SOCKS 的出口 vs 宿主出口；相同 = 代理没走 VPN ---
+  S_EG="-"; S_NSDNS="-"
+  if [ -n "$proxy" ] && { [ $((TICK % EGRESS_EVERY)) -eq 1 ] || [ "${FORCE_EGRESS:-0}" = 1 ]; }; then
+    if [ "$HOST_EG" = "-" ] || [ $((S_E - HOST_EG_AT)) -ge "$HOST_EGRESS_TTL" ]; then
+      local h; h=$(curl -4 -s --max-time 6 https://api.ipify.org 2>/dev/null || true)
+      [ -z "$h" ] && h=$(curl -4 -s --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)
+      if [[ "$h" =~ ^[0-9.]+$ ]]; then HOST_EG=$h; HOST_EG_AT=$S_E; fi
+    fi
+    S_EG=$(curl -4 -s --connect-timeout 5 --max-time 10 -x "$proxy" https://api.ipify.org 2>/dev/null || true)
+    [[ "$S_EG" =~ ^[0-9.]+$ ]] || S_EG="FAIL"
+    if [ "$S_EG" != FAIL ]; then
+      LAST_SOCKS_EG=$S_EG
+      if [ "$HOST_EG" != "-" ] && [ "$S_EG" = "$HOST_EG" ]; then FALLBACK=1; else FALLBACK=0; fi
+    fi
+    if [ $S_NS = 1 ]; then
+      if timeout 5 ip netns exec "$NETNS_NAME" getent ahostsv4 www.gstatic.com >/dev/null 2>&1; then S_NSDNS=ok; else S_NSDNS=FAIL; fi
+    fi
+  fi
+  [ -z "$proxy" ] && FALLBACK=0
+
+  # --- 判定候选状态 ---
+  REASON=""
+  if [ "$ST_HAVE" = 0 ]; then
+    if [ "$S_OCN" -gt 0 ]; then
+      # ocm 的 netns 启动流程在最后才写 state：刚起的 openconnect 先算 STARTING
+      local young; young=$(ps -o etimes= -p "$(pgrep -n -x openconnect)" 2>/dev/null | tr -d ' ')
+      if [[ "$young" =~ ^[0-9]+$ ]] && [ "$young" -lt "$STARTUP_GRACE" ]; then
+        CAND=STARTING; REASON="openconnect-up-${young}s-waiting-for-ocm-state"
+      else
+        CAND=UNMANAGED; REASON="openconnect-running-without-ocm-state"
+      fi
+    else CAND=STOPPED; fi
+  elif [ "$S_OCPID" = "-" ]; then
+    CAND=DOWN; REASON="openconnect-gone(state-file-still-present)"
+  else
+    local pr=""
+    if [ "$ST_MODE" = netns ]; then
+      [ $S_NS = 1 ] || pr="${pr}netns-missing,"
+      [ "$S_TUN" = "-" ] && pr="${pr}tun-missing,"
+      [ "$S_TUN" != "-" ] && [ "$S_TUNST" != UP ] && pr="${pr}tun-down,"
+      [ $S_DEFTUN = 1 ] || pr="${pr}no-default-via-tun,"
+      [ "$S_NAT" -ge 1 ] 2>/dev/null || pr="${pr}masquerade-missing,"
+      [ "$S_FWD" = 1 ] || pr="${pr}ip_forward-off,"
+    fi
+    if [ -n "$ST_PORT" ]; then
+      [ "$S_LISTEN" -ge 1 ] 2>/dev/null || pr="${pr}socks-not-listening,"
+      [[ "$S_SOCKS" =~ ^[23] ]] || pr="${pr}socks-probe-fail(${S_SOCKS}),"
+    fi
+    if [ -n "$pr" ]; then
+      REASON=${pr%,}
+      if [[ "$S_OCAGE" =~ ^[0-9]+$ ]] && [ "$S_OCAGE" -lt "$STARTUP_GRACE" ]; then CAND=STARTING; else CAND=DEGRADED; fi
+    elif [ "$FALLBACK" = 1 ]; then
+      CAND=FALLBACK; REASON="socks-egress==host-egress(${HOST_EG})"
+    else
+      CAND=UP
+    fi
+  fi
+
+  LINE=$(printf '%s st=%s mode=%s proto=%s oc=%s age=%s sess=%s ocn=%s gost=%s socat=%s tun=%s/%s ip=%s deftun=%s rx=%s tx=%s listen=%s socks=%s/%sms xprobe=%s tping=%s gw=%s gwtcp=%s gwping=%s hping=%s nat=%s fwd=%s veth=%s retr=%s tmo=%s eg=%s nsdns=%s mem=%sMB%s' \
+    "$S_TS" "$CAND" "${ST_MODE:--}" "${ST_PROTO:--}" "$S_OCPID" "$S_OCAGE" "$S_SESS" "$S_OCN" "$S_GOST" "$S_SOCAT" \
+    "$S_TUN" "$S_TUNST" "$S_TUNIP" "$S_DEFTUN" "$S_RX" "$S_TX" "$S_LISTEN" "$S_SOCKS" "$S_SOCKSMS" "$S_XPROBE" \
+    "$S_TPING" "$S_GWIP" "$S_GWTCP" "$S_GWPING" "$S_HPING" "$S_NAT" "$S_FWD" "$S_VETH" "$S_RETR" "$S_TMO" \
+    "$S_EG" "$S_NSDNS" "$S_MEM" "$([ -n "$REASON" ] && printf ' why=%s' "$REASON")")
+}
+
+# ---------------- 现场快照 ----------------
+LAST_SNAP=0
+snapshot() { # 标签
+  local tag="${1:-manual}" f
+  watch_dirs
+  f="$INC_DIR/$(printf '%(%Y%m%d-%H%M%S)T' -1)-${tag//[^A-Za-z0-9_.-]/_}.txt"
+  {
+    sec() { printf '\n===== %s =====\n' "$1"; }
+    printf 'oc-master %s incident snapshot  tag=%s  time=%s  host=%s\n' "$VERSION" "$tag" "$(now_ts)" "$(hostname)"
+    sec "最近 12 条采样"; tail -n 12 "$SAMPLES" 2>/dev/null
+    sec "最近 15 条事件"; tail -n 15 "$EVENTS" 2>/dev/null
+    sec "openconnect 输出（最近 150 行）"; tail -n 150 "$OCLOG" 2>/dev/null
+    sec "supervisor 阶段 / 服务状态"; cat "$PHASE_FILE" 2>/dev/null; systemctl --no-pager --lines=0 status "$SVC_MAIN" 2>/dev/null | head -n 6
+    sec "ocm state 文件（已脱敏）"; sed -E 's/^(SOCKS_PASS)=.*/\1=<redacted>/' "$STATE_FILE" 2>/dev/null || echo "(不存在)"
+    sec "相关进程"; ps -eo pid,ppid,etimes,stat,rss,args 2>/dev/null | grep -E 'openconnect|gost|socat|ocproxy|oc_master|ocm' | grep -v grep
+    sec "at 队列（ocm 的保底 stop 任务）"; atq 2>/dev/null
+    sec "netns: link/addr/route"
+    timeout 4 ip -n "$NETNS_NAME" -s link 2>/dev/null; timeout 4 ip -n "$NETNS_NAME" addr 2>/dev/null; timeout 4 ip -n "$NETNS_NAME" route 2>/dev/null
+    sec "netns: resolv.conf / TCP 概况"
+    cat "/etc/netns/$NETNS_NAME/resolv.conf" 2>/dev/null; timeout 4 ip netns exec "$NETNS_NAME" ss -s 2>/dev/null
+    timeout 4 ip netns exec "$NETNS_NAME" ss -tnp 2>/dev/null | head -n 40
+    sec "宿主: ip rule / route / veth"
+    ip rule 2>/dev/null; ip route 2>/dev/null; ip -s link show veth_ocm_h 2>/dev/null
+    sec "宿主: iptables nat（与 netns/端口相关）"
+    timeout 5 iptables -w 2 -t nat -S 2>/dev/null | grep -E "192\.168\.200|MASQUERADE|${ST_PORT:-8585}" 
+    sec "宿主: sysctl"
+    sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding "net.ipv4.conf.veth_ocm_h.route_localnet" 2>/dev/null
+    sec "宿主: 监听端口"; ss -lntp 2>/dev/null | grep -E ":${ST_PORT:-8585}\b" 
+    sec "连通性复测"
+    local gw; gw=$(gw_host)
+    echo "gw_host=$gw"; timeout 4 getent ahostsv4 "$gw" 2>/dev/null | head -n 3
+    ping -n -c 4 -i 0.3 -w 5 "$gw" 2>&1 | tail -n 3
+    timeout 8 curl -s -o /dev/null -w 'gw https: code=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n' "https://$gw/" 2>&1
+    ping -n -c 3 -w 4 1.1.1.1 2>&1 | tail -n 2
+    timeout 6 ip netns exec "$NETNS_NAME" ping -n -c 3 -w 4 "$TUN_PING_TARGET" 2>&1 | tail -n 2
+    timeout 6 ip netns exec "$NETNS_NAME" getent ahostsv4 www.gstatic.com 2>&1 | head -n 2
+    [ -n "${ST_PORT:-}" ] && curl -s -o /dev/null -w "socks probe: code=%{http_code} total=%{time_total}s\n" --max-time 10 -x "socks5h://127.0.0.1:${ST_PORT}" "$PROBE_URL" 2>&1
+    sec "内存 / OOM / 内核消息（最近 30 分钟）"
+    free -m; ps -eo pid,rss,comm --sort=-rss | head -n 8
+    timeout 10 journalctl -k --since "-30min" --no-pager -o short-iso 2>/dev/null | tail -n 60
+    sec "系统 warning 以上日志（最近 15 分钟）"
+    timeout 15 journalctl -p warning --since "-15min" --no-pager -o short-iso 2>/dev/null | grep -vE 'ocm-sentinel' | tail -n 60 | redact
+    sec "TCP 计数（宿主）"; nstat -asz 2>/dev/null | grep -E 'TcpRetransSegs|TCPTimeouts|TCPAbortOn|TcpExtListenDrops' 
+  } > "$f" 2>&1
+  chmod 640 "$f" 2>/dev/null || true
+  ls -1 "$INC_DIR"/*.txt 2>/dev/null | sort | head -n -"$KEEP_INCIDENTS" | xargs -r rm -f
+  printf '%s' "$f"
+}
+
+# ---------------- 主循环 ----------------
+_watch_loop() {
+  watch_dirs
+  trap 'ev "WATCH stop pid=$$ (signal)"; exit 0' TERM INT
+  ev "WATCH start v$VERSION pid=$$ interval=${INTERVAL}s fast=${FAST_INTERVAL}s/${FAST_WINDOW}s probe=$PROBE_URL"
+
+  local status="" since=0 fast_until=0 last_hb=0 t0 dt nap now bad_start=0 bad_since=0 bad_from=""
+  status="INIT"; since=$(now_s); last_hb=$since
+  FORCE_EGRESS=1
+  while :; do
+    t0=$(now_s)
+    sample
+    FORCE_EGRESS=0
+    now=$S_E
+
+    # --- 会话时间轴里程碑：会话年龄跨过 AGE_MARKS 时记一笔（同一 openconnect 进程内） ---
+    if [ "$S_OCPID" != "-" ] && [[ "$S_OCAGE" =~ ^[0-9]+$ ]]; then
+      local pa=${PREV[ocage]:-} m
+      if [ "${PREV[ocagepid]:-}" = "$S_OCPID" ] && [[ "$pa" =~ ^[0-9]+$ ]]; then
+        for m in $AGE_MARKS; do
+          if [ "$pa" -lt "$m" ] && [ "$S_OCAGE" -ge "$m" ]; then
+            ev "SESSION age_mark=$(fmt_dur $m) age=$S_OCAGE pid=$S_OCPID status=$status cand=$CAND socks=$S_SOCKS/${S_SOCKSMS}ms tping=$S_TPING rx=$S_RX tx=$S_TX started=$(date -d "@$OC_START" '+%F %T')"
+          fi
+        done
+      fi
+      PREV[ocage]=$S_OCAGE; PREV[ocagepid]=$S_OCPID
+    fi
+
+    # --- 字段变化事件（不必等状态迁移） ---
+    local chg="" k v
+    for k in OCPID:"$S_OCPID" TUNIP:"$S_TUNIP" GWIP:"$S_GWIP" NAT:"$S_NAT" FWD:"$S_FWD" VETH:"$S_VETH" MODE:"${ST_MODE:--}" PROTO:"${ST_PROTO:--}"; do
+      v=${k#*:}; k=${k%%:*}
+      if [ -n "${PREV[$k]+x}" ] && [ "${PREV[$k]}" != "$v" ]; then chg="${chg} ${k}:${PREV[$k]}->${v}"; fi
+      PREV[$k]=$v
+    done
+    if [ "$S_EG" != "-" ] && [ "$S_EG" != FAIL ]; then
+      [ -n "${PREV[EG]+x}" ] && [ "${PREV[EG]}" != "$S_EG" ] && chg="${chg} EGRESS:${PREV[EG]}->${S_EG}"
+      PREV[EG]=$S_EG
+    fi
+    # 网关可达性翻转也单独记（区分"学校网关挂了/路由断了" 与 "本机问题"）
+    local gwok=1; [ "$S_GWTCP" = FAIL ] && gwok=0; [ "$S_GWIP" = DNSFAIL ] && gwok=0
+    [ -n "${PREV[GWOK]+x}" ] && [ "${PREV[GWOK]}" != "$gwok" ] && chg="${chg} GW_REACH:${PREV[GWOK]}->${gwok}(tcp=${S_GWTCP},ping=${S_GWPING})"
+    PREV[GWOK]=$gwok
+    [ -n "$chg" ] && ev "CHANGE${chg}"
+
+    # --- 状态迁移（UP→DEGRADED 需连续确认，其它立即生效） ---
+    local new=$CAND
+    # 已经 UP 过的会话再出问题就是"运行中异常"，不能因为进程年轻就归为 STARTING
+    [ "$new" = STARTING ] && [ "$status" = UP ] && [ "$ST_HAVE" = 1 ] && new=DEGRADED
+    if [ "$new" = DEGRADED ] && [ "$status" = UP ]; then
+      BAD_STREAK=$((BAD_STREAK+1))
+      if [ $BAD_STREAK -lt "$BAD_CONFIRM" ]; then
+        new=UP
+        fast_until=$((now + FAST_WINDOW))
+        ev "WARN 单次异常待确认 (${BAD_STREAK}/${BAD_CONFIRM}): ${REASON}"
+        [ $BAD_STREAK -eq 1 ] && bad_start=$now
+      fi
+    else
+      [ "$new" = UP ] && BAD_STREAK=0
+    fi
+
+    if [ "$new" != "$status" ]; then
+      local held=$((now - since)) heal=0
+      # supervisor 正在重连期间的状态变化不算人工停止
+      case "$(get_phase)" in reconnecting|connecting) heal=1;; esac
+      ev "STATUS from=$status to=$new heal=$heal held=$held held_h=$(fmt_dur $held) session_age=$S_SESS session_age_h=$(fmt_dur "$S_SESS") session_pid=${OC_START_PID:--} reason=${REASON:-ok} oc=$S_OCPID tun=$S_TUN/$S_TUNST socks=$S_SOCKS gwtcp=$S_GWTCP"
+      case "$new" in
+        DOWN|DEGRADED|FALLBACK|UNMANAGED)
+          fast_until=$((now + FAST_WINDOW)); FORCE_EGRESS=1
+          # 把 openconnect 最后几行话直接放进事件，事后不翻文件也能一眼看到原因
+          tail -n 6 "$OCLOG" 2>/dev/null | while IFS= read -r l; do ev "OCLAST $l"; done
+          ;;
+      esac
+      # 断线计时：从"最初进入异常"算起，中间经过 STARTING 等过渡状态不打断
+      if [[ "$new" =~ ^(DOWN|DEGRADED|FALLBACK|UNMANAGED)$ ]] && [ "$bad_since" = 0 ]; then bad_since=$now; bad_from=$status; fi
+      if [ "$new" = UP ] && [ "$bad_since" != 0 ]; then
+        ev "RECOVERED outage=$((now - bad_since)) outage_h=$(fmt_dur $((now - bad_since))) (since leaving $bad_from)"
+        bad_since=0
+      fi
+      [ "$new" = STOPPED ] && { [ "$heal" = 1 ] || bad_since=0; OC_START=0; OC_START_PID=""; }
+      # 离开 UP 或进入异常：保存现场（后台进行，不拖慢采样；同一分钟内最多一份，DOWN 除外）
+      if { [ "$status" = UP ] || [[ "$new" =~ ^(DOWN|DEGRADED|FALLBACK|UNMANAGED)$ ]]; } && [ "$status" != INIT ]; then
+        if [ "$new" = DOWN ] || [ $((now - LAST_SNAP)) -ge 60 ]; then
+          LAST_SNAP=$now
+          ( sleep 2; f=$(snapshot "${status}-to-${new}"); ev "INCIDENT saved $f" ) &
+        fi
+      fi
+      status=$new; since=$now
+    fi
+
+    # --- 软重连：openconnect 还在，但代理持续不通 / 出口回落到宿主 ---
+    if [ "${CFG[AUTO_RECONNECT]}" = on ] && [ "$S_OCPID" != "-" ] && [ "$(get_phase)" = up ] && svc_active; then
+      local want=""
+      [ "$status" = DEGRADED ] && [ $((now - since)) -ge "${CFG[DEGRADED_WAIT]}" ] && want="degraded-$((now - since))s:${REASON}"
+      [ "$status" = FALLBACK ] && [ $((now - since)) -ge 20 ] && want="fallback:${REASON}"
+      if [ -n "$want" ] && [ $((now - LAST_KICK)) -ge 120 ]; then
+        LAST_KICK=$now; touch "$RESTART_REQ"; kill -TERM "$S_OCPID" 2>/dev/null
+        ev "WATCH restart-request reason=$want pid=$S_OCPID"
+      fi
+    fi
+
+    # --- 写采样 ---
+    [ "$LOW_DISK" = 0 ] && printf '%s\n' "$LINE" >> "$SAMPLES" 2>/dev/null
+    printf '%s %s %s\n' "$status" "$since" "$LINE" > "$WATCH_LIB/current" 2>/dev/null
+
+    # --- 心跳、轮转、磁盘、跟随进程看护 ---
+    if [ $((now - last_hb)) -ge "$HEARTBEAT_EVERY" ]; then
+      ev "HEARTBEAT status=$status for=$(fmt_dur $((now - since))) samples=$(stat -c%s "$SAMPLES" 2>/dev/null)B"
+      last_hb=$now
+    fi
+    rotate_file "$SAMPLES" "$KEEP_SAMPLES"
+    rotate_file "$EVENTS" "$KEEP_EVENTS"
+    rotate_file "$OCLOG" "$KEEP_OCLOG"
+    [ $((TICK % 10)) -eq 1 ] && disk_guard
+    [ $((TICK % 20)) -eq 0 ] && watch_reload_cfg
+
+    local inwin=0
+    [[ "$S_OCAGE" =~ ^[0-9]+$ ]] && [ "$S_OCAGE" -ge "$AGE_WATCH_FROM" ] && [ "$S_OCAGE" -le "$AGE_WATCH_TO" ] && inwin=1
+    if [ "$now" -lt "$fast_until" ] || [ $inwin = 1 ]; then nap=$FAST_INTERVAL
+    elif [ "$status" = STOPPED ]; then nap=$IDLE_INTERVAL
+    else nap=$INTERVAL; fi
+    dt=$(( $(now_s) - t0 )); nap=$((nap - dt)); [ $nap -lt 1 ] && nap=1
+    # 两次采样之间每 WATCH_STEP 秒做一次极轻量存活检查（不发网络请求）：
+    #   会话出现/消失、openconnect 进程退出 → 立即提前采样，断线时刻精确到约 5 秒。
+    local end=$(( $(now_s) + nap )) left step
+    while :; do
+      left=$(( end - $(now_s) )); [ $left -le 0 ] && break
+      step=$WATCH_STEP; [ $left -lt $step ] && step=$left
+      sleep "$step" & wait $!
+      if [ "$status" = STOPPED ]; then
+        { [ -f "$STATE_FILE" ] || pgrep -x openconnect >/dev/null 2>&1; } && break
+      else
+        [ -f "$STATE_FILE" ] || break
+        [ "$S_OCPID" != "-" ] && ! kill -0 "$S_OCPID" 2>/dev/null && break
+        [ "$S_OCPID" = "-" ] && [ -r "$PID_FILE" ] && break
+      fi
+    done
+  done
+}
+
+# ---------------- 报告 ----------------
+cmd_report() {
+  local days="${1:-7}"; [[ "$days" =~ ^[0-9]+$ ]] || days=7
+  local cutoff=$(( $(now_s) - days*86400 ))
+  echo "== ocm 诊断报告：最近 ${days} 天（$(date -d "@$cutoff" '+%F %T') 起）=="
+  # 每一段都要 || true：前台是 set -e + pipefail，没有轮转文件时 ls 失败会让整个子 shell 提前退出、后面的 cat 不执行
+  { { ls -1 "$EVENTS".*.gz 2>/dev/null | sort | xargs -r zcat 2>/dev/null; } || true; cat "$EVENTS" 2>/dev/null || true; } \
+  | awk -v cut="$cutoff" -v nowe="$(now_s)" -v slo="$AGE_SUSPECT_LO" -v shi="$AGE_SUSPECT_HI" '
+    function kv(k,   i,a){ for(i=2;i<=NF;i++){ if(index($i,k"=")==1){ return substr($i,length(k)+2) } } return "" }
+    function dur(s,  d,h,m){ d=int(s/86400); h=int((s%86400)/3600); m=int((s%3600)/60); if(d>0) return sprintf("%dd%02dh%02dm",d,h,m); if(h>0) return sprintf("%dh%02dm",h,m); if(m>0) return sprintf("%dm%02ds",m,s%60); return sprintf("%ds",s) }
+    { e=kv("e")+0 }
+    $3=="STATUS" {
+      from=kv("from"); to=kv("to"); held=kv("held")+0
+      if (e>=cut) {
+        st=(e-held<cut)? cut : e-held
+        if (from!="INIT") tm[from]+= (e-st)
+        # 连续的异常状态（DOWN→STARTING→DEGRADED…）合并成一次断线，原因依次拼接
+        if (to ~ /^(DOWN|DEGRADED|FALLBACK|UNMANAGED)$/) {
+          if (open>0) { why[open]=why[open] " ; " to ":" kv("reason") }
+          else { n++; ts[n]=$1; fr[n]=from; tt[n]=to; why[n]=kv("reason"); hf[n]=held; be[n]=e; sa[n]=kv("session_age"); open=n }
+        }
+        if (to=="UP" && open>0) { rec[open]=e-be[open]; open=0 }
+        if (to=="STOPPED" && open>0 && kv("heal")!="1") { rec[open]=-1; open=0 }
+        # 会话结束时间轴：离开 UP 的那一刻会话已持续多久（人工停止单独标注）
+        # 只有会话真正结束（进程退出/出口回落/被停止）才算；DEGRADED 是会话内的短暂故障，另行统计
+        if (from=="UP" && to=="DEGRADED") blips++
+        if (from=="UP" && to!="UP" && to!="DEGRADED") {
+          a=kv("session_age")
+          if (a ~ /^[0-9]+$/) {
+            se++; se_ts[se]=$1; se_to[se]=to; se_age[se]=a+0; se_why[se]=kv("reason")
+            se_man[se]=(md>0 && e-md<=60) ? 1 : 0
+            if (!se_man[se] && a+0>=slo && a+0<=shi) near2h++
+            if (!se_man[se]) unplanned++
+          }
+        }
+      }
+      last_to=to; last_e=e
+    }
+    # 记录器自身停机期间状态未知：正常停止时结算到停止时刻，异常退出（无 stop 行）则不计
+    ($3=="SENTINEL" || $3=="WATCH") && $4=="stop" { if (last_to!="" && e>=cut) { st=(last_e<cut)?cut:last_e; if (last_to!="INIT") tm[last_to]+=e-st } ; last_to=""; last_e=0 }
+    ($3=="SENTINEL" || $3=="WATCH") && $4=="start" { last_to=""; last_e=0 }
+    $3=="OC" && e>=cut {
+      m=tolower($0)
+      if (m ~ /dead peer|dpd/) c["DPD/对端失联"]++
+      if (m ~ /reconnect/) c["重连"]++
+      if (m ~ /terminat|session.*(end|expir)|expired/) c["会话被终止/过期"]++
+      if (m ~ /esp/) c["ESP 相关"]++
+      if (m ~ /fail|error|refused|denied|unauthor/) c["失败/错误"]++
+      if (m ~ /cancel|sigint|sigterm/) c["人工/信号退出"]++
+      if (m ~ /establish/) c["隧道建立"]++
+    }
+    $3=="SUP" && e>=cut {
+      if ($4=="exit") { sx++; sk[kv("kind")]++ }
+      if ($4=="up") sup++
+      if ($4=="paused" || $4=="rate-limited") ahP++
+      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect)$/) { ah++; ahs[ah]=$0 }
+      next
+    }
+    $3=="WATCH" && $4=="restart-request" && e>=cut { wr++; ah++; ahs[ah]=$0; next }
+    $3=="MARK" && $4=="AUTOHEAL" && e>=cut {
+      ah++; ahs[ah]=$0
+      if ($5=="trigger") ahT++
+      if ($5 ~ /^result=ok/) ahOK++
+      if ($5 ~ /^result=FAIL/) ahF++
+      if ($5=="paused:" || $5=="rate-limited:") ahP++
+      next
+    }
+    $3=="MARK" && e>=cut {
+      if ($0 ~ /\[autoheal\]/) next
+      mk++; mks[mk]=$0; if ($0 ~ /ocm-nc down|ocm stop|TEST:|启动前清理/) md=e
+    }
+    $3=="SESSION" && e>=cut { sm++; sms[sm]=$0 }
+    $3=="CHANGE" && e>=cut { ch++; chs[ch]=$0 }
+    END {
+      if (last_to!="" && last_e>0) { st=(last_e<cut)?cut:last_e; tm[last_to]+= nowe-st }
+      tot=0; for (k in tm) if (k!="STOPPED") tot+=tm[k]
+      printf "当前状态：%s（已持续 %s）\n", (last_to==""?"未知":last_to), (last_e>0?dur(nowe-last_e):"-")
+      printf "状态时长："
+      for (k in tm) printf " %s=%s", k, dur(tm[k])
+      if (tot>0 && ("UP" in tm)) printf "  | 可用率（不计 STOPPED）%.2f%%", 100*tm["UP"]/tot
+      printf "\n\n异常/断线次数：%d\n", n
+      for (i=1;i<=n;i++) printf "  %s  %s→%s  会话已持续 %-10s 恢复用时 %-12s 原因 %s\n", ts[i], fr[i], tt[i], (sa[i] ~ /^[0-9]+$/ ? dur(sa[i]+0) : "?"), (i in rec ? (rec[i]<0?"被停止":dur(rec[i])) : "尚未恢复"), why[i]
+      printf "\n会话结束时间轴（离开 UP 时距认证多久；≈2h = %s–%s）：\n", dur(slo), dur(shi)
+      if (!se) print "  （暂无会话结束记录）"
+      for (i=1;i<=se;i++) printf "  %s  →%-9s 会话时长 %-10s %s%s  %s\n", se_ts[i], se_to[i], dur(se_age[i]), (se_man[i]?"[人工] ":""), (!se_man[i] && se_age[i]>=slo && se_age[i]<=shi ? "[≈2h!] " : ""), se_why[i]
+      if (unplanned>0) printf "  非人工结束 %d 次，其中落在 ≈2h 区间 %d 次\n", unplanned, near2h
+      printf "  会话内短暂故障（DEGRADED，未断开）%d 次\n", blips
+      printf "\n自动重连：openconnect 退出 %d 次", sx
+      if (sx) { printf "（"; sep=""; for (k in sk) { printf "%s%s=%d", sep, k, sk[k]; sep=" " } printf "）" }
+      printf "，重新就绪 %d 次，软重连请求 %d 次，暂停或限速 %d 次", sup, wr, ahP
+      if (ahT) printf "；旧版 autoheal 触发 %d 次（成功 %d / 失败 %d）", ahT, ahOK, ahF
+      printf "（最近 15 条）：\n"
+      if (!ah) print "  （无）"
+      for (i=(ah>15?ah-14:1); i<=ah; i++) print "  " ahs[i]
+      printf "\n会话里程碑（最近 12 条，共 %d）：\n", sm
+      for (i=(sm>12?sm-11:1); i<=sm; i++) print "  " sms[i]
+      printf "\nopenconnect 关键消息统计：\n"; nc=0
+      for (k in c) { printf "  %-16s %d\n", k, c[k]; nc++ }
+      if (!nc) print "  （无）"
+      printf "\n字段变化（最近 15 条，共 %d）：\n", ch
+      for (i=(ch>15?ch-14:1); i<=ch; i++) print "  " chs[i]
+      printf "\n人工标记（最近 10 条，共 %d）：\n", mk
+      for (i=(mk>10?mk-9:1); i<=mk; i++) print "  " mks[i]
+    }'
+  echo
+  echo "最近的现场快照："; ls -1t "$INC_DIR"/*.txt 2>/dev/null | head -n 8 | sed 's/^/  /' || true
+  echo
+  echo "细查：grep -E 'STATUS|OC |CHANGE|INCIDENT' $EVENTS | tail -n 50"
+  echo "      less $OCLOG    zcat -f $SAMPLES* | grep -v 'st=UP'"
+}
+
 
 # --- 定时与卸载 ---
 # 写 crontab 前先留一份副本：下面几处都是 `... | crontab -` 的写法，一旦 `crontab -l`
@@ -1149,50 +2258,6 @@ _backup_crontab() {
     log_warn "备份 crontab 失败（${_CRON_BAK} 不可写），继续操作。"
   fi
   return 0
-}
-
-manage_cron() {
-  # 同 manage_accounts：c 必须 local，否则会覆盖主菜单的选项变量。
-  local c
-  # 有些系统（实测 Debian 12 最小安装）没有 cron 包，crontab 命令不存在：那种环境下
-  # 本菜单的每个操作都会以 command not found 失败，而 set -e 会直接终止整个脚本。
-  if ! command -v crontab &>/dev/null; then
-    clear 2>/dev/null || true; title "🗓️ 定时/守护任务"; sep
-    log_err "系统未安装 cron/crontab，定时任务不可用。"
-    log_info "可先执行： apt-get install -y cron"
-    sep
-    read -n1 -s -p "按任意键返回主菜单..." || true
-    return 0
-  fi
-  while true; do
-    clear 2>/dev/null || true; title "🗓️ 定时/守护任务"; sep
-    crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || log_info "  当前无此脚本的定时任务。"
-    sep
-    echo -e "  1) 设置守护任务 (每5分钟检查，断线重连)"
-    echo -e "  2) 添加定时关闭任务"
-    echo -e "  3) 清除所有此脚本相关的定时任务"
-    echo -e "  4) 返回主菜单"
-    read -rp "请选择 [1-4]: " c || { echo; log_info "标准输入已结束，返回。"; return 0; }
-    case "$c" in
-      1) log_warn "守护任务：默认/ocproxy 模式断线后自动重连；Netns 模式探测到隧道不可用时会停止清理（不自动重连）。"
-         # cron 给任务的默认 PATH 是 /usr/bin:/bin（Debian cron 的编译期常量，实测
-         # `strings /usr/sbin/cron`），而 openconnect 在 /usr/sbin、gost 在 /usr/local/bin
-         # —— 没有 PATH 时守护任务必然找不到命令（实测 env -i PATH=/usr/bin:/bin 下这两个
-         # 都是 MISSING）。cron 会把命令行交给 /bin/sh -c，所以把赋值写在命令前面即可：
-         # 既不动用户已有的 PATH 行，也不依赖目标机器的 crontab 里恰好有 PATH 行。
-         local cron_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-         _backup_crontab
-         (crontab -l 2>/dev/null | grep -v "_internal_check_health" || true) | { cat; echo "*/5 * * * * PATH=$cron_path $SCRIPT_PATH _internal_check_health"; } | crontab -
-         log "已设置守护任务。";;
-      2) read -rp "请输入 cron 表达式 (例如 '0 2 * * *' 代表每天凌晨2点): " exp
-         _backup_crontab
-         [ -z "$exp" ] && { log_err "表达式不能为空"; } || { (crontab -l 2>/dev/null || true; echo "$exp $SCRIPT_PATH stop") | crontab -; log "已添加定时关闭任务。"; };;
-      3) _backup_crontab
-         crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "已清除所有相关定时任务。";;
-      4) break;;
-      *) log_err "无效选项";;
-    esac; read -n1 -s -p $'\n'"按任意键返回..."
-  done
 }
 
 # 卸载依赖前的询问。核心区别：
@@ -1218,6 +2283,9 @@ uninstall() {
   read -rp "⚠️  确认要卸载此脚本及其所有相关配置吗？[y/N]: " y || y=""
   [[ "$y" =~ ^[yY]$ ]] || { log_info "已取消"; exit 0; }
   log_info "开始卸载..."; stop_vpn
+  uninstall_units; log "systemd 单元已移除"
+  local yl=""; read -rp "是否同时删除设置与诊断日志（${CONF_DIR}、${LOG_DIR}）? [y/N]: " yl || yl=""
+  if [[ "$yl" =~ ^[yY]$ ]]; then rm -rf "$CONF_DIR" "$LOG_DIR" "$WATCH_LIB" "$RUN_DIR"; log "设置与日志已删除"; else log_info "已保留 ${CONF_DIR} 与 ${LOG_DIR}"; fi
   _backup_crontab
   crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true; log "定时任务已清理"
   
@@ -1278,94 +2346,369 @@ uninstall() {
   log_info "正在删除脚本文件: $SCRIPT_PATH"; rm -f "$SCRIPT_PATH"; log "卸载完成，再见！"
 }
 
-_internal_cron_handler() {
-  local a="$1"; shift; check_root
-  case "$a" in
-    _internal_check_health)
-      # netns 模式单独处理：它不自动重连（重建 netns + 重新认证的副作用大，也容易和
-      # 用户的手动操作打架），但绝不能什么都不做——连接断了而接口/state 还在时，
-      # gost 会回落走宿主出口，主菜单显示"运行中"而实际完全没走 VPN。
-      # 一旦明确探测到不可用就做一次彻底停止，让状态如实变成"停止"，用户看到后自己重连。
-      local _mode=""
-      [ -f "$STATE_FILE" ] && _mode="$(grep '^MODE=' "$STATE_FILE" 2>/dev/null | cut -d'=' -f2 || true)"
-      if [ "$_mode" = "netns" ]; then
-        local _rc=0; _netns_vpn_probe || _rc=$?
-        # 只有"明确不可用"(1) 才动手；"无法判断"(2) 时保持原状，避免网络抖动误停
-        if [ "$_rc" -eq 1 ]; then
-          log_warn "守护进程: Netns 模式的 VPN 已不可用，执行停止清理（不自动重连）。"
-          stop_vpn
-        fi
-        return 0
+# ============================================================================
+#  设置菜单
+# ----------------------------------------------------------------------------
+#  target=cfg：修改并保存到 settings.conf；target=ovr：只改本次（启动前「t」），不保存。
+#  choice 类型用数字选；int/text 类型的常用预设用字母选，也可以直接输入值。
+# ============================================================================
+_pause() { read -n1 -s -rp "${1:-按任意键返回...}" || true; echo; }
+
+settings_edit_item() {
+  local k="$1" target="${2:-cfg}" t="${SET_TYPE[$1]}" v="" a old j c
+  local -a cs=()
+  clear 2>/dev/null || true
+  title "⚙️  ${SET_TITLE[$k]}   ${C_GREY}($k)${C_RESET}"; sep
+  _set_help "$k"; sep
+  echo -e "当前：${C_CYAN}$(cfg_label "$k")${C_RESET}"
+  [ -n "${SET_CHOICES[$k]}" ] && IFS=',' read -r -a cs <<<"${SET_CHOICES[$k]}"
+  case "$t" in
+    choice)
+      j=0; for c in "${cs[@]}"; do j=$((j+1)); printf '  %d) %s  %s\n' "$j" "${c#*:}" "$(echo -e "${C_GREY}[${c%%:*}]${C_RESET}")"; done
+      read -rp "选择编号（回车保持不变）: " a || return 0
+      [ -z "$a" ] && return 0
+      [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le ${#cs[@]} ] || { log_err "无效编号"; _pause; return 0; }
+      v=${cs[$((a-1))]%%:*} ;;
+    int|text)
+      local letters=abcdefghij
+      j=0; for c in "${cs[@]}"; do printf '  %s) %s  %s\n' "${letters:$j:1}" "${c#*:}" "$(echo -e "${C_GREY}[${c%%:*}]${C_RESET}")"; j=$((j+1)); done
+      if [ "$t" = text ]; then read -rp "选字母预设、直接输入新值，或输入 - 清空（回车保持不变）: " a || return 0
+      else read -rp "选字母预设或直接输入数字（回车保持不变）: " a || return 0; fi
+      [ -z "$a" ] && return 0
+      if [[ "$a" =~ ^[a-j]$ ]]; then
+        j=$(( $(printf '%d' "'$a") - 97 )); [ $j -lt ${#cs[@]} ] || { log_err "无效预设"; _pause; return 0; }
+        v=${cs[$j]%%:*}
+      elif [ "$t" = text ] && [ "$a" = - ]; then v=""
+      else v="$a"; fi ;;
+    account)
+      accounts_list
+      read -rp "选择账户序号（回车保持不变）: " a || return 0
+      [ -z "$a" ] && return 0
+      v="$a" ;;
+    auth)
+      local u="" p="" yn=""
+      read -rp "启用 SOCKS5 认证? [y/N]: " yn || return 0
+      if [[ "$yn" =~ ^[yY]$ ]]; then
+        read -rp "  用户名: " u || return 0
+        settings_validate SOCKS_USER "$u" && [ -n "$u" ] || { log_err "用户名无效"; _pause; return 0; }
+        read -rsp "  密码: " p || return 0; echo
+        settings_validate SOCKS_PASS "$p" && [ -n "$p" ] || { log_err "密码无效"; _pause; return 0; }
       fi
-      if ! is_vpn_running && [ -f "$STATE_FILE" ]; then
-        log_info "守护进程: 检测到连接断开, 正在尝试自动重连..."; 
-        . "$STATE_FILE"; _load_account_by_index "${ACCOUNT_INDEX:-}"
-        case "${MODE:-}" in
-          default) _start_default_logic ;;
-          ocproxy) _start_ocproxy_logic reconnect ;;
-          netns) log_err "守护进程: Netns 模式尚不支持自动重连，已跳过。";;
-          *) log_err "守护进程: 未知的恢复模式, 无法重连";;
-        esac
-      fi;;
-    *) log_err "内部 cron 调用错误: '$a'";;
+      CFG[SOCKS_USER]=$u; CFG[SOCKS_PASS]=$p
+      if [ "$target" = ovr ]; then OVR[SOCKS_USER]=$u; OVR[SOCKS_PASS]=$p
+      else settings_save; ev "CONFIG SOCKS_AUTH -> ${u:+on(user=$u)}${u:-off}"; fi
+      log "已设置：$(cfg_label SOCKS_AUTH)"; _settings_restart_note "$k" "$target"; _pause; return 0 ;;
   esac
+  settings_validate "$k" "$v" || { _pause; return 0; }
+  old=${CFG[$k]}; CFG[$k]=$v
+  if [ "$target" = ovr ]; then
+    OVR[$k]=$v; log "本次使用：$(cfg_label "$k")"
+  else
+    settings_save; ev "CONFIG $k: ${old} -> ${v}"; log "已保存：$(cfg_label "$k")"
+    case "$k" in WATCH|AUTOSTART) apply_service_prefs ;; esac
+  fi
+  _settings_restart_note "$k" "$target"
+  _pause
+}
+_settings_restart_note() {
+  [ "$2" = cfg ] || return 0
+  case "$SET_NEEDS_RESTART" in *" $1 "*) svc_active && log_warn "VPN 正在运行：这项要重启后才生效（菜单 2 或 ocm restart）。";; esac
+  return 0
 }
 
-# --- 主菜单 ---
+settings_menu() {
+  local target="${1:-cfg}" n i k g lastg mark
+  while true; do
+    clear 2>/dev/null || true
+    if [ "$target" = ovr ]; then title "⏱  只改本次（不保存，仅对这次启动生效）"; else title "⚙️  设置   ${C_GREY}${SETTINGS_FILE}${C_RESET}"; fi
+    sep
+    i=0; lastg=""
+    for k in "${SET_KEYS[@]}"; do
+      i=$((i+1)); g=${SET_GROUP[$k]}
+      [ "$g" != "$lastg" ] && { echo -e "  ${C_GREY}── ${g} ──${C_RESET}"; lastg=$g; }
+      mark=""; [ "$target" = ovr ] && [ -n "${OVR[$k]+x}" ] && mark=" ${C_YELLOW}(本次)${C_RESET}"
+      echo -e "  $(printf '%2d' $i)) ${SET_TITLE[$k]}：${C_CYAN}$(cfg_label "$k")${C_RESET}${mark}"
+    done
+    sep
+    echo "  选编号查看说明并修改；0 返回"
+    read -rp "选择: " n || return 0
+    case "$n" in
+      0|"") return 0 ;;
+      *) [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#SET_KEYS[@]} ] || continue
+         settings_edit_item "${SET_KEYS[$((n-1))]}" "$target" || true ;;
+    esac
+  done
+}
+
+# ============================================================================
+#  定时任务（v8：断线自动重连已由 systemd supervisor 负责，这里只管定时启停）
+# ============================================================================
+manage_cron() {
+  local c exp act cron_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  if ! command -v crontab &>/dev/null; then
+    clear 2>/dev/null || true; title "🗓️ 定时任务"; sep
+    log_err "系统未安装 cron/crontab，定时任务不可用。可先执行： apt-get install -y cron"; sep; _pause "按任意键返回主菜单..."; return 0
+  fi
+  while true; do
+    clear 2>/dev/null || true; title "🗓️ 定时任务"; sep
+    crontab -l 2>/dev/null | grep -F "$SCRIPT_PATH" || log_info "  当前无此脚本的定时任务。"
+    crontab -l 2>/dev/null | grep -q "_internal_check_health" && log_warn "  有旧版守护任务（_internal_check_health）：v8 已由 systemd 自动重连取代，建议选 3 清除。"
+    sep
+    echo "  1) 添加定时启动（按保存的设置 ocm start）"
+    echo "  2) 添加定时关闭（ocm stop）"
+    echo "  3) 清除所有此脚本相关的定时任务（含旧版守护任务）"
+    echo "  4) 返回主菜单"
+    read -rp "请选择 [1-4]: " c || return 0
+    case "$c" in
+      1|2) act=start; [ "$c" = 2 ] && act=stop
+           read -rp "cron 表达式（分 时 日 月 周，例如 '0 8 * * 1-5' = 工作日 8 点）: " exp || continue
+           [ "$(wc -w <<<"$exp")" -eq 5 ] || { log_err "需要 5 个字段"; _pause; continue; }
+           _backup_crontab
+           { crontab -l 2>/dev/null || true; echo "$exp PATH=$cron_path $SCRIPT_PATH $act >/dev/null 2>&1"; } | crontab -
+           log "已添加：$exp → ocm $act"; _pause ;;
+      3) _backup_crontab
+         { crontab -l 2>/dev/null | grep -vF "$SCRIPT_PATH" || true; } | crontab - 2>/dev/null || true
+         log "已清除。"; _pause ;;
+      4) return 0 ;;
+      *) log_err "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+# ============================================================================
+#  主菜单状态区（只读本地状态，不发网络请求，保证菜单秒开）
+# ============================================================================
+show_status() {
+  sep
+  local ph; ph=$(get_phase)
+  if svc_active; then
+    case "$ph" in
+      up)           title "  VPN 状态: ${C_GREEN}🟢 运行中${C_RESET}  ${C_GREY}(systemd 托管)${C_RESET}" ;;
+      reconnecting) title "  VPN 状态: ${C_YELLOW}🟡 重连中${C_RESET}" ;;
+      *)            title "  VPN 状态: ${C_YELLOW}🟡 ${ph:-启动中}${C_RESET}" ;;
+    esac
+    if [ -f "$STATE_FILE" ]; then
+      local MODE="" ACCOUNT_INDEX="" VPN_PROTOCOL="" SOCKS_PORT="" LISTEN_ADDR="" FORWARDER="" SOCKS_USER="" SOCKS_PASS="" KILL_SWITCH=""
+      # shellcheck disable=SC1090
+      . "$STATE_FILE" 2>/dev/null || true
+      echo -e "    ${C_BOLD}账户:${C_RESET} $(account_field $(( ${ACCOUNT_INDEX:-0} + 1 )) 1 2>/dev/null || echo '?')   ${C_BOLD}模式:${C_RESET} ${MODE:-?}   ${C_BOLD}协议:${C_RESET} ${VPN_PROTOCOL:-?}"
+      [ -n "$SOCKS_PORT" ] && echo -e "    ${C_BOLD}SOCKS5:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}${SOCKS_USER:+ （认证 ${SOCKS_USER}:****）}${FORWARDER:+ ${C_GREY}by ${FORWARDER}${C_RESET}}"
+    fi
+    if is_vpn_running; then
+      echo -e "    ${C_BOLD}本次会话:${C_RESET} 已连接 $(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
+    fi
+    if [ -r "$WATCH_LIB/current" ]; then
+      local st ws eg; read -r st ws _ < "$WATCH_LIB/current"
+      eg=$(grep -o ' eg=[0-9.]*' "$SAMPLES" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
+      echo -e "    ${C_BOLD}诊断:${C_RESET} ${st}（$(fmt_dur $(( $(now_s) - ws )))）${eg:+   最近出口 ${eg}}"
+    fi
+  else
+    case "$ph" in
+      failed:*) title "  VPN 状态: ${C_RED}🔴 已停止（${ph#failed:}）${C_RESET}  ${C_GREY}详情：菜单 4${C_RESET}" ;;
+      *)        title "  VPN 状态: ${C_RED}🔴 停止${C_RESET}" ;;
+    esac
+    if is_vpn_running; then
+      echo -e "    ${C_YELLOW}检测到不受 systemd 托管的 openconnect（旧版启动？）。选 3 停止后再用 1 启动。${C_RESET}"
+    fi
+    echo -e "    ${C_BOLD}将使用:${C_RESET} $(cfg_label ACCOUNT)  /  ${CFG[MODE]}  /  $(account_field "${CFG[ACCOUNT]}" 6 2>/dev/null || true)${CFG[PROTOCOL]}  /  $(cfg_label DATA_CHANNEL)"
+  fi
+  echo -e "    ${C_BOLD}快捷命令:${C_RESET} $(_shortcut_state)   ${C_GREY}ocm -h 查看命令行用法${C_RESET}"
+  sep
+}
+
+status_menu() {
+  local c
+  while true; do
+    clear 2>/dev/null || true; cmd_status -v || true; sep
+    echo "  1) 诊断报告（最近 1 天）   2) 最近 7 天   3) 最近 30 天"
+    echo "  4) 最近 60 行 openconnect 输出   5) 立即保存一份现场快照   0) 返回"
+    read -rp "选择: " c || return 0
+    case "$c" in
+      1) cmd_report 1 | less -R -F -X || true ;;
+      2) cmd_report 7 | less -R -F -X || true ;;
+      3) cmd_report 30 | less -R -F -X || true ;;
+      4) tail -n 60 "$OCLOG" 2>/dev/null || echo "（暂无）"; _pause ;;
+      5) cmd_log snapshot menu || true; _pause ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 main_menu() {
-  # clear 失败不该中断菜单：TERM 未设置时（例如 `ssh host ocm` 没带 -t）clear 返回 1，
-  # 在 set -e 下会把整个脚本当场杀掉。
+  local c
   clear 2>/dev/null || true
   echo -e "${C_BOLD}========================================================${C_RESET}"
-  echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v7.7.7 (Final) 🚀${C_RESET}"
+  echo -e "${C_BOLD}  🚀 OpenConnect Master Manager v${VERSION} 🚀${C_RESET}"
   echo -e "${C_BOLD}========================================================${C_RESET}"
-  # 状态显示只是展示：它内部任何查询失败都不该中断主菜单（见 _pub_ip 的 set -e 陷阱）
+  settings_load
   show_status || true
   title "主菜单:"
-  echo -e "  ${C_GREEN}1) 启动: 🛡️  默认模式 (全局VPN, 保护SSH)${C_RESET}"
-  echo -e "  ${C_GREEN}2) 启动: 🔌 ocproxy 模式 (SOCKS5, 仅IPv4)${C_RESET}"
-  echo -e "  ${C_GREEN}3) 启动: 🌐 Netns 模式 (SOCKS5, socat 转发)${C_RESET}"
-  echo -e "  ${C_GREEN}4) 启动: 🌐 Netns 模式 (SOCKS5, iptables 双 NAT，IPv4 入口)${C_RESET}"
-  echo -e "  ${C_RED}5) 停止 VPN${C_RESET}"
+  echo -e "  ${C_GREEN}1) 🚀 启动 VPN（按当前设置，启动前确认）${C_RESET}"
+  echo -e "  ${C_GREEN}2) 🔁 重启 VPN（应用新设置）${C_RESET}"
+  echo -e "  ${C_RED}3) ⏹  停止 VPN${C_RESET}"
+  echo -e "  4) 📊 状态详情与诊断报告"
   sep
-  echo -e "  6) ⚙️  管理 VPN 账户"
-  echo -e "  7) 🗓️  设置定时/守护任务"
+  echo -e "  5) ⚙️  设置（模式 / 协议 / 数据通道 / 代理 / 重连 / 日志…）"
+  echo -e "  6) 🔐 管理 VPN 账户"
+  echo -e "  7) 🗓️  定时启动 / 关闭"
   echo -e "  8) 📦 检查/安装依赖"
   echo -e "  9) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
   echo -e " 10) 🗑️  卸载"
   echo -e "  0) 🚪 退出"
   echo
-  # 标准输入结束（管道/重定向）时直接退出：否则末尾的 return 0 会让菜单无限循环，
-  # 每轮还会发两次公网 IP 查询。read 失败正是 EOF 的情形。
-  read -rp "请选择 [0-9] 或 10: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
+  read -rp "请选择 [0-10]: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
   case "$c" in
-    1) start_default || true;;
-    2) start_ocproxy_mode || true;;
-    3) start_netns_mode socat || true;;
-    4) start_netns_mode iptables || true;;
-    5) stop_vpn || true;;
-    6) manage_accounts;;
-    7) manage_cron;;
-    8) manage_deps;;
-    9) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then
-         test_netns_ipv6 || true
-       else
-         log_err "Netns 模式未运行，无法测试"
-       fi;;
-    10) uninstall; exit 0;;
-    0) exit 0;;
-    *) log_err "无效选项 '$c'";;
+    1) OVR=(); cmd_start 1 || true ;;
+    2) if svc_active; then OVR=(); cmd_stop || true; sleep 2; fi; cmd_start 1 || true ;;
+    3) cmd_stop || true ;;
+    4) status_menu ;;
+    5) settings_menu ;;
+    6) manage_accounts ;;
+    7) manage_cron ;;
+    8) manage_deps || true ;;
+    9) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then test_netns_ipv6 || true; else log_err "Netns 模式未运行，无法测试"; fi ;;
+    10) uninstall; exit 0 ;;
+    0) exit 0 ;;
+    *) log_err "无效选项 '$c'" ;;
   esac
-  # 选项 6/7、直接回车或输错键时，上面那条 AND 列表返回 1；而"函数最后一条语句返回
-  # 非 0"会让 set -e 结束整个脚本（实测：在主菜单按一下回车程序就退出了）。
-  # 显式 return 0，保证任何输入都回到菜单循环里。
-  [[ "$c" =~ ^([1-5]|8|9)$ ]] && read -n1 -s -p $'\n'"按任意键返回主菜单..."
+  [[ "$c" =~ ^([1-3]|8|9)$ ]] && _pause "按任意键返回主菜单..."
   return 0
 }
 
+# ============================================================================
+#  命令行
+# ============================================================================
+usage() { cat <<EOF
+OpenConnect Master Manager v${VERSION}
+
+用法：ocm [命令] [选项]
+  （不带参数）             打开交互菜单
+  start [选项]             按保存的设置启动（交给 systemd 托管）；选项只影响本次
+      -a, --account N|名称     使用第 N 个 / 指定名称的账户
+      -m, --mode MODE          netns | default | ocproxy
+      -p, --proto PROTO        anyconnect | pulse | nc | gp | fortinet | array
+      -P, --port N             SOCKS5 端口
+          --listen ADDR        127.0.0.1 | 0.0.0.0
+          --tls-only | --dtls  数据通道：仅 TLS（--no-dtls）/ ESP·DTLS
+          --fwd socat|iptables 端口转发方式
+          --kill-switch on|off 断线保护
+          --dns fast|system    DNS 超时策略
+          --mtu N|auto         隧道 MTU
+          --oc-args "..."      附加给 openconnect 的参数
+          --save               把本次选项保存为默认
+      -i, --interactive        启动前显示摘要并确认（菜单启动即此行为）
+  stop                     停止 VPN（openconnect 正常登出后清理）
+  restart [选项]           停止后按（新）设置启动
+  status [-v]              运行状态、诊断判定、最近事件
+  log report [天数]        断线统计 / 会话时间轴 / 自动重连记录（默认 7 天）
+  log tail                 实时跟踪事件与 openconnect 输出
+  log snapshot [标签]      立即保存一份现场快照
+  log mark <文字>          在事件日志里打标记
+  heal on|off|status       自动重连开关
+  config list [-v]         列出全部设置（-v 附说明）
+  config get KEY           读取一项
+  config set KEY VALUE     修改一项（SOCKS5 认证用 SOCKS_USER / SOCKS_PASS）
+  accounts                 列出账户（不显示密码）
+  install-service          安装/刷新 systemd 单元（启动时会自动做）
+  uninstall-service        移除 systemd 单元（不删设置与日志）
+  -V, --version            版本
+  -h, --help               本帮助
+
+文件：设置 ${SETTINGS_FILE}   账户 ${ACCOUNTS_FILE}   日志 ${LOG_DIR}
+退出码：0 成功  1 失败  2 用法错误  3 已在运行 / 状态冲突
+示例：
+  ocm start -m netns -p nc -P 8585 --tls-only --save
+  ocm log report 7
+  ocm config set DEGRADED_WAIT 60
+EOF
+}
+
+INTERACTIVE=0
+_ovr() { settings_validate "$1" "$2" || exit 2; OVR[$1]=$2; }
+parse_start_opts() {
+  local idx
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -a|--account) [ $# -ge 2 ] || { log_err "$1 需要参数"; exit 2; }
+                    idx=$(account_resolve "$2") || { log_err "找不到账户：$2"; exit 2; }; OVR[ACCOUNT]=$idx; shift 2 ;;
+      -m|--mode) [ $# -ge 2 ] || exit 2; _ovr MODE "$2"; shift 2 ;;
+      -p|--proto|--protocol) [ $# -ge 2 ] || exit 2; _ovr PROTOCOL "$2"; shift 2 ;;
+      -P|--port) [ $# -ge 2 ] || exit 2; _ovr SOCKS_PORT "$2"; shift 2 ;;
+      --listen) [ $# -ge 2 ] || exit 2; _ovr LISTEN "$2"; shift 2 ;;
+      --tls-only|--no-dtls) OVR[DATA_CHANNEL]=tls; shift ;;
+      --dtls) OVR[DATA_CHANNEL]=dtls; shift ;;
+      --fwd|--forwarder) [ $# -ge 2 ] || exit 2; _ovr FORWARDER "$2"; shift 2 ;;
+      --kill-switch) [ $# -ge 2 ] || exit 2; _ovr KILL_SWITCH "$2"; shift 2 ;;
+      --dns) [ $# -ge 2 ] || exit 2
+             case "$2" in fast|on) OVR[DNS_FAST]=on ;; system|off) OVR[DNS_FAST]=off ;; *) log_err "--dns 只能是 fast|system"; exit 2;; esac; shift 2 ;;
+      --mtu) [ $# -ge 2 ] || exit 2; _ovr MTU "$2"; shift 2 ;;
+      --oc-args) [ $# -ge 2 ] || exit 2; _ovr OC_EXTRA "$2"; shift 2 ;;
+      --save) OPT_SAVE=1; shift ;;
+      -i|--interactive) INTERACTIVE=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) log_err "未知选项：$1"; echo "用 ocm -h 查看用法" >&2; exit 2 ;;
+    esac
+  done
+}
+
+cmd_heal() {
+  check_root; settings_load
+  case "${1:-status}" in
+    on|off) CFG[AUTO_RECONNECT]=$1; settings_save; ev "CONFIG AUTO_RECONNECT -> $1"
+            log "自动重连：$(cfg_label AUTO_RECONNECT)（运行中的 supervisor 下一次掉线时即按新值处理）"
+            [ "$1" = on ] && ! svc_active && [[ "$(get_phase)" == failed:* ]] && log_info "上次因 $(get_phase) 停止，确认原因后用 ocm start 重新启动。" ;;
+    status) echo "自动重连：$(cfg_label AUTO_RECONNECT)   VPN 服务：$(systemctl is-active "$SVC_MAIN" 2>/dev/null || true)   阶段：$(get_phase)"
+            grep -aE ' SUP (exit|paused|rate-limited|retry) | WATCH restart-request ' "$EVENTS" 2>/dev/null | tail -n 10 | cut -c1-200 | sed 's/^/  /' || true ;;
+    *) log_err "用法：ocm heal on|off|status"; return 2 ;;
+  esac
+}
+
+cmd_config() {
+  check_root; settings_load
+  local sub="${1:-list}" k
+  case "$sub" in
+    list)
+      for k in "${SET_KEYS[@]}"; do
+        [ "$k" = SOCKS_AUTH ] && { printf '%-18s = %s\n' "SOCKS_USER" "${CFG[SOCKS_USER]}"; printf '%-18s = %s\n' "SOCKS_PASS" "$( [ -n "${CFG[SOCKS_PASS]}" ] && echo '****')"; continue; }
+        printf '%-18s = %-24s # %s：%s\n' "$k" "${CFG[$k]}" "${SET_TITLE[$k]}" "$(cfg_label "$k")"
+        [ "${2:-}" = -v ] && _set_help "$k" | sed 's/^/      /'
+      done; return 0 ;;
+    get) [ -n "${2:-}" ] && _is_cfg_key "$2" || { log_err "未知设置项：${2:-}"; return 2; }; printf '%s\n' "${CFG[$2]}" ;;
+    set) [ $# -ge 3 ] || { log_err "用法：ocm config set KEY VALUE"; return 2; }
+         _is_cfg_key "$2" || { log_err "未知设置项：$2（ocm config list 查看）"; return 2; }
+         local v="$3"; [ "$2" = ACCOUNT ] && { v=$(account_resolve "$3") || { log_err "找不到账户：$3"; return 2; }; }
+         settings_validate "$2" "$v" || return 2
+         local old=${CFG[$2]}; CFG[$2]=$v; settings_save
+         if [ "$2" = SOCKS_PASS ]; then ev "CONFIG SOCKS_PASS changed"; else ev "CONFIG $2: $old -> $v"; fi
+         log "$2 = $( [ "$2" = SOCKS_PASS ] && echo '****' || cfg_label "$2")"
+         case "$2" in WATCH|AUTOSTART) apply_service_prefs ;; esac
+         case "$SET_NEEDS_RESTART" in *" $2 "*) svc_active && log_warn "VPN 正在运行：重启后生效（ocm restart）。";; esac
+         [[ "$2" =~ ^SOCKS_(USER|PASS)$ ]] && svc_active && log_warn "VPN 正在运行：重启后生效（ocm restart）。"
+         return 0 ;;
+    *) log_err "用法：ocm config list [-v] | get KEY | set KEY VALUE"; return 2 ;;
+  esac
+}
+
 # --- 脚本入口 ---
-case "${1:-main}" in
-  _internal_*) _internal_cron_handler "$@"; exit 0 ;;
-  stop) check_root; stop_vpn; exit 0 ;;
-  main|*) check_root; _ensure_shortcut; while true; do main_menu; done ;;
-esac
+main_entry() {
+  case "${1:-}" in
+    "")            check_root; _ensure_shortcut; while true; do main_menu; done ;;
+    -h|--help|help) usage ;;
+    -V|--version|version) echo "OpenConnect Master Manager v${VERSION}" ;;
+    start)         shift; parse_start_opts "$@"; cmd_start "$INTERACTIVE" ;;
+    restart)       shift; parse_start_opts "$@"; check_root; cmd_stop; sleep 2; cmd_start "$INTERACTIVE" ;;
+    stop)          cmd_stop ;;
+    status)        shift; cmd_status "${1:-}" ;;
+    log|logs)      shift; cmd_log "$@" ;;
+    heal)          shift; cmd_heal "$@" ;;
+    config)        shift; cmd_config "$@" ;;
+    accounts)      check_root; accounts_list ;;
+    install-service)   check_root; settings_load; install_units && log "systemd 单元已就绪：$SVC_MAIN / $SVC_WATCH" ;;
+    uninstall-service) check_root; uninstall_units; log "已移除 systemd 单元（设置与日志保留）" ;;
+    _supervise)    _supervise ;;
+    _watch)        _watch ;;
+    _internal_*)   echo "[$VR_TAG] 旧版 cron 守护已由 systemd 自动重连取代；请在菜单 7 清除该定时任务。" >&2; exit 0 ;;
+    *)             log_err "未知命令：$1"; echo "用 ocm -h 查看用法" >&2; exit 2 ;;
+  esac
+}
+main_entry "$@"

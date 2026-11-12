@@ -4,16 +4,16 @@
 
 **English | [简体中文](README.md)**
 
-![Version](https://img.shields.io/badge/version-7.7.7-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.0.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
 
 **All-in-One OpenConnect VPN Management Tool**
 
-Three Running Modes | Policy Routing Protection | Network Namespace Isolation | IPv4+IPv6 Dual Stack
+Three Running Modes | systemd-managed + Auto-Reconnect | Built-in Diagnostic Logs | Settings Menu + CLI
 
-[Quick Start](#-quick-start) • [Features](#-features) • [Documentation](#-documentation)
+[Quick Start](#-quick-start) • [Features](#-features) • [Documentation](#-documentation) • [Upgrading from Older Versions](#upgrade)
 
 </div>
 
@@ -24,355 +24,324 @@ Three Running Modes | Policy Routing Protection | Network Namespace Isolation | 
 ### 🎯 Three Running Modes
 
 | Mode | Icon | Description | IPv4 | IPv6 | Use Case |
-|------|------|-------------|------|------|----------|
-| **Default Mode** | 🛡️ | Global VPN + SSH Protection | ✅ | ✅ | Scenarios requiring global proxy |
-| **ocproxy Mode** | 🔌 | SOCKS5 Proxy (Simplified) | ✅ | ❌ | Lightweight proxy needs |
-| **Netns Mode** | 🌐 | Network Namespace Isolation | ✅ | ✅ | **Recommended**! Complete isolation, dual-stack support |
+|------|------|------|------|------|----------|
+| **Default Mode** | 🛡️ | Global VPN + SSH Protection | ✅ | ✅ | The whole machine needs to go through the VPN |
+| **ocproxy Mode** | 🔌 | User-space SOCKS5 (no tun device) | ✅ | ❌ | Lightweight proxy needs |
+| **Netns Mode** | 🌐 | Network Namespace Isolation + SOCKS5 | ✅ | ✅ | **Recommended**! Only the programs that need it go through the VPN; the host is completely unaffected |
 
 ### 🔥 Core Features
 
-- ✅ **Intelligent Policy Routing**
-  - Automatically protects SSH connections from VPN interference
-  - Supports IPv4 and IPv6 dual-stack routing
-  - Precise routing table management and cleanup
+- ✅ **systemd-managed, auto-reconnect after drops** (new in v8)
+  - openconnect runs in the foreground inside `ocm.service`, so closing SSH no longer takes it down
+  - Exits are handled by cause: server terminated the session (expired) → reconnect after ~2 seconds; network error → retry with backoff intervals; authentication failure → counted, and paused once the threshold is reached, **to keep the account from being locked**
+  - The netns and the proxy stay in place during a reconnect; clients only notice a few seconds of interruption
+  - "Process still running but no connectivity" is detected too: if connectivity stays down beyond a threshold, a soft reconnect is triggered
 
-- ✅ **Multi-Account Management**
-  - Support for multiple VPN account switching
-  - Account information is stored **in plain text** in `/root/.vpn_accounts.env` (the script tightens it to mode `600`, root-only - anyone who can read that file can read the passwords, so protect it accordingly)
-  - Quick selection and switching
+- ✅ **Built-in long-term diagnostic logs** (new in v8, `ocm-watch.service`)
+  - Periodically samples the tunnel / proxy / gateway / egress IP, records every state change and an incident snapshot at each drop
+  - `ocm log report` shows in one command the number of drops, **how long the session had lasted at each drop**, and the auto-reconnect record
+  - Well suited to troubleshooting "it drops every so often" problems (for example, many school / corporate VPNs have a fixed session length)
 
-- ✅ **Scheduled Tasks Support**
-  - Daemon task: Default/ocproxy modes reconnect automatically after a drop; Netns mode stops and cleans up when the tunnel is really gone (it does not auto-reconnect)
-  - Scheduled shutdown with your own cron expression (there is no "scheduled start")
-  - Connection status monitoring: the main menu shows the mode, the SOCKS address and the egress IP
+- ✅ **⚙️ Settings menu + CLI** (new in v8)
+  - Every tunable parameter is listed in the menu with its current value, purpose, options and trade-offs — no need to read the source to guess defaults
+  - A settings summary is shown before starting: start directly / change settings and save / change for this run only
+  - `ocm -h`: `start / stop / restart / status / log / heal / config / accounts`, scriptable
 
-- ✅ **Safe Cleanup Mechanism**
-  - Complete environment cleanup
-  - Automatic rollback protection
-  - Graceful interrupt handling
+- ✅ **Intelligent policy routing** (Default Mode)
+  - Automatically protects SSH connections from the global VPN, supports IPv4 and IPv6
+  - The first start comes with a 3-minute failsafe automatic rollback
 
-- ✅ **Network Namespace Isolation** (Netns Mode)
-  - Completely independent network environment
-  - Does not affect host network
-  - Supports IPv4 and IPv6 dual stack
-  - Access via SOCKS5 proxy
+- ✅ **Network Namespace isolation** (Netns Mode)
+  - A completely independent network environment, accessed through a SOCKS5 proxy (optional username/password)
+  - Two port-forwarding backends: socat (IPv4+IPv6 entry) / iptables double NAT (IPv4 entry only)
+  - Optional **kill switch**: when the VPN is down the proxy simply fails; traffic never leaves through the VPS's own egress
+
+- ✅ **Multi-account management**
+  - Account information is stored **in plain text** in `/root/.vpn_accounts.env` (permissions tightened to `600`, readable by root only; protect it yourself as needed)
+  - Each account can specify its own protocol; passwords are not shown in the list or the status area
+
+- ✅ **Safe cleanup mechanism**
+  - On stop, openconnect is first allowed to log out normally, then the proxy / netns / routes are torn down
+  - Only the kernel forwarding switches this script turned on are restored; uninstall distinguishes "dependencies installed by this script" from "dependencies that were already there"
 
 ## 📦 System Requirements
 
-- **Operating System**: Debian/Ubuntu/CentOS/RHEL or other Linux distributions (**fully tested on Debian 12 only**; please verify on other distributions first)
-- **Permissions**: Root access required
+- **Operating System**: Debian/Ubuntu/CentOS/RHEL and other Linux distributions using **systemd** (**currently fully tested on Debian 12 only**; please verify other distributions yourself first)
+- **Permissions**: root privileges required
 - **Network**: Internet access required
-- **Dependencies**: Script will automatically detect and install necessary dependencies
+- **Dependencies**: The script automatically detects and installs the required dependencies
 
-### Auto-Installed Dependencies
+### Automatically Installed Dependencies
 
 - `openconnect` - OpenConnect VPN client
 - `ocproxy` - Required for ocproxy mode
 - `gost` - SOCKS5 server for Netns mode
 - `socat` - Port forwarding for Netns mode (**preferred**)
-- `iptables` - Port forwarding fallback (double NAT) and NAT rules
+- `iptables` - Fallback port forwarding (double NAT), netns egress NAT, kill switch
 - `iproute2` - Network configuration tools
-- `at` - schedules the 2-minute failsafe cleanup job at startup (if atd is not running the script says so honestly instead of pretending the job exists)
-- `curl` - public IP lookups and downloading the gost installer
-
-> The Netns **iptables double NAT** backend only supports an **IPv4 entry point**: kernel DNAT
-> cannot cross address families, so IPv6 clients such as `[::1]:port` cannot connect. Use the
-> **socat backend** (menu 3) when you need an IPv6 entry point.
+- `at` - 3-minute failsafe rollback on the first start in Default Mode
+- `curl` - Public IP lookup, downloading the gost install script
 
 ## 🚀 Quick Start
 
-### Method 1: One-Click Install (Recommended)
+### Method 1: One-Click Download and Run
 
 ```bash
-# Download and run directly
-bash <(curl -fsSL https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh)
+wget -O /root/oc_master.sh https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh
+chmod +x /root/oc_master.sh
+/root/oc_master.sh
 ```
 
-### Method 2: Manual Install
+> v8 is managed by systemd, so **the script must live in a fixed location** (e.g. `/root/oc_master.sh`) — the systemd unit remembers this path.
+> Do not run it directly with `bash <(curl …)`.
+> `oc_master_en.sh` is the English-UI build; `oc_master.sh` in the repo is the Chinese-UI build with identical functions and settings.
+
+### Method 2: Clone the Repository
 
 ```bash
-# Download script
-wget https://raw.githubusercontent.com/duya07/openconnect-master/main/oc_master_en.sh
-
-# Add execute permission
-chmod +x oc_master_en.sh
-
-# Run script
-./oc_master_en.sh
-```
-
-### Method 3: Clone Repository
-
-```bash
-# Clone repository
 git clone https://github.com/duya07/openconnect-master.git
 cd openconnect-master
-
-# Run script
 chmod +x oc_master_en.sh
 ./oc_master_en.sh
 ```
+
+The first run automatically creates the shortcut command `ocm`; after that, just type `ocm`.
 
 ## 📖 Documentation
 
-### First Run
+### First Run (Three Steps)
 
-1. After running the script, select `6) Manage VPN Accounts`
-2. Add your VPN account information:
-   - Display name (for easy identification)
-   - VPN username
-   - VPN password
-   - VPN server address
-   - Authentication group (optional)
+1. `6) Manage VPN Accounts` → add an account: display name, username, password, VPN server address, auth group (optional), protocol (optional)
+2. `5) Settings` → at least confirm **Running mode**, **VPN protocol** (must match the gateway) and **SOCKS5 port**
+3. `1) Start VPN` → check the summary, press Enter to start
 
-### Protocol Selection
+Command-line equivalent:
 
-When starting any mode, you are asked which protocol to use right after choosing an account. **It must match your VPN gateway type** — choosing the wrong one fails at the authentication stage (the script cannot tell which type of gateway yours is):
+```bash
+ocm config set PROTOCOL nc          # protocol: anyconnect / pulse / nc / gp / fortinet / array
+ocm config set MODE netns
+ocm config set SOCKS_PORT 8585
+ocm start
+```
 
-| Option | Value passed to `openconnect` | Applicable Gateways |
+After a successful start, the SOCKS5 address and the VPN egress IP are shown. To use it from your own computer (when listening on localhost only):
+
+```bash
+ssh -N -L 8585:127.0.0.1:8585 root@your-VPS
+# then set the browser / application proxy to SOCKS5 127.0.0.1:8585
+```
+
+### ⚙️ Settings Overview
+
+Settings are stored in `/etc/oc-master/settings.conf` (`600`). Every item has a detailed description in menu `5) Settings`; you can also view them with `ocm config list -v`.
+
+| Group | Item (KEY) | Values | Description |
+|---|---|---|---|
+| Connection | Running mode `MODE` | `netns` / `default` / `ocproxy` | See the mode table above |
+| Connection | VPN protocol `PROTOCOL` | `anyconnect` `pulse` `nc` `gp` `fortinet` `array` | Must match the gateway; column 6 of an account can override it |
+| Connection | Data channel `DATA_CHANNEL` | `dtls` / `tls` | `dtls`: data switches to UDP after ~1 minute, fast but less stable on lossy networks; `tls`: TLS/TCP throughout (`--no-dtls`), usually more stable on lossy networks |
+| Connection | Reconnect-on-outage duration `RECONNECT_TIMEOUT` | 60 / 300 / 900 seconds | How long openconnect keeps reconnecting by itself after a brief network outage; has no effect when the server terminates the session |
+| Connection | Tunnel MTU `MTU` | `auto` / 1400 / 1300 / … | Lower it when large files or certain sites stall |
+| Connection | Extra arguments `OC_EXTRA` | Free text | Appended verbatim to openconnect, e.g. `--useragent=…` |
+| Proxy | SOCKS5 port `SOCKS_PORT` | Number | netns / ocproxy modes |
+| Proxy | Listen scope `LISTEN` | `127.0.0.1` / `0.0.0.0` | Always set authentication when exposing it externally |
+| Proxy | SOCKS5 authentication `SOCKS_USER`/`SOCKS_PASS` | — | netns mode only |
+| Proxy | Port forwarder `FORWARDER` | `socat` / `iptables` | socat has an IPv4+IPv6 entry; iptables has an IPv4 entry only |
+| Security | Kill switch `KILL_SWITCH` | `off` / `on` | `on`: when the VPN is down the proxy simply fails and never falls back to the VPS egress (netns only) |
+| Network | DNS timeout policy `DNS_FAST` | `off` / `on` | `on`: when DNS inside the VPN drops packets, retry after 1 second and rotate servers, reducing "5-second stalls" (netns only) |
+| Network | Host IPv6 forwarding `IPV6_FORWARD` | `off` / `on` | Turn on only if you need IPv6 through the proxy |
+| Daemon | Auto-reconnect `AUTO_RECONNECT` | `on` / `off` | When off, a drop stops and cleans up |
+| Daemon | Reconnect backoff `BACKOFF` | e.g. `5 30 60 120 300 600 900` | Retry interval sequence for network-type failures |
+| Daemon | Max reconnects per hour `MAX_PER_HOUR` | Number | Prevents frantic retrying when something goes wrong |
+| Daemon | Auth-failure pause threshold `AUTH_FAIL_PAUSE` | Number | Pause after this many consecutive authentication failures (a failure on the very first start stops immediately) |
+| Daemon | Soft-reconnect wait `DEGRADED_WAIT` | 30 / 60 / 90 / 180 seconds | How long the process may be running while the proxy stays unreachable before a reconnect is triggered |
+| Daemon | Connect at boot `AUTOSTART` | `off` / `on` | Enables `ocm.service` to start at boot |
+| Logs | Diagnostic logs `WATCH` | `on` / `off` | `ocm-watch.service` |
+| Logs | Sampling interval `SAMPLE_INTERVAL` | 15 / 30 / 60 seconds | Automatically tightens to 5 seconds for 3 minutes after a state change |
+| Logs | Total log size cap `LOG_MAX_MB` | 100 / 300 / 1000 | The oldest rotated files are deleted when exceeded |
+| Logs | Extra probe URL `EXTRA_PROBE_URL` | URL | E.g. an on-campus resource entry point, to confirm it is reachable |
+
+### ⌨️ Command Line
+
+```text
+ocm                      Open the interactive menu
+ocm start [options]      Start with the saved settings; options affect this run only, add --save to make them the default
+    -a/--account N|name  -m/--mode netns|default|ocproxy  -p/--proto nc|pulse|anyconnect|…
+    -P/--port N  --listen 127.0.0.1|0.0.0.0  --tls-only|--dtls  --fwd socat|iptables
+    --kill-switch on|off  --dns fast|system  --mtu N|auto  --oc-args "…"  --save  -i
+ocm stop | restart [options] | status [-v]
+ocm log report [days] | log tail | log snapshot [label] | log mark <text>
+ocm heal on|off|status
+ocm config list [-v] | get KEY | set KEY VALUE
+ocm accounts
+ocm install-service | uninstall-service
+ocm -V | -h
+```
+
+Exit codes: `0` success, `1` failure, `2` usage error, `3` already running / state conflict.
+
+### 🔁 How Auto-Reconnect Works
+
+`ocm start` hands the session over to `ocm.service` (the supervisor). Each time openconnect exits, the supervisor determines the cause from the exit code and the output:
+
+| Verdict | Basis | Action |
 |---|---|---|
-| 1 | `anyconnect` | Cisco AnyConnect, ocserv (default) |
-| 2 | `pulse` | Pulse Secure / Ivanti Secure Access |
-| 3 | `nc` | Juniper Network Connect |
+| `server-terminated` | Output contains `Server terminated connection` / `Session terminated by server` | Reconnect after ~2 seconds (no backoff) |
+| `watch-request` | The diagnostic service found "process running but no connectivity" and requested a soft reconnect | Reconnect after ~2 seconds |
+| `auth` | Exit code 2 (cookie/authentication rejected) or login-failure wording | Counted; failure on the very first start or reaching the consecutive threshold → pause |
+| `session-confirm` | The server demands an interactive page, such as confirming an existing session | Retry with backoff |
+| `network` | Everything else (DNS, TCP, TLS failures, process crash, etc.) | Retry with `BACKOFF`, limited by `MAX_PER_HOUR` |
 
-### Mode Selection Guide
+> When openconnect receives a termination notice from the server (e.g. session expiry) it **exits immediately**; `--reconnect-timeout` does not cover this case — which is exactly why an external reconnect is needed.
+> Before reconnecting, the supervisor restores the netns default route and resolv.conf to the baseline, so it can reconnect even if openconnect was force-killed and never got to clean up.
 
-#### 🛡️ Default Mode
+### 📊 Diagnostic Logs and Reports
 
-**Use Cases**:
-- Global VPN proxy needed
-- All traffic through VPN
-- Access to internal network resources
+Log directory `/var/log/oc-master/`:
 
-**Features**:
-- All traffic through VPN
-- Automatic SSH connection protection
-- IPv4 and IPv6 support
+| File | Contents |
+|---|---|
+| `events.log` | Changes only: state transitions, supervisor events (start / exit cause / reconnect), key openconnect lines, manual marks |
+| `samples.log` | Periodic samples: process, tun, default route, SOCKS probe, in-tunnel ping, gateway TCP/ping, egress IP, TCP retransmits… |
+| `openconnect.log` | All openconnect output (sanitized) |
+| `incidents/` | An on-the-spot snapshot each time the normal state is left (routes, NAT, processes, kernel messages…) |
+| `launch/` | The full startup output of each `ocm start` |
 
-**Usage**:
+Everything is rotated by size and gzipped, the total is capped by `LOG_MAX_MB`, and writing samples is paused when free disk space drops below 400MB.
+
 ```bash
-# Select after running the script
-1) Start: 🛡️  Default Mode (Global VPN, protects SSH)
+ocm log report 7
 ```
 
-#### 🔌 ocproxy Mode
+Report example (excerpt):
 
-**Use Cases**:
-- Only need SOCKS5 proxy
-- No IPv6 support needed
-- Lightweight usage
+```text
+Session end timeline (time since auth when leaving UP; ≈2h = 1h55m–2h05m):
+  2026-01-01T19:34:13+0800  →DOWN      session length 2h00m      [≈2h!]   openconnect-gone(state-file-still-present)
+  2026-01-01T21:34:47+0800  →DOWN      session length 2h00m      [≈2h!]   openconnect-gone(state-file-still-present)
+  Non-manual endings 2, of which in the ≈2h window: 2
 
-**Features**:
-- Provides SOCKS5 proxy interface
-- IPv4 only
-- Listens on localhost 127.0.0.1 by default
-
-**Usage**:
-```bash
-# Select after running the script
-2) Start: 🔌 ocproxy Mode (SOCKS5, IPv4 only)
-# Enter listening port (e.g. 1080)
+Auto-reconnect: openconnect exited 2 times (server-terminated=2), ready again 2 times, soft-reconnect requests 0, paused or rate-limited 0
 ```
 
-#### 🌐 Netns Mode (Recommended)
-
-**Use Cases**:
-- Need completely isolated network environment
-- Need both IPv4 and IPv6 support
-- Seeking best stability and compatibility
-
-**Features**:
-- Complete isolation using Network Namespace
-- Does not affect host network
-- IPv4 and IPv6 dual-stack support
-- Access via SOCKS5 proxy
-- Option for local or remote listening
-- Two port-forwarding backends, one menu entry each: **3) Netns Mode (SOCKS5, socat forwarding)** and **4) Netns Mode (SOCKS5, iptables double NAT)**; the former is a process-level relay (recommended, and it also provides an IPv6 entry point when listening remotely), the latter uses kernel DNAT + SNAT (**IPv4 entry point only**)
-- Optional **SOCKS5 username/password**: asked at startup, empty means anonymous; once enabled the main menu shows the auth info
-
-**Usage**:
-```bash
-# Select after running the script
-3) Start: 🌐 Netns Mode (SOCKS5, socat forwarding)
-# For kernel forwarding choose 4) Start: 🌐 Netns Mode (SOCKS5, iptables double NAT, IPv4 entry)
-# Enter listening port (e.g. 8585)
-# Choose whether to allow remote connections
-```
+If the drops all fall at the same session length, it is the server's fixed session length, not a network problem.
 
 ### Account Configuration File Format
 
-Account information is stored in `/root/.vpn_accounts.env`, format:
+Account information is stored in `/root/.vpn_accounts.env`:
 
 ```
-DisplayName|Username|Password|VPNHost|AuthGroup(optional)
+DisplayName|Username|Password|VPNHost|AuthGroup(optional)|Protocol(optional)
 ```
 
 Example:
 ```
-Example Gateway A|user001|your_password|vpn.example.com|DefaultGroup
-Example Gateway B|user002|your_password|vpn2.example.com|
+ExampleGatewayA|user001|your_password|vpn.example.com|DefaultGroup
+ExampleGatewayB|user002|your_password|vpn2.example.com||nc
 ```
 
-See also [examples/vpn_accounts.example](examples/vpn_accounts.example)
+No field may contain `|`. See also [examples/vpn_accounts.example](examples/vpn_accounts.example).
 
 ### Scheduled Tasks
 
-#### Setup Daemon (Auto-Reconnect)
+Menu `7) Scheduled Start / Stop`: add `ocm start` or `ocm stop` with a cron expression.
+Reconnecting after drops is now handled by the systemd supervisor; **the old cron daemon task is no longer needed**.
+
+### Stopping the VPN
 
 ```bash
-# In script main menu select
-7) 🗓️  Cron / Daemon Jobs
-1) Set up daemon task (check every 5 mins, auto-reconnect)
-```
-
-This adds the line below to crontab (the inline `PATH=...` is written by the script: cron's
-default `PATH=/usr/bin:/bin` does not contain openconnect or gost, so without it the task
-would fail with "command not found"):
-
-```cron
-*/5 * * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /path/to/oc_master_en.sh _internal_check_health
-```
-
-⚠️ **Note**: In **Default** and **ocproxy** modes the daemon reconnects automatically after a drop; **Netns mode does not auto-reconnect** - when it detects that the tunnel is really gone (criterion: the egress seen inside the netns equals the host egress) it stops and cleans up so the status honestly reads "stopped", leaving the reconnect decision to you
-
-#### Setup Scheduled Shutdown
-
-```bash
-# Example: Automatically shutdown VPN at 2 AM daily
-7) 🗓️  Cron / Daemon Jobs
-2) Add a scheduled stop task
-# Enter: 0 2 * * *
-```
-
-### Stop VPN
-
-```bash
-# Method 1: In script menu
-5) Stop VPN
-
-# Method 2: Direct command line
-./oc_master_en.sh stop
-
-# Method 3: After installing the shortcut command
-ocm stop
+ocm stop            # or menu 3
 ```
 
 ### Uninstall
 
-Select `10) 🗑️ Uninstall` in the main menu. It will, in order:
+Menu `10) 🗑️ Uninstall`: stop the VPN and clean up → remove the systemd units → ask whether to delete the settings and diagnostic logs → remove this script's crontab entries (backed up first to `/root/.oc_master-crontab.bak`) → ask about each dependency individually → delete the account file, the shortcut command and the script itself.
 
-1. Stop the VPN and clean up netns / veth / iptables rules / policy routes / `/etc/netns/<name>/`; if it turned a kernel forwarding switch from 0 to 1, that is restored to 0
-2. Remove every crontab entry this script added (the previous crontab is backed up to `/root/.oc_master-crontab.bak` first)
-3. Ask about dependencies: `gost` / `socat` are asked about individually, distinguishing "installed by this script" (default: remove) from "already on the machine" (default: keep); `openconnect` and `ocproxy` get a **single combined question** and are **kept by default** (they are common packages other programs may use)
-4. Delete the account file `/root/.vpn_accounts.env`, the dependency marker directory `/var/lib/oc-master` and the `/usr/local/bin/ocm` shortcut
-5. Delete the script itself
-
-> ⚠️ Steps 4 and 5 cannot be undone - the account file (with plain-text passwords) and the
-> script itself are gone. Back them up first if you need them.
-
-### ocm Shortcut Command
-
-The script makes sure the shortcut exists on every start (it does not take up a menu entry): if `/usr/local/bin/ocm` is absent, or is a dangling link that used to point at this script, it creates a symlink to the script so you no longer have to remember the path:
-
-```bash
-ocm          # open the main menu
-ocm stop     # stop the VPN
-```
-
-- It only takes over a link that already points at this script; if that path is occupied by another real file, it refuses to overwrite and tells you.
-- If the script itself has no execute permission, it is added automatically (otherwise the symlink could not be run).
-- The shortcut command is removed along with the script when you uninstall.
+> ⚠️ The account file (with plain-text passwords) and the script itself will be deleted; back them up yourself first if you want to keep them.
 
 ### IPv6 Connectivity Test
 
-For Netns mode, you can test IPv6 connectivity:
+While Netns mode is running, choose menu `9) 🧪 Test Netns IPv6 Connectivity`: checks for a global IPv6 address, pings Google's IPv6 DNS, and tests HTTP access over IPv6.
 
-```bash
-# In script main menu select
-9) 🧪 Test Netns IPv6 Connectivity
-```
+<a id="upgrade"></a>
 
-Test items include:
-1. ✓ Check global IPv6 address in Netns
-2. ✓ Ping Google IPv6 DNS (2001:4860:4860::8888)
-3. ✓ HTTP IPv6 connection test
+## ⬆️ Upgrading from v7
+
+1. Stop the VPN with the old version first (or run `ocm stop` directly after upgrading; v8 cleans up sessions started by the old version)
+2. Overwrite the original file with the new script (the path the `ocm` shortcut points to stays the same)
+3. `ocm` → `5) Settings`: confirm the mode, protocol and port (what v7 asked on every start is now saved in the settings)
+4. If you configured the old daemon task (`_internal_check_health`), remove it with option `3` in menu `7`; it has been replaced by systemd auto-reconnect
+5. `ocm start`
+
+Behavior change: netns mode **no longer** turns on the host's `net.ipv6.conf.all.forwarding` by default (set `IPV6_FORWARD=on` if you need it).
 
 ## 🔧 Advanced Configuration
 
-### Custom Configuration Parameters
-
-Key configuration variables in the script (modify as needed):
+### File Locations
 
 ```bash
-# Network Namespace Configuration
-NETNS_NAME="ocm_vpn_space"
-VETH_HOST="veth_ocm_h"
-VETH_NS="veth_ocm_ns"
-VETH_HOST_IP="192.168.200.1"
-VETH_NS_IP="192.168.200.2"
+/etc/oc-master/settings.conf          # settings (600)
+/root/.vpn_accounts.env               # accounts (600, plain text)
+/var/log/oc-master/                   # diagnostic logs
+/run/oc-master/                       # runtime (stage, settings in effect for this run)
+/etc/systemd/system/ocm.service       # supervisor
+/etc/systemd/system/ocm-watch.service # diagnostic logs
+/var/run/oc_manager.state             # current session state (v7-compatible format)
+/var/lib/oc-master/                   # dependency markers, diagnostic service state
+```
 
-# Routing Table IDs
-RT4_ID=100  # IPv4 routing table
-RT6_ID=101  # IPv6 routing table
+Network constants in the script (edit the top of the script directly if you need to change them):
 
-# File Locations
-PID_FILE="/var/run/oc_manager.pid"
-GOST_PID_FILE="/var/run/oc_gost.pid"
-SOCAT_PID_FILE="/var/run/oc_socat.pid"           # the .v6 sibling holds the IPv6 socat PID
-STATE_FILE="/var/run/oc_manager.state"
-SYSCTL_STATE_FILE="/var/run/oc_manager.sysctl"   # netns mode: records the forwarding switch originals
-ACCOUNTS_FILE="/root/.vpn_accounts.env"
-SHORTCUT_PATH="/usr/local/bin/ocm"
-DEPS_STATE_DIR="/var/lib/oc-master"              # records which dependencies this script installed
+```bash
+NETNS_NAME="ocm_vpn_space"; VETH_HOST="veth_ocm_h"; VETH_NS="veth_ocm_ns"
+VETH_HOST_IP="192.168.200.1"; VETH_NS_IP="192.168.200.2"
+RT4_ID=100; RT6_ID=101          # Default Mode SSH protection routing tables
+OC_TUN_DEFAULT="ocmtun0"        # tunnel interface name in Default Mode
 ```
 
 ### Manual Debug Commands
 
 ```bash
-# View Network Namespaces
-ip netns list
-
-# View network configuration inside Netns
-ip netns exec ocm_vpn_space ip addr
-ip netns exec ocm_vpn_space ip route
-
-# Test connection inside Netns
-ip netns exec ocm_vpn_space ping 8.8.8.8
+ocm status -v                                   # running status + latest sample
+journalctl -u ocm -n 100                        # supervisor output
+ocm log tail                                    # live events + openconnect output
+ip netns exec ocm_vpn_space ip route            # routes inside the netns
 ip netns exec ocm_vpn_space curl https://api.ipify.org
-
-# View SOCKS5 listening ports
-ss -tlnp | grep socat                                  # the socat backend listens on the host
-ip netns exec ocm_vpn_space ss -lntp                   # gost listens inside the netns (invisible on the host)
-iptables -t nat -S | grep DNAT                         # the iptables double NAT backend has no listener, only rules
-
-# View OpenConnect process
-ps aux | grep openconnect
+ss -tlnp | grep socat                           # the socat backend listens on the host
+ip netns exec ocm_vpn_space ss -lntp            # gost listens inside the netns
 ```
 
 ## 🐛 Troubleshooting
 
-### Common Issues
-
 1. **VPN Connection Failed**
-   - Check if account information is correct
-   - Verify VPN server address is accessible
-   - Check OpenConnect logs
+   - Check the stage with `ocm status -v`; the full startup output is in `/var/log/oc-master/launch/`
+   - Stage shows `failed:auth`: wrong or rejected username/password; after verifying, run `ocm start` again (auto-reconnect has been paused to keep the account from being locked)
+   - Check that the protocol matches the gateway (Settings → VPN protocol)
 
-2. **SOCKS5 Proxy Not Working** (Netns Mode)
-   - Test network connectivity in Netns: `ip netns exec ocm_vpn_space ping 8.8.8.8`
-   - Check if gost process is running: `ps aux | grep gost`
-   - Check port forwarding: `ss -tlnp | grep socat` (socat backend) or `iptables -t nat -S | grep DNAT` (iptables double NAT backend, which has no listener process)
+2. **Drops at a fixed interval**
+   - Check the "session end timeline" in `ocm log report 7`. If the drops all fall at the same session length, it is usually the server's session limit, which the client cannot extend; auto-reconnect will reconnect within a few seconds
 
-3. **IPv6 Not Working**
-   - Confirm VPN server supports IPv6
-   - Use Netns mode (Default and ocproxy modes have limited IPv6 support)
-   - Run IPv6 connectivity test (menu option 9)
+3. **SOCKS5 proxy works intermittently** (Netns Mode)
+   - Look at "brief in-session failures" in the report and the `tping` (in-tunnel packet loss) and `socks` fields in the samples
+   - On lossy networks try `DATA_CHANNEL=tls`; for "5-second stalls" caused by DNS packet loss inside the VPN try `DNS_FAST=on`
 
 4. **SSH Connection Interrupted** (Default Mode)
-   - Script automatically protects SSH connections
-   - If still interrupted, check policy routing configuration
+   - The script automatically protects SSH connections; if success is not confirmed within 3 minutes of the first start, it rolls back automatically
 
 ## 📊 Version History
+
+### v8.0.0 (2026-11-12)
+
+- ✨ **New**: systemd management (`ocm.service`). openconnect now runs in the foreground and reconnects automatically by exit cause (server termination / network error / authentication failure handled separately); the netns and proxy stay in place during reconnects; closing SSH no longer affects the VPN
+- ✨ **New**: built-in long-term diagnostic logs (`ocm-watch.service`): samples, events, incident snapshots at drops, `ocm log report` (session end timeline, auto-reconnect statistics); proactive soft reconnect on "process running but no connectivity"
+- ✨ **New**: ⚙️ settings menu and `/etc/oc-master/settings.conf`, with a description and options for every parameter; a summary is shown before starting, and changes can apply to this run only
+- ✨ **New**: command-line interface `ocm -h` (start / stop / restart / status / log / heal / config / accounts)
+- ✨ **New**: data channel selection (`--no-dtls`), MTU, reconnect-on-outage duration, extra arguments, kill switch, fast DNS retry, connect at boot
+- ✨ **New**: column 6 of an account can specify the protocol; GlobalProtect / Fortinet / Array added as protocol options
+- 🔧 **Fix**: after openconnect was force-killed, the netns default route and resolv.conf were not restored, so reconnecting failed — the network baseline is now restored before reconnecting
+- 🔧 **Change**: netns mode no longer turns on host-wide IPv6 forwarding by default; the VPN password is no longer `export`ed into child process environments; the account list and status area no longer show plain-text passwords; the main menu status area no longer makes network requests and opens instantly
+- 🔧 **Change**: the old cron daemon task is replaced by systemd auto-reconnect (old entries only print a notice when they run and take no action)
+- 📝 **Research references**: openconnect source (exit codes and server termination reasons), wazum/openconnect-proxy (foreground run + retry loop), telekom-mms/oc-daemon, f3flight/openconnect-ns (systemd management)
 
 ### v7.7.7 (2025-10-25) - Final
 
@@ -384,36 +353,36 @@ ps aux | grep openconnect
 
 **Follow-up fixes (still v7.7.7)**
 
-- 🔧 **Fix**: Netns mode intermittently reported a startup failure right after "TUN interface is ready" - under `set -o pipefail`, `grep -q` exits early and `ip` dies from SIGPIPE, so a successful match was treated as a failure (measured ~17% of runs)
-- ✨ **New**: Netns mode gained an **iptables double NAT** port-forwarding backend (DNAT into the netns + SNAT rewriting the source to the veth address). With DNAT alone all four access paths failed (gost replies never leave the netns); it now has its own menu entry (menu 4, IPv4 entry point only) and `OCM_FORWARDER=iptables` still overrides once
-- 🔧 **Improved**: port forwarding is now a pluggable backend module (`_fwd_setup_<name>` / `_fwd_teardown_<name>`; the main flow only calls `_fwd_avail` / `_fwd_setup` / `_fwd_teardown`), so a new scheme touches only the module area
-- 🔧 **Fix**: now that each backend has its own menu entry, picking socat in menu 3 and failing to install it refuses to start (it no longer switches backends silently); use menu 4 for the kernel path
-- 🔧 **Fix**: with a `0.0.0.0` bind, reaching the port through the host's own LAN address failed - locally generated traffic never traverses PREROUTING, so the OUTPUT chain now matches it too
-- 🔧 **Fix**: Uninstalling gost used `--remove`, which the official script does not support - it actually opened the interactive "pick a version" installer and aborted the uninstall; it now deletes the binary directly
-- 🔧 **Fix**: Deleting a VPN account left the account file with mode 644 instead of 600
-- 🔧 **Fix**: Stopping Netns mode left openconnect running for a long time (its logout path was torn down first, and the leftover process fought the next connection)
-- 🔧 **Fix**: A failed start did not cancel the failsafe rollback job, which killed the connection the user had re-established 2 minutes later
-- ✨ **New**: Menu 8 now scans dependency status and marks "installed by this script" vs "pre-existing"; on uninstall the latter is kept by default with a warning, so packages used elsewhere are not removed by accident
-- 🔧 **Fix**: `cleanup_netns` never removed `/etc/netns/<name>/`, so every Netns run left a directory behind on the system (still there after uninstalling the script)
-- 🔧 **Fix**: A wrong key or a bare Enter at the main menu quit the whole program - the trailing `[[ ]] && read` in `main_menu` returns 1, and "a function whose last statement returns non-zero" makes `set -e` terminate the script; it now returns explicitly and exits cleanly when stdin ends (otherwise it would spin on the menu)
-- 🔧 **Fix**: The account and cron submenus reused the main menu's option variable (no `local`), so the "press any key" decision after returning used the submenu's value - after choosing 5/6 that produced a spurious extra "press any key to return to the main menu" that also swallowed the next input character
-- 🔧 **Fix**: `stop` aborted halfway when the state file existed but lacked `MODE=`/`VPS4=`/`VPS6=` (the assignment is the last command of an `[ -f ] && ...` list, and `grep` returning 1 made `set -e` end the whole stop path: no process killed, no temp file removed, no safety-net job cancelled)
-- 🔧 **Fix**: Account deletion now removes exactly the row at the given index of the filtered list. The old `grep -vF ... && mv` printed "Deleted" without changing the file when the last entry was removed (`grep` produced no output, returned 1, so `mv` never ran) and also removed two identical accounts at once
-- 🔧 **Fix**: In the Netns stop path, a failing `eval iptables -D` (rule already removed elsewhere) aborted the whole stop flow via `set -e`, leaving processes and the netns behind
-- 🔧 **Fix**: After a failed start, `stop_vpn` took the "not running" early exit and left the state file plus the policy routes (ip rule) behind; machines with the health cron installed would retry the bad account every 5 minutes
-- 🔧 **Fix**: The ocproxy health reconnect never worked under cron - the reconnect logic starts with an interactive port prompt, and without a terminal `read` hits EOF and `set -e` kills the flow instantly. Reconnects now reuse the port saved in the state file; also removed the dead link to the deleted docs/FAQ.md
-- ✨ **New**: Netns mode is split into two menu entries by forwarding backend - `3) Netns Mode (SOCKS5, socat forwarding)` and `4) Netns Mode (SOCKS5, iptables double NAT)`. Pick one directly; there is no separate "preference" step any more. If socat was chosen but cannot be installed, startup is refused instead of silently falling back; `OCM_FORWARDER` still overrides once for scripted calls
-- ✨ **New**: Netns mode supports an optional **SOCKS5 username/password**, asked at startup (empty means anonymous); gost is started as `socks5://user:pass@host:port`. Both fields reject `/` quotes backslash and blanks (they break gost's URL parsing; `@` and `:` were measured to work and are now allowed); the state file is written with `%q` escaping and tightened to 600; the main menu shows the listening address and the auth info on the SOCKS line
-- ✨ **New**: The daemon (menu 7, option 1) no longer does nothing for Netns mode. It used to print "does not support auto-reconnect yet" and skip - but once the tunnel drops while the interfaces and state file remain, gost falls back to the host egress and the menu says "running" while nothing goes through the VPN. A definite failure (same criterion as the startup check: the netns egress already equals the host egress) now triggers a stop and cleanup, so the status honestly becomes "stopped" and the user reconnects; auto-reconnect is still not attempted
-- 🔧 **Fix**: **Netns mode occasionally reported "running" while nothing went through the VPN** (gost egressed through the machine's own public IP). The criterion is now "the egress seen inside the netns differs from the host egress", waiting up to ~50s and treating startup as failed with a rollback when it never does. Two earlier criteria were measured and rejected: (1) "ping works" - while the netns default route has not been taken over, ping still succeeds via veth -> host -> NAT; a netns with no VPN at all pinged fine and egressed through the host IP; (2) "default route points at tun" - openconnect creates tun0 and installs the route before the tunnel is negotiated, and removes tun0 again when the connection drops; that criterion held ("waited 0s") while traffic had already fallen back to the veth
-- 🔧 **Fix**: **The iptables double NAT backend did not forward at all on some machines.** After the OUTPUT DNAT, host-generated traffic still carries `127.0.0.1` as its source; netfilter then re-routes the packet (`ip_route_me_harder`) and the kernel consults `route_localnet` to decide whether `127.0.0.0/8` may leave through that interface. The default `0` means it may not, so the packet is dropped as a martian and never reaches POSTROUTING (measured: the DNAT counter keeps climbing, the SNAT counter stays at 0, tcpdump on the veth sees nothing). It "worked" on the original test host only because that machine had the global `all=1` (the kernel uses `IN_DEV_ORCONF`, i.e. `all` OR the interface value). Startup now sets `route_localnet=1` on `veth_ocm_h` only - the script's own interface - and leaves the global `all` alone
-- 🔧 **Fix**: In `_fwd_setup_iptables`, `dst` and `socks_port` were assigned in the same `local` statement, so the port never took effect (it only worked because bash's dynamic scope happened to find a variable of that name in the caller); split into two `local` statements
+- 🔧 **Fix**: Netns mode intermittently reported a startup failure right after "TUN is ready" — under `set -o pipefail`, `grep -q` exits early and `ip` gets SIGPIPE, so a successful match was treated as a failure (measured non-zero rate ~17%)
+- ✨ **New**: Netns mode gained an **iptables double NAT** port-forwarding backend (DNAT into the netns + SNAT rewriting the source to the veth address). With DNAT alone, all four access paths failed (gost's reply source is not on the directly connected veth subnet, so replies cannot leave the netns); it is now a separate entry in menu 4 (IPv4 entry only), and `OCM_FORWARDER=iptables` can also override it once
+- 🔧 **Improved**: port forwarding is now a pluggable backend module (`_fwd_setup_<name>` / `_fwd_teardown_<name>`; the main flow only calls `_fwd_avail` / `_fwd_setup` / `_fwd_teardown`), so adding a forwarding scheme later only touches the module area, not the main flow
+- 🔧 **Fix**: now that the forwarding backends are separate menu items, choosing socat in menu 3 when socat cannot be installed explicitly refuses to start (it no longer silently switches to another backend); use menu 4 for kernel forwarding
+- 🔧 **Fix**: with a `0.0.0.0` bind, access from the host itself via its LAN IP failed — locally generated traffic does not pass through PREROUTING, so the OUTPUT chain now allows it too
+- 🔧 **Fix**: uninstalling gost called `--remove`, which the official script does not have at all; it actually popped up the "choose version" install menu and aborted the uninstall; it now deletes the binary directly
+- 🔧 **Fix**: deleting a VPN account changed the account file permissions from 600 to 644
+- 🔧 **Fix**: when stopping Netns mode, openconnect took a long time to exit (its logout path was torn down too early, and the leftover process would fight the next connection)
+- 🔧 **Fix**: a failed start did not cancel the failsafe rollback job, which 2 minutes later would wrongly kill the connection the user had re-established
+- ✨ **New**: menu 8 now first scans dependency status and marks "installed by this script / installed by you"; on uninstall it warns about the latter and keeps them by default, to avoid removing packages that have other uses
+- 🔧 **Fix**: `cleanup_netns` did not clean up `/etc/netns/<name>/`, so every Netns mode run left a directory on the system (still present after uninstalling the script)
+- 🔧 **Fix**: a wrong key or a bare Enter at the main menu quit the whole program — the trailing `[[ ]] && read` in `main_menu` returns 1, and "the last statement of a function returning non-zero" is treated by `set -e` as an error that ends the script; it now explicitly does `return 0` and exits cleanly when standard input ends (otherwise it would spin redrawing the menu)
+- 🔧 **Fix**: the account / scheduled-task submenus reused the main menu's option variable (not `local`), so after returning, the "press any key needed?" check used the submenu's choice — showing up as a spurious extra "press any key to return to the main menu" after choosing 5/6, which also swallowed the next input
+- 🔧 **Fix**: `stop` aborted halfway when the state file existed but lacked the `MODE=`/`VPS4=`/`VPS6=` keys (the assignment is the last command of `[ -f ] && …`, and `grep` returning 1 makes `set -e` end the whole stop flow: process not killed, temp files not deleted, failsafe job not cancelled)
+- 🔧 **Fix**: account deletion now removes exactly one row by "index in the filtered list". Previously `grep -vF … && mv`, when deleting the last entry, had `grep` produce no output and return 1, so `mv` did not run — the file was left untouched yet "deleted" was still printed, and a `.tmp` was left behind; two accounts with identical content would also be deleted together
+- 🔧 **Fix**: when stopping Netns, a failing `eval iptables -D` in the iptables cleanup branch (rule already removed externally) was interrupted by `set -e`, ending the whole stop flow so processes and the netns were no longer cleaned up
+- 🔧 **Fix**: after a failed start, `stop_vpn` exited early due to "no pid file", leaving the state file and the configured policy routes (ip rule) behind; machines with the daemon task installed would retry the failed account every 5 minutes
+- 🔧 **Fix**: the ocproxy mode daemon reconnect was completely unusable under cron — the first step of the reconnect logic is an interactive port prompt, and without a terminal `read` hits EOF immediately and is terminated by `set -e`. The daemon reconnect now reuses the port saved in the state file; removed the dead link to the deleted docs/FAQ.md
+- ✨ **New**: Netns mode is split into two start entries by forwarding backend — `3) Netns Mode (socat forwarding)` and `4) Netns Mode (iptables double NAT)` — chosen directly, without first switching a "preference". If socat is chosen but cannot be installed, startup is explicitly refused rather than silently downgraded; the `OCM_FORWARDER` environment variable can still override once, for scripted calls
+- ✨ **New**: Netns mode supports an optional **SOCKS5 username/password**. It is asked at startup (leave empty for anonymous), and gost is started as `socks5://user:pass@host:port`; the username/password reject `/`, quotes, backslash and whitespace (these break gost's URL parsing; `@` and `:` were measured to work and are now allowed); the state file is written with `%q` escaping and tightened to 600; the main menu shows the listening address and auth info on the SOCKS line
+- ✨ **New**: the daemon task (menu 7, option 1) no longer "does nothing" for Netns mode. Previously on a drop it only printed "auto-reconnect not supported yet" and skipped, yet after the tunnel went down the interfaces and state remained, and gost fell back to the host egress — the main menu showed "running" while nothing went through the VPN. Now when unavailability is definitely detected (same criterion as the startup check: the actual egress inside the netns already equals the host egress) it stops and cleans up, so the status honestly becomes "stopped" and the user reconnects manually; it still does not auto-reconnect
+- 🔧 **Fix**: **Netns mode occasionally "connected but not going through the VPN"** (gost actually egressed with the host's public IP). The criterion is now "the actual egress seen inside the netns ≠ the host egress", waiting up to ~50 seconds; if it never holds, startup is judged failed and rolled back (stop + cancel the failsafe job). Two insufficiently reliable criteria were ruled out along the way: ① `ping works` — when the netns has not taken over the default route, ping still works via veth→host→NAT; measured: a netns with no VPN connected pinged fine and its egress was exactly the host IP; ② `default route points at tun` — openconnect first creates tun0 and configures routes, and only then completes tunnel negotiation, and a connection interrupted midway deletes tun0 again; measured: this criterion held ("waited 0 seconds" passed) while the netns had already fallen back to the veth
+- 🔧 **Fix**: **the iptables double NAT backend did not forward at all on some machines**. After OUTPUT DNAT, locally generated traffic still has source address `127.0.0.1`; netfilter then re-routes it (`ip_route_me_harder`), and the kernel uses `route_localnet` to decide whether `127.0.0.0/8` may leave through that interface — the default `0` means no, so the packet is dropped as a martian and never even reaches POSTROUTING (measured: the DNAT counter kept rising, the SNAT counter stayed at 0, nothing was captured on the veth). It "worked" on the test machine before only because that machine had the global `all=1` (the kernel uses `IN_DEV_ORCONF`, ORing `all` with the interface value) — an environmental coincidence. Startup now sets `route_localnet` to 1 on `veth_ocm_h`, opening only the interface the script itself created, without touching the global `all`
+- 🔧 **Fix**: in `_fwd_setup_iptables`, `dst` and `socks_port` were declared in the same `local` statement, so the port got no value (it only worked by luck because bash's dynamic scoping picked up the caller's variable of the same name); split into two `local` statements
 
 ### v7.7.6 (2025-01-10)
 
-- 🔧 **Fix**: Adopted correct architecture of "service built-in (gost in netns), port external (socat/DNAT)"
-- ✨ **New**: Prioritize socat for port forwarding, with iptables DNAT as backup
-- 🔧 **Enhancement**: Added checks for tun interface and internal network connectivity
+- 🔧 **Fix**: Adopted the correct architecture of "service built in (gost in netns), port attached outside (socat/DNAT)"
+- ✨ **New**: Prefer socat for port forwarding, with iptables DNAT as a fallback
+- 🔧 **Enhancement**: Added checks for the tun interface and internal network connectivity
 
 ### v7.7.5 (Earlier)
 
@@ -431,17 +400,18 @@ Issues and Pull Requests are welcome!
 - Maintain consistent code style
 - Add necessary comments
 - Update related documentation
-- Test all three modes
+- Test all three modes (at least netns), and run `bash -n` and shellcheck once
 
 ## 📄 License
 
-This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
 
 ## 🙏 Acknowledgments
 
 - [OpenConnect](https://www.infradead.org/openconnect/)
 - [GOST](https://github.com/go-gost/gost)
 - [ocproxy](https://github.com/cernekee/ocproxy)
+- Design references: [openconnect-proxy](https://github.com/wazum/openconnect-proxy), [oc-daemon](https://github.com/telekom-mms/oc-daemon), [openconnect-ns](https://github.com/f3flight/openconnect-ns)
 - All users who use and provide feedback
 
 ---

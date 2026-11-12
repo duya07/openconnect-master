@@ -1,32 +1,30 @@
-# OpenConnect VPN 账户配置示例
-# 
+# OpenConnect VPN 账户配置示例（复制为 /root/.vpn_accounts.env 并 chmod 600）
+#
 # 格式说明:
-# 显示名|用户名|密码|VPN主机|认证组(可选)
+# 显示名|用户名|密码|VPN主机|认证组(可选)|协议(可选)
 #
 # 字段说明:
 # - 显示名: 方便识别的名称，可以使用中文
 # - 用户名: VPN 登录用户名
 # - 密码: VPN 登录密码
-# - VPN主机: VPN 服务器地址（域名或 IP）
-# - 认证组: VPN 认证组（可选，部分 VPN 需要）
+# - VPN主机: VPN 服务器地址（域名、IP 或 https:// 开头的 URL）
+# - 认证组: VPN 认证组 / realm（可选，部分 VPN 需要）
+# - 协议: anyconnect / pulse / nc / gp / fortinet / array（可选；留空则用设置里的全局协议）
 #
 # 注意:
 # - 以 # 开头的行为注释
-# - 密码中如果包含 | 符号，请使用转义或更换密码
-# - 此文件包含敏感信息，请妥善保管
-# - 建议设置文件权限: chmod 600 /root/.vpn_accounts.env
+# - 任何字段都不能包含 | 符号（会被当成分隔符）
+# - 此文件包含明文密码，请妥善保管: chmod 600 /root/.vpn_accounts.env
+# - 推荐用脚本菜单「管理 VPN 账户」添加，脚本会自动校验并收紧权限
 
-# 示例1: 不需要认证组
+# 示例1: 不需要认证组，使用全局协议
 示例网关A|user001|your_password123|vpn.example.com|
 
 # 示例2: 需要认证组
 示例网关B|user002|YourPass456|vpn2.example.com|DefaultGroup
 
-# 示例3: 使用域名
-示例网关C|user003|YourPass789|my-vpn.example.com|
+# 示例3: Juniper / Pulse 类网关，单独指定协议
+示例网关C|user003|YourPass789|https://vpn3.example.edu|Users|nc
 
 # 示例4: 使用 IP 地址
-示例网关D|user004|YourPass000|192.168.1.100|GroupA
-
-# 您的账户（请修改以下信息）
-# 示例网关|your_username|your_password|vpn.example.com|认证组(可选)
+示例网关D|user004|YourPass000|203.0.113.10|GroupA
