@@ -4,7 +4,7 @@
 
 **[English](README_EN.md) | 简体中文**
 
-![Version](https://img.shields.io/badge/version-8.0.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.1.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
@@ -45,7 +45,7 @@
 - ✅ **⚙️ 设置菜单 + 命令行**（v8 新增）
   - 每个可调参数都在菜单里列出：当前值、作用、可选项与代价，不用读源码猜默认值
   - 启动前显示设置摘要：直接启动 / 改设置并保存 / 只改本次
-  - `ocm -h`：`start / stop / restart / status / log / heal / config / accounts`，可脚本化
+  - `ocm -h`：`start / stop / restart / status / log / heal / config / accounts / proxy`，可脚本化
 
 - ✅ **智能策略路由**（默认模式）
   - 自动保护 SSH 连接不受全局 VPN 影响，支持 IPv4 和 IPv6
@@ -55,6 +55,7 @@
   - 完全独立的网络环境，通过 SOCKS5 代理访问（可选用户名/密码）
   - 两种端口转发后端：socat（IPv4+IPv6 入口）/ iptables 双 NAT（仅 IPv4 入口）
   - 可选**断线保护**：VPN 不通时代理直接失败，流量绝不从 VPS 自己的出口出去
+  - 或者**回落代理**（v8.1 新增）：VPN 不通时新连接自动改走你指定的备用代理（socks5 / http / https / ss 等），VPN 恢复后自动切回，回落期间的连接不断
 
 - ✅ **多账户管理**
   - 账户信息以**明文**保存在 `/root/.vpn_accounts.env`（权限收紧为 `600`，仅 root 可读；请自行按需保护）
@@ -146,7 +147,8 @@ ssh -N -L 8585:127.0.0.1:8585 root@你的VPS
 | 代理 | 监听范围 `LISTEN` | `127.0.0.1` / `0.0.0.0` | 对外开放时务必设置认证 |
 | 代理 | SOCKS5 认证 `SOCKS_USER`/`SOCKS_PASS` | — | 仅 netns 模式 |
 | 代理 | 端口转发方式 `FORWARDER` | `socat` / `iptables` | socat 有 IPv4+IPv6 入口；iptables 仅 IPv4 入口 |
-| 安全 | 断线保护 `KILL_SWITCH` | `off` / `on` | `on`：VPN 不通时代理直接失败，绝不改走 VPS 出口（仅 netns） |
+| 安全 | 断线保护 `KILL_SWITCH` | `off` / `on` / `proxy` | `on`：VPN 不通时代理直接失败，绝不改走 VPS 出口；`proxy`：改走[回落代理](#fallback-proxy)，都不通则同 `on`（仅 netns） |
+| 安全 | 回落代理选择 `FALLBACK_PROXY` | `auto` / 显示名 | `auto`：按列表顺序用第一个能连上的；显示名：只用它 |
 | 网络 | DNS 超时策略 `DNS_FAST` | `off` / `on` | `on`：VPN 内 DNS 丢包后 1 秒重试并轮换服务器，减少「卡 5 秒」（仅 netns） |
 | 网络 | 宿主 IPv6 转发 `IPV6_FORWARD` | `off` / `on` | 只有需要经代理走 IPv6 时才开 |
 | 守护 | 自动重连 `AUTO_RECONNECT` | `on` / `off` | 关闭后掉线即停止并清理 |
@@ -167,12 +169,13 @@ ocm                      打开交互菜单
 ocm start [选项]         按保存的设置启动；选项只影响本次，加 --save 保存为默认
     -a/--account N|名称  -m/--mode netns|default|ocproxy  -p/--proto nc|pulse|anyconnect|…
     -P/--port N  --listen 127.0.0.1|0.0.0.0  --tls-only|--dtls  --fwd socat|iptables
-    --kill-switch on|off  --dns fast|system  --mtu N|auto  --oc-args "…"  --save  -i
+    --kill-switch on|off|proxy  --fallback 名称|auto  --dns fast|system  --mtu N|auto  --oc-args "…"  --save  -i
 ocm stop | restart [选项] | status [-v]
 ocm log report [天数] | log tail | log snapshot [标签] | log mark <文字>
 ocm heal on|off|status
 ocm config list [-v] | get KEY | set KEY VALUE
 ocm accounts
+ocm proxy list | add ['一行'] | del 序号|名称 | test [序号|名称] | format
 ocm install-service | uninstall-service
 ocm -V | -h
 ```
@@ -241,6 +244,55 @@ ocm log report 7
 
 任何字段都不能包含 `|`。也可以参考 [examples/vpn_accounts.example](examples/vpn_accounts.example)。
 
+<a id="fallback-proxy"></a>
+
+### 🛟 回落代理（断线保护的备用出口）
+
+把「断线保护」设为 `proxy` 后，VPN 掉线 / 重连期间，SOCKS5 代理的**新连接**自动改走你指定的代理；VPN 一恢复，新连接马上切回 VPN。回落期间已经建立的连接不会因为切回而中断。
+代理都连不上时与 `on` 相同：直接失败，**绝不**改走 VPS 自己的出口。仅 netns 模式。
+
+```bash
+ocm proxy add                     # 逐项提问添加（密码不回显）；也可在主菜单 11「管理回落代理」
+ocm proxy test                    # 从本机经每个代理访问一次，显示出口 IP
+ocm config set KILL_SWITCH proxy  # 然后 ocm restart 生效
+```
+
+代理列表在 `/etc/oc-master/proxies.conf`（`600`，含明文密码），每行一个，两种写法任选，文件头自带完整说明（`ocm proxy format` 随时查看，或参考 [examples/proxies.example](examples/proxies.example)）：
+
+```text
+# 写法一：竖线分列（推荐）。用户名、密码里有 @ : / % 等字符直接照写，不用转义
+显示名|类型|地址|端口|用户名(可选)|密码(可选)
+香港备用|socks5|203.0.113.20|1080|user|p@ss:word
+日本SS|ss|203.0.113.30|8388|aes-256-gcm|ss-password
+
+# 写法二：URL（第 2 列含 :// 即按 URL 读取；特殊字符按 URL 规则编码，@ → %40）
+显示名|类型://用户名:密码@地址:端口[?参数]
+TLS代理|https://bob:pa%40ss@proxy.example.com:443
+WS代理|socks5+wss://carol:pw@proxy.example.com:443?path=/ws
+```
+
+| 类型 | 说明 |
+|---|---|
+| `socks5` | SOCKS5；`s5` / `s5h` / `socks5h` / `socks` 都按它处理。目标域名一律交给上游代理解析（即 s5h 的效果） |
+| `socks4` / `socks4a` | SOCKS4 / 4a |
+| `http` | HTTP 代理（CONNECT） |
+| `https` | 走 TLS 的 HTTP 代理（`http+tls`） |
+| `ss` | Shadowsocks：用户名列填加密方式（如 `aes-256-gcm`），密码列填密码 |
+| `socks5+tls` / `socks5+ws` / `socks5+wss` | 套 TLS / WebSocket 的 SOCKS5（路径用 URL 写法 `?path=/ws`） |
+
+- vmess / vless / trojan / hysteria 不支持：先在本机用对应客户端开一个 socks5 端口，再把它填进来。
+- 地址填域名或 IPv4（暂不支持 IPv6 地址）。代理就在本机时写 `127.0.0.1`，脚本会换成 netns 看到的宿主地址 `192.168.200.1`，所以那个代理要监听 `0.0.0.0` 或 `192.168.200.1`。
+- 选择方式：`FALLBACK_PROXY=auto`（默认）每次掉线时按列表顺序检测，用第一个能连上的；正在用的代理断了会自动换下一个。也可以固定为某个显示名。
+- 改列表不用重启，下次掉线即按新内容生效；改 `KILL_SWITCH` / `FALLBACK_PROXY` 需要 `ocm restart`。
+- 实测范围：socks5、http、ss 已端到端实测（含长连接跨越 VPN 恢复不断）；https、socks5+tls/ws/wss 已验证 gost 能正确解析，未实连。
+
+<details>
+<summary>实现方式</summary>
+
+netns 里常驻第二个 gost（只监听 veth 地址，链路指向选中的代理，配置来自权限 600 的临时 YAML，启动后即删除，代理密码不出现在常驻进程的参数里）。VPN 不通时，在 netns 的 `nat PREROUTING` 加一条 `REDIRECT`，把从宿主转发进来的新连接改送到它；VPN 恢复后删掉这条规则。已建立的连接由 conntrack 保持原去向；为此会给代理 IP 加一条经 veth 的 `/32` 路由，并在 netns 里常驻一条 conntrack 规则（否则删掉 REDIRECT 时内核会撤销该 netns 的连接跟踪，回落期间的连接会被重置）。
+
+</details>
+
 ### 定时任务
 
 菜单 `7) 定时启动 / 关闭`：按 cron 表达式添加 `ocm start` 或 `ocm stop`。
@@ -281,6 +333,7 @@ Netns 模式运行中可选菜单 `9) 🧪 测试 Netns IPv6 连通性`：检查
 ```bash
 /etc/oc-master/settings.conf          # 设置（600）
 /root/.vpn_accounts.env               # 账户（600，明文）
+/etc/oc-master/proxies.conf           # 回落代理（600，明文）
 /var/log/oc-master/                   # 诊断日志
 /run/oc-master/                       # 运行时（阶段、本次生效设置）
 /etc/systemd/system/ocm.service       # supervisor
@@ -324,10 +377,22 @@ ip netns exec ocm_vpn_space ss -lntp            # gost 在 netns 内监听
    - 看报告里的「会话内短暂故障」与采样里的 `tping`（隧道内丢包）、`socks` 字段
    - 丢包网络可试 `DATA_CHANNEL=tls`；VPN 内 DNS 丢包导致的「卡 5 秒」可试 `DNS_FAST=on`
 
-4. **SSH 连接中断**（默认模式）
+4. **回落代理没有生效**（`KILL_SWITCH=proxy`）
+   - `ocm proxy test` 看每个代理能否连上、出口 IP 是什么；`ocm status` 显示「回落代理：待命 / 使用中」
+   - `ocm log report 1` 里的 `SUP fallback …` 事件：`unavailable` 表示当时列表里没有能连上的代理
+   - 本机代理只监听 `127.0.0.1` 时 netns 连不到它，改为监听 `0.0.0.0` 或 `192.168.200.1`
+
+5. **SSH 连接中断**（默认模式）
    - 脚本会自动保护 SSH 连接；首次启动 3 分钟内若未确认成功会自动回滚
 
 ## 📊 版本历史
+
+### v8.1.0 (2026-11-12)
+
+- ✨ **新增**：断线保护增加第三种选择「回落代理」（`KILL_SWITCH=proxy`）：VPN 不通时新连接改走指定代理，恢复后自动切回，回落期间的连接不断；代理都连不上则直接失败
+- ✨ **新增**：回落代理列表 `/etc/oc-master/proxies.conf`，竖线分列与 URL 两种写法；支持 socks5（含 s5 / s5h 别名）、socks4/4a、http、https、ss、socks5+tls/ws/wss；主菜单 11 与 `ocm proxy list|add|del|test|format`
+- ✨ **新增**：设置 `FALLBACK_PROXY`（auto 按顺序选第一个能连上的 / 固定某一个）；`ocm start --kill-switch proxy --fallback 名称`
+- ✨ **新增**：诊断采样增加 `fb=` 字段，报告统计回落次数与累计时长，状态页显示回落代理是否在用
 
 ### v8.0.0 (2026-11-12)
 

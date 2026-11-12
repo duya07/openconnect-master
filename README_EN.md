@@ -4,7 +4,7 @@
 
 **English | [简体中文](README.md)**
 
-![Version](https://img.shields.io/badge/version-8.0.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.1.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
@@ -45,7 +45,7 @@ Three Running Modes | systemd-managed + Auto-Reconnect | Built-in Diagnostic Log
 - ✅ **⚙️ Settings menu + CLI** (new in v8)
   - Every tunable parameter is listed in the menu with its current value, purpose, options and trade-offs — no need to read the source to guess defaults
   - A settings summary is shown before starting: start directly / change settings and save / change for this run only
-  - `ocm -h`: `start / stop / restart / status / log / heal / config / accounts`, scriptable
+  - `ocm -h`: `start / stop / restart / status / log / heal / config / accounts / proxy`, scriptable
 
 - ✅ **Intelligent policy routing** (Default Mode)
   - Automatically protects SSH connections from the global VPN, supports IPv4 and IPv6
@@ -55,6 +55,7 @@ Three Running Modes | systemd-managed + Auto-Reconnect | Built-in Diagnostic Log
   - A completely independent network environment, accessed through a SOCKS5 proxy (optional username/password)
   - Two port-forwarding backends: socat (IPv4+IPv6 entry) / iptables double NAT (IPv4 entry only)
   - Optional **kill switch**: when the VPN is down the proxy simply fails; traffic never leaves through the VPS's own egress
+  - Or a **fallback proxy** (new in v8.1): while the VPN is down, new connections automatically go through a backup proxy you specify (socks5 / http / https / ss, etc.); they switch back once the VPN recovers, and connections made during fallback are not cut
 
 - ✅ **Multi-account management**
   - Account information is stored **in plain text** in `/root/.vpn_accounts.env` (permissions tightened to `600`, readable by root only; protect it yourself as needed)
@@ -147,7 +148,8 @@ Settings are stored in `/etc/oc-master/settings.conf` (`600`). Every item has a 
 | Proxy | Listen scope `LISTEN` | `127.0.0.1` / `0.0.0.0` | Always set authentication when exposing it externally |
 | Proxy | SOCKS5 authentication `SOCKS_USER`/`SOCKS_PASS` | — | netns mode only |
 | Proxy | Port forwarder `FORWARDER` | `socat` / `iptables` | socat has an IPv4+IPv6 entry; iptables has an IPv4 entry only |
-| Security | Kill switch `KILL_SWITCH` | `off` / `on` | `on`: when the VPN is down the proxy simply fails and never falls back to the VPS egress (netns only) |
+| Security | Kill switch `KILL_SWITCH` | `off` / `on` / `proxy` | `on`: when the VPN is down the proxy simply fails and never falls back to the VPS egress; `proxy`: use the [fallback proxies](#fallback-proxy), and behave like `on` if none is reachable (netns only) |
+| Security | Fallback proxy choice `FALLBACK_PROXY` | `auto` / display name | `auto`: the first reachable one in list order; a display name: only that one |
 | Network | DNS timeout policy `DNS_FAST` | `off` / `on` | `on`: when DNS inside the VPN drops packets, retry after 1 second and rotate servers, reducing "5-second stalls" (netns only) |
 | Network | Host IPv6 forwarding `IPV6_FORWARD` | `off` / `on` | Turn on only if you need IPv6 through the proxy |
 | Daemon | Auto-reconnect `AUTO_RECONNECT` | `on` / `off` | When off, a drop stops and cleans up |
@@ -168,12 +170,13 @@ ocm                      Open the interactive menu
 ocm start [options]      Start with the saved settings; options affect this run only, add --save to make them the default
     -a/--account N|name  -m/--mode netns|default|ocproxy  -p/--proto nc|pulse|anyconnect|…
     -P/--port N  --listen 127.0.0.1|0.0.0.0  --tls-only|--dtls  --fwd socat|iptables
-    --kill-switch on|off  --dns fast|system  --mtu N|auto  --oc-args "…"  --save  -i
+    --kill-switch on|off|proxy  --fallback NAME|auto  --dns fast|system  --mtu N|auto  --oc-args "…"  --save  -i
 ocm stop | restart [options] | status [-v]
 ocm log report [days] | log tail | log snapshot [label] | log mark <text>
 ocm heal on|off|status
 ocm config list [-v] | get KEY | set KEY VALUE
 ocm accounts
+ocm proxy list | add ['line'] | del index|name | test [index|name] | format
 ocm install-service | uninstall-service
 ocm -V | -h
 ```
@@ -242,6 +245,55 @@ ExampleGatewayB|user002|your_password|vpn2.example.com||nc
 
 No field may contain `|`. See also [examples/vpn_accounts.example](examples/vpn_accounts.example).
 
+<a id="fallback-proxy"></a>
+
+### 🛟 Fallback Proxy (Backup Egress for the Kill Switch)
+
+With the kill switch set to `proxy`, **new connections** to the SOCKS5 proxy go through a proxy you specify while the VPN is down or reconnecting; as soon as the VPN recovers, new connections switch back to the VPN. Connections established during fallback are not cut by the switch back.
+If no proxy is reachable it behaves like `on`: connections fail outright and **never** use the VPS's own egress. Netns mode only.
+
+```bash
+ocm proxy add                     # add one field by field (password not echoed); or main menu 11 [Manage fallback proxies]
+ocm proxy test                    # access once through every proxy from this host and show the egress IP
+ocm config set KILL_SWITCH proxy  # then ocm restart
+```
+
+The list lives in `/etc/oc-master/proxies.conf` (`600`, plaintext passwords), one proxy per line, in either of two notations. The file header documents the format in full (`ocm proxy format` shows it any time; see also [examples/proxies.example](examples/proxies.example)):
+
+```text
+# Notation 1: pipe-separated columns (recommended). Write @ : / % etc. in usernames and passwords as-is, no escaping
+name|type|address|port|username(optional)|password(optional)
+HK-backup|socks5|203.0.113.20|1080|user|p@ss:word
+JP-SS|ss|203.0.113.30|8388|aes-256-gcm|ss-password
+
+# Notation 2: URL (read as a URL when column 2 contains ://; percent-encode special characters, @ → %40)
+name|type://username:password@address:port[?params]
+TLS-proxy|https://bob:pa%40ss@proxy.example.com:443
+WS-proxy|socks5+wss://carol:pw@proxy.example.com:443?path=/ws
+```
+
+| Type | Notes |
+|---|---|
+| `socks5` | SOCKS5; `s5` / `s5h` / `socks5h` / `socks` are all treated as this. Target hostnames are always resolved by the upstream proxy (i.e. s5h behaviour) |
+| `socks4` / `socks4a` | SOCKS4 / 4a |
+| `http` | HTTP proxy (CONNECT) |
+| `https` | HTTP proxy over TLS (`http+tls`) |
+| `ss` | Shadowsocks: put the cipher (e.g. `aes-256-gcm`) in the username column and the password in the password column |
+| `socks5+tls` / `socks5+ws` / `socks5+wss` | SOCKS5 over TLS / WebSocket (path via URL notation `?path=/ws`) |
+
+- vmess / vless / trojan / hysteria are not supported: run the matching client locally, expose a socks5 port, and add that.
+- The address must be a hostname or IPv4 (IPv6 addresses are not supported yet). For a proxy on this host write `127.0.0.1`; the script swaps it for `192.168.200.1`, the host address as seen from the netns, so that proxy must listen on `0.0.0.0` or `192.168.200.1`.
+- Choice: with `FALLBACK_PROXY=auto` (default) the list is checked top to bottom on each disconnect and the first reachable proxy is used; if the proxy in use goes down, the next one takes over. It can also be fixed to one display name.
+- Editing the list needs no restart (the next disconnect uses it); changing `KILL_SWITCH` / `FALLBACK_PROXY` needs `ocm restart`.
+- Test coverage: socks5, http and ss were tested end to end (including a long-lived connection surviving the VPN recovery); for https and socks5+tls/ws/wss only gost's parsing was verified, not a live connection.
+
+<details>
+<summary>How it works</summary>
+
+A second gost runs inside the netns (listening only on the veth address, chained to the selected proxy, configured from a temporary YAML with mode 600 that is deleted once gost starts, so the proxy password never appears in a long-running process's arguments). While the VPN is down, a `REDIRECT` rule in the netns `nat PREROUTING` chain sends new connections forwarded from the host to it; the rule is removed once the VPN recovers. Established connections keep their path through conntrack; for that the script adds a `/32` route to the proxy IP via the veth and keeps a permanent conntrack rule in the netns (otherwise deleting the REDIRECT makes the kernel drop connection tracking in that netns, and connections made during fallback are reset).
+
+</details>
+
 ### Scheduled Tasks
 
 Menu `7) Scheduled Start / Stop`: add `ocm start` or `ocm stop` with a cron expression.
@@ -282,6 +334,7 @@ Behavior change: netns mode **no longer** turns on the host's `net.ipv6.conf.all
 ```bash
 /etc/oc-master/settings.conf          # settings (600)
 /root/.vpn_accounts.env               # accounts (600, plain text)
+/etc/oc-master/proxies.conf           # fallback proxies (600, plain text)
 /var/log/oc-master/                   # diagnostic logs
 /run/oc-master/                       # runtime (stage, settings in effect for this run)
 /etc/systemd/system/ocm.service       # supervisor
@@ -325,10 +378,22 @@ ip netns exec ocm_vpn_space ss -lntp            # gost listens inside the netns
    - Look at "brief in-session failures" in the report and the `tping` (in-tunnel packet loss) and `socks` fields in the samples
    - On lossy networks try `DATA_CHANNEL=tls`; for "5-second stalls" caused by DNS packet loss inside the VPN try `DNS_FAST=on`
 
-4. **SSH Connection Interrupted** (Default Mode)
+4. **Fallback proxy does not kick in** (`KILL_SWITCH=proxy`)
+   - `ocm proxy test` shows whether each proxy is reachable and its egress IP; `ocm status` shows the fallback proxy as standby / in use
+   - `SUP fallback …` events in `ocm log report 1`: `unavailable` means no proxy in the list was reachable at that moment
+   - A local proxy that listens only on `127.0.0.1` cannot be reached from the netns; make it listen on `0.0.0.0` or `192.168.200.1`
+
+5. **SSH Connection Interrupted** (Default Mode)
    - The script automatically protects SSH connections; if success is not confirmed within 3 minutes of the first start, it rolls back automatically
 
 ## 📊 Version History
+
+### v8.1.0 (2026-11-12)
+
+- ✨ **New**: a third kill switch option, "fallback proxy" (`KILL_SWITCH=proxy`): while the VPN is down, new connections go through a specified proxy and switch back automatically when it recovers, without cutting connections made during fallback; if no proxy is reachable, connections fail outright
+- ✨ **New**: fallback proxy list `/etc/oc-master/proxies.conf` in pipe-column or URL notation; supports socks5 (including the s5 / s5h aliases), socks4/4a, http, https, ss, socks5+tls/ws/wss; main menu 11 and `ocm proxy list|add|del|test|format`
+- ✨ **New**: setting `FALLBACK_PROXY` (auto = first reachable in list order / fixed to one); `ocm start --kill-switch proxy --fallback NAME`
+- ✨ **New**: diagnostic samples gain an `fb=` field, the report counts fallback episodes and total time, and the status page shows whether the fallback proxy is in use
 
 ### v8.0.0 (2026-11-12)
 

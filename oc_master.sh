@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- 全局配置 ---
-VERSION="8.0.0"
+VERSION="8.1.0"
 VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
@@ -34,10 +34,14 @@ DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
 # --- v8: 设置 / 运行时 / 日志 ---
 CONF_DIR="/etc/oc-master"
 SETTINGS_FILE="${CONF_DIR}/settings.conf"
+PROXIES_FILE="${CONF_DIR}/proxies.conf"  # 回落代理列表（600，含明文密码；断线保护 = proxy 时使用）
 RUN_DIR="/run/oc-master"
 RUN_PROFILE="${RUN_DIR}/run.conf"        # 本次启动的生效设置（600；不含 VPN 密码）
 PHASE_FILE="${RUN_DIR}/phase"            # supervisor 阶段：starting/connecting/up/reconnecting/stopping/stopped/failed:<原因>
 RESTART_REQ="${RUN_DIR}/restart-request" # 观察进程请求软重连
+FB_STATE_FILE="${RUN_DIR}/fallback"          # 正在回落时存在：起始时间 IP:端口 显示名
+FB_GOST_PID_FILE="${RUN_DIR}/fallback-gost.pid"
+FB_YAML="${RUN_DIR}/fallback-gost.yaml"      # 回落 gost 的配置（600，含代理密码；gost 启动后即删除）
 SESSION_LOG="${RUN_DIR}/oc-session.log"  # 当前这次 openconnect 的输出（判断退出原因用）
 LOG_DIR="/var/log/oc-master"
 EVENTS="${LOG_DIR}/events.log"
@@ -621,7 +625,8 @@ SET_REGISTRY=(
   "LISTEN|choice|127.0.0.1|127.0.0.1:仅本机（经 SSH 隧道访问）,0.0.0.0:全部网卡（对外开放）|监听范围|代理"
   "SOCKS_AUTH|auth|||SOCKS5 认证|代理"
   "FORWARDER|choice|socat|socat:socat 进程转发（IPv4+IPv6 入口）,iptables:iptables 双 NAT（仅 IPv4 入口）|端口转发方式|代理"
-  "KILL_SWITCH|choice|off|off:关（掉线期间代理改走 VPS 出口）,on:开（掉线期间代理直接失败）|断线保护|安全"
+  "KILL_SWITCH|choice|off|off:关（掉线期间代理改走 VPS 出口）,on:开（掉线期间代理直接失败）,proxy:回落代理（掉线期间改走指定代理，都不通则失败）|断线保护|安全"
+  "FALLBACK_PROXY|text|auto|auto:自动（按顺序选第一个能连上的）|回落代理选择|安全"
   "DNS_FAST|choice|off|off:系统默认（每次等 5 秒）,on:快速重试（1 秒 × 3 次，轮换服务器）|DNS 超时策略|网络"
   "IPV6_FORWARD|choice|off|off:关,on:开|宿主 IPv6 转发|网络"
   "AUTO_RECONNECT|choice|on|on:开,off:关|自动重连|守护"
@@ -644,7 +649,7 @@ for _e in "${SET_REGISTRY[@]}"; do
 done
 unset _e _k _t _d _c _ti _g
 # 修改后需要重启 VPN 才生效的键（守护/日志类在运行中即时读取）
-SET_NEEDS_RESTART=" ACCOUNT MODE PROTOCOL DATA_CHANNEL RECONNECT_TIMEOUT MTU OC_EXTRA SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST IPV6_FORWARD "
+SET_NEEDS_RESTART=" ACCOUNT MODE PROTOCOL DATA_CHANNEL RECONNECT_TIMEOUT MTU OC_EXTRA SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH FALLBACK_PROXY DNS_FAST IPV6_FORWARD "
 
 _set_help() {
   case "$1" in
@@ -677,9 +682,17 @@ tls ：所有流量都走 TLS/TCP 隧道（--no-dtls）。稍多一点开销，�
     FORWARDER) echo "把宿主端口转进 netns 里的 SOCKS5：
 socat   ：进程级中继，宿主侧 IPv4+IPv6 都可接入，最稳妥（默认）。
 iptables：内核双 NAT，不多一个进程，但只有 IPv4 入口。";;
-    KILL_SWITCH) echo "关：VPN 掉线/重连的那几秒里，代理仍有响应，但流量出口是 VPS 自己的 IP。
-开：VPN 不通时代理直接失败（netns 内防火墙只放行隧道），保证流量绝不从 VPS 出口出去；
-    代价是重连期间访问会报错。仅 netns 模式有效。";;
+    KILL_SWITCH) echo "关      ：VPN 掉线/重连的那几秒里，代理仍有响应，但流量出口是 VPS 自己的 IP。
+开      ：VPN 不通时代理直接失败（netns 内防火墙只放行隧道），保证流量绝不从 VPS 出口出去；
+          代价是重连期间访问会报错。
+回落代理：VPN 不通时，新连接自动改走「回落代理」列表里的代理（${PROXIES_FILE}），VPN 恢复后自动切回；
+          回落期间建立的连接不会因切回而中断。代理都连不上时与「开」相同：直接失败，不走 VPS 出口。
+          代理在主菜单 11「管理回落代理」或 ocm proxy add 添加，ocm proxy test 测试。
+以上仅 netns 模式有效。";;
+    FALLBACK_PROXY) echo "断线保护 = 回落代理 时用哪一个：
+auto  ：每次掉线时按列表从上到下检测（TCP 连接测试），用第一个能连上的；正在用的代理断了会自动换下一个。
+显示名：只用这一个；它连不上就直接失败。
+列表：${PROXIES_FILE}（主菜单 11 或 ocm proxy list）。列表内容改了不用重启，下次掉线即按新内容。";;
     DNS_FAST) echo "VPN 下发的 DNS 若经常丢包，程序每丢一次查询要干等 5 秒，表现为网页时不时卡住。
 on：在 netns 的 resolv.conf 加 options timeout:1 attempts:3 rotate，丢包后 1 秒就重试并轮换服务器。
 仅 netns 模式；每次（重）连接后自动补上（vpnc-script 每次连接都会重写该文件）。";;
@@ -745,6 +758,7 @@ settings_validate() {
     SOCKS_PASS) [ -z "$v" ] && return 0
       case "$v" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "密码不能含 / 引号 反斜杠 空白"; return 1;; esac; return 0;;
     OC_EXTRA|EXTRA_PROBE_URL) case "$v" in *$'\n'*) log_err "不能含换行"; return 1;; esac; return 0;;
+    FALLBACK_PROXY) [ -z "$v" ] || [ "$v" = auto ] || proxy_find "$v" >/dev/null || { log_err "回落代理选择应为 auto 或列表里某个代理的显示名（ocm proxy list）"; return 1; }; return 0;;
   esac
   case "${SET_TYPE[$k]:-}" in
     choice) IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]}"
@@ -763,6 +777,7 @@ cfg_label() {
     SOCKS_AUTH) if [ -n "${CFG[SOCKS_USER]:-}" ]; then echo "${CFG[SOCKS_USER]}:****"; else echo "无"; fi; return;;
     ACCOUNT) echo "${v}) $(account_field "$v" 1 2>/dev/null || echo '?')"; return;;
     OC_EXTRA|EXTRA_PROBE_URL) echo "${v:-（空）}"; return;;
+    FALLBACK_PROXY) if [ -z "$v" ] || [ "$v" = auto ]; then echo "自动（按顺序选第一个能连上的）"; else echo "固定：$v"; fi; return;;
   esac
   IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]:-}"
   for c in "${_cs[@]}"; do [ "${c%%:*}" = "$v" ] && { echo "${c#*:}"; return; }; done
@@ -803,6 +818,321 @@ accounts_list() {
   [ $n -gt 0 ] || echo "  （无账户）"
 }
 gw_host_of() { local h; h=$(account_field "$1" 4 2>/dev/null || true); h=${h#https://}; h=${h#http://}; h=${h%%/*}; h=${h%%:*}; printf '%s' "$h"; }
+
+# ============================================================================
+#  回落代理（断线保护 = proxy：VPN 不通期间，SOCKS5 的新连接改走这里的代理）
+#  文件：/etc/oc-master/proxies.conf（600，含明文密码）；格式见 _proxies_template（新建文件时写入文件头）。
+#  每行先归一成 gost 的代理 URL，再交给 gost 本身解析（gost -F URL -O yaml），保证与 gost 行为一致。
+# ============================================================================
+_proxies_template() { cat <<'EOT'
+# ocm 回落代理列表（设置「断线保护」= 回落代理 时使用）
+# 本文件含明文密码，权限必须是 600：chmod 600 /etc/oc-master/proxies.conf
+#
+# VPN 掉线 / 重连期间，SOCKS5 代理的新连接改走这里的代理；VPN 恢复后新连接自动切回 VPN，
+# 回落期间已建立的连接不受影响。代理都连不上时直接失败，绝不改走 VPS 自己的出口。
+# 设置「回落代理选择」= auto（默认）时按从上到下的顺序，用第一个能连上的；也可以固定为某个显示名。
+# 改完本文件不用重启：下一次掉线时自动按新内容生效。测试：ocm proxy test
+#
+# 每行一个代理，两种写法任选（# 开头为注释，空行忽略）：
+#
+# 写法一：竖线分列（推荐）
+#   显示名|类型|地址|端口|用户名(可选)|密码(可选)
+#   - 用户名、密码里有 @ : / % # ? 等字符直接照写，不用转义；密码在最后一列，里面有 | 也可以
+#   - 没有认证就省略最后两列
+#
+# 写法二：URL
+#   显示名|类型://用户名:密码@地址:端口[?参数]
+#   - 第 2 列里有 :// 就按 URL 读取
+#   - 用户名、密码里的特殊字符要按 URL 规则编码：@ → %40   : → %3A   / → %2F   % → %25   # → %23
+#
+# 类型（不区分大小写）：
+#   socks5      SOCKS5。别名 s5、s5h、socks5h、socks 都按它处理；目标域名一律交给上游代理解析（即 s5h 的效果）
+#   socks4      SOCKS4（没有密码，用户名可选）        socks4a   SOCKS4a
+#   http        HTTP 代理（CONNECT）。别名 h
+#   https       走 TLS 的 HTTP 代理（等同 http+tls）
+#   ss          Shadowsocks：「用户名」填加密方式（如 aes-256-gcm、chacha20-ietf-poly1305），「密码」填密码
+#   socks5+tls  套 TLS 的 SOCKS5
+#   socks5+ws / socks5+wss   套 WebSocket（wss 带 TLS）的 SOCKS5；路径用 URL 写法加 ?path=/ws
+#   不支持 vmess / vless / trojan / hysteria：先在本机用对应客户端开一个 socks5 端口，再把它填进来
+#
+# 地址：域名或 IPv4（暂不支持 IPv6 地址）。域名在宿主上解析（断线期间 netns 里不能做 DNS）。
+#   代理就跑在这台 VPS 上时写 127.0.0.1 或 localhost：脚本会换成 192.168.200.1（netns 看到的宿主地址），
+#   所以那个代理必须监听 0.0.0.0 或 192.168.200.1，只监听 127.0.0.1 是连不上的。
+#
+# 示例（去掉行首的 # 即可启用）：
+# 香港备用|socks5|203.0.113.20|1080|user|p@ss:word
+# 无认证S5|s5h|203.0.113.21|1080
+# 公司HTTP|http|proxy.example.com|3128|alice|secret
+# 日本SS|ss|203.0.113.30|8388|aes-256-gcm|ss-password
+# TLS代理|https://bob:pa%40ss@proxy.example.com:443
+# WS代理|socks5+wss://carol:pw@proxy.example.com:443?path=/ws
+# 本机代理|socks5|127.0.0.1|7890
+EOT
+}
+_proxies_ensure_file() {
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  [ -f "$PROXIES_FILE" ] || ( umask 077; _proxies_template > "$PROXIES_FILE" )
+  chmod 600 "$PROXIES_FILE" 2>/dev/null || true
+}
+_proxies_lines() { { tr -d '\r' < "$PROXIES_FILE" | grep -vE '^[[:space:]]*#|^[[:space:]]*$'; } 2>/dev/null || true; }
+proxies_count() { _proxies_lines | wc -l; }
+proxy_line() { _proxies_lines | sed -n "${1}p"; }
+proxy_find() { _proxies_lines | awk -F'|' -v a="$1" '$1==a{print NR; f=1; exit} END{exit !f}'; }
+# 序号或显示名 → 序号
+proxy_resolve_ref() {
+  local a="$1" n; n=$(proxies_count)
+  if [[ "$a" =~ ^[0-9]+$ ]]; then [ "$a" -ge 1 ] && [ "$a" -le "$n" ] && { echo "$a"; return 0; }; return 1; fi
+  proxy_find "$a"
+}
+# 类型别名 → gost 协议名。白名单之外一律拒绝：gost 遇到不认识的协议名会静默当成 http（实测 socks5h:// 即如此）
+_proxy_norm_type() {
+  case "${1,,}" in
+    s5|s5h|socks|socks5|socks5h) echo socks5 ;;
+    s4|socks4) echo socks4 ;;
+    socks4a)   echo socks4a ;;
+    h|http)    echo http ;;
+    https|http+tls) echo http+tls ;;
+    ss|shadowsocks) echo ss ;;
+    socks5+tls|socks5+ws|socks5+wss) echo "${1,,}" ;;
+    *) return 1 ;;
+  esac
+}
+# URL 百分号编码（按字节，只保留 RFC 3986 的非保留字符）
+_pct_enc() {
+  local LC_ALL=C s="$1" i c o=""
+  for ((i=0; i<${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in [A-Za-z0-9._~-]) o+=$c ;; *) printf -v c '%%%02X' "'$c"; o+=$c ;; esac
+  done
+  printf '%s' "$o"
+}
+# 解析一行 → P_NAME P_TYPE P_HOST P_PORT P_AUTH，P_URL（gost 用，含认证，只留在内存）；失败时设 P_ERR 并返回 1
+proxy_parse() {
+  local line="${1%$'\r'}" rest
+  P_NAME=""; P_TYPE=""; P_HOST=""; P_PORT=""; P_URL=""; P_AUTH=0; P_ERR=""
+  case "$line" in *"|"*) ;; *) P_ERR="缺少 | 分隔（应为 显示名|类型|地址|端口… 或 显示名|URL）"; return 1 ;; esac
+  P_NAME=${line%%|*}; rest=${line#*|}
+  [ -n "$P_NAME" ] || { P_ERR="显示名为空"; return 1; }
+  if [[ "$rest" == *"://"* ]]; then
+    local re='^([A-Za-z0-9+]+)://(([^@/?#]*)@)?([A-Za-z0-9.-]+):([0-9]{1,5})/?(\?[^#[:space:]]*)?$'
+    [[ "$rest" =~ $re ]] || { P_ERR="URL 格式不对（类型://[用户名:密码@]地址:端口[?参数]；密码里的 @ : / 要写成 %40 %3A %2F）"; return 1; }
+    local sch=${BASH_REMATCH[1]} ui=${BASH_REMATCH[3]} q=${BASH_REMATCH[6]}
+    P_HOST=${BASH_REMATCH[4]}; P_PORT=${BASH_REMATCH[5]}
+    P_TYPE=$(_proxy_norm_type "$sch") || { P_ERR="不支持的类型：$sch"; return 1; }
+    [ -n "$ui" ] && P_AUTH=1
+    P_URL="${P_TYPE}://${ui:+${ui}@}${P_HOST}:${P_PORT}${q}"
+  else
+    local t h p u pw ui="" r="$rest"
+    # 逐列切出前 4 列，剩下的全部是密码（密码里可以有 |，结尾是 | 也保留；read 会吞掉结尾的 |）
+    t=${r%%|*}; r=${r#"$t"}; r=${r#|}
+    h=${r%%|*}; r=${r#"$h"}; r=${r#|}
+    p=${r%%|*}; r=${r#"$p"}; r=${r#|}
+    u=${r%%|*}; r=${r#"$u"}; r=${r#|}
+    pw=$r
+    P_TYPE=$(_proxy_norm_type "$t") || { P_ERR="不支持的类型：${t:-（空）}"; return 1; }
+    P_HOST=$h; P_PORT=$p
+    [[ "$P_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { P_ERR="地址只能是域名或 IPv4：${P_HOST:-（空）}"; return 1; }
+    [[ "$P_PORT" =~ ^[0-9]{1,5}$ ]] || { P_ERR="端口应为数字：${P_PORT:-（空）}"; return 1; }
+    if [ -n "$u" ] || [ -n "$pw" ]; then
+      ui=$(_pct_enc "$u"); [ -n "$pw" ] && ui+=":$(_pct_enc "$pw")"; P_AUTH=1
+    fi
+    P_URL="${P_TYPE}://${ui:+${ui}@}${P_HOST}:${P_PORT}"
+  fi
+  [ "$P_PORT" -ge 1 ] && [ "$P_PORT" -le 65535 ] || { P_ERR="端口应为 1-65535"; return 1; }
+  [ "$P_TYPE" = ss ] && [ "$P_AUTH" = 0 ] && { P_ERR="ss 需要填加密方式（用户名列）和密码"; return 1; }
+  return 0
+}
+# 代理地址 → IPv4。$2=ns：从 netns 看（本机代理换成 veth 宿主地址）；host：从宿主看
+_proxy_ip() {
+  local h="$1" ip=""
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ip=$h
+  elif [ "${h,,}" = localhost ]; then ip=127.0.0.1
+  else ip=$(timeout 5 getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}' || true); fi
+  [ -n "$ip" ] || return 1
+  [ "${2:-ns}" = ns ] && [[ "$ip" == 127.* ]] && ip=$VETH_HOST_IP
+  printf '%s' "$ip"
+}
+_tcp_probe() { timeout 3 bash -c ">/dev/tcp/$1/$2" 2>/dev/null; }
+# 生成 gost 配置：$1=URL $2=原地址 $3=实际 IP $4=代理端口 $5=监听（地址:端口）$6=监听是否带 SOCKS5 认证 $7=输出文件
+_proxy_gen_yaml() {
+  local url="$1" host="$2" ip="$3" port="$4" listen="$5" auth="$6" out="$7" gl tmp
+  gl="socks5://${listen}"
+  [ "$auth" = 1 ] && [ -n "${CFG[SOCKS_USER]:-}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@${listen}"
+  tmp=$(umask 077; mktemp "${out}.XXXXXX") || return 1
+  # gost -O 只打印解析后的配置就退出、不监听；URL（含密码）只在这一瞬间出现在 root 进程的参数里
+  if ! timeout 10 gost -L "$gl" -F "$url" -O yaml > "$tmp" 2>/dev/null || ! grep -q '^chains:' "$tmp"; then rm -f "$tmp"; return 1; fi
+  if [ "$host" != "$ip" ]; then
+    # 节点地址换成已解析的 IP（断线期间 netns 里做不了 DNS）；TLS 的 serverName 仍保留原域名
+    ( umask 077; awk -v from="addr: ${host}:${port}" -v to="addr: ${ip}:${port}" '
+        /^chains:/ {c=1}
+        c && !n && (i=index($0, from)) { $0=substr($0,1,i-1) to substr($0,i+length(from)); n=1 }
+        {print} END{exit !n}' "$tmp" > "$tmp.2" ) || { rm -f "$tmp" "$tmp.2"; return 1; }
+    mv -f "$tmp.2" "$tmp"
+  fi
+  chmod 600 "$tmp"; mv -f "$tmp" "$out"
+}
+proxies_list() {
+  local n=0 line
+  [ -f "$PROXIES_FILE" ] || { echo "  （代理文件不存在：$PROXIES_FILE）"; return 0; }
+  while IFS= read -r line; do
+    n=$((n+1))
+    if proxy_parse "$line"; then
+      printf '  %d) %s  %s  %s:%s%s\n' "$n" "$P_NAME" "$P_TYPE" "$P_HOST" "$P_PORT" "$( [ "$P_AUTH" = 1 ] && echo '  （有认证）')"
+    else
+      echo -e "  ${n}) ${C_RED}${line%%|*}  格式错误：${P_ERR}（这一行会被跳过）${C_RESET}"
+    fi
+  done < <(_proxies_lines)
+  [ $n -gt 0 ] || echo "  （还没有回落代理）"
+  return 0
+}
+# 从本机经该代理访问一次 https://api.ipify.org，打印出口 IP（即回落时网站看到的 IP）
+proxy_test_one() {
+  local line ip t0 t1 dir port pid eg i
+  line=$(proxy_line "$1")
+  proxy_parse "$line" || { printf '  %s) %s：格式错误：%s\n' "$1" "${line%%|*}" "$P_ERR"; return 1; }
+  printf '  %s) %s（%s %s:%s）' "$1" "$P_NAME" "$P_TYPE" "$P_HOST" "$P_PORT"
+  ip=$(_proxy_ip "$P_HOST" host) || { echo " → 域名解析失败 ❌"; return 1; }
+  t0=$(ms_now)
+  _tcp_probe "$ip" "$P_PORT" || { echo " → ${ip}:${P_PORT} TCP 连不上 ❌"; return 1; }
+  t1=$(ms_now); printf ' → %s TCP %sms' "$ip" "$((t1 - t0))"
+  command -v gost >/dev/null 2>&1 || { echo "，未安装 gost，跳过出口测试"; return 0; }
+  dir=$(mktemp -d)
+  for i in 1 2 3 4 5 6 7 8 9 10; do port=$(( RANDOM % 20000 + 30000 )); ss -Hlnt "sport = :$port" 2>/dev/null | grep -q . || break; done
+  _proxy_gen_yaml "$P_URL" "$P_HOST" "$ip" "$P_PORT" "127.0.0.1:${port}" 0 "$dir/t.yaml" \
+    || { echo "，gost 解析不了这个代理 ❌"; rm -rf "$dir"; return 1; }
+  gost -C "$dir/t.yaml" >/dev/null 2>&1 & pid=$!
+  for i in 1 2 3 4 5 6; do ss -Hlnt "sport = :$port" 2>/dev/null | grep -q . && break; sleep 0.5; done
+  rm -f "$dir/t.yaml"
+  eg=$("$CURL_CMD" -4 -s --connect-timeout 8 --max-time 15 -x "socks5h://127.0.0.1:${port}" https://api.ipify.org 2>/dev/null || true)
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$dir"
+  if [[ "$eg" =~ ^[0-9.]+$ ]]; then echo "，经代理出口 ${eg} ✅"; return 0; fi
+  echo "，经代理访问失败（认证 / 协议 / 代理自身网络？）❌"; return 1
+}
+proxy_test_all() {
+  local n i; n=$(proxies_count)
+  [ "$n" -gt 0 ] || { echo "  （还没有回落代理）"; return 0; }
+  echo "从本机经各代理访问 https://api.ipify.org（显示的出口 IP 就是回落时网站看到的 IP）："
+  for ((i=1; i<=n; i++)); do proxy_test_one "$i" || true; done
+  return 0
+}
+_proxy_name_ok() {
+  local d="$1"
+  [ -n "$d" ] || { log_err "显示名不能为空"; return 1; }
+  case "$d" in *"|"*) log_err "显示名不能含 |"; return 1 ;; esac
+  [ "$d" = auto ] && { log_err "auto 是保留字，换一个显示名"; return 1; }
+  proxy_find "$d" >/dev/null && { log_err "已有同名代理：$d"; return 1; }
+  return 0
+}
+# 校验后追加一行（竖线或 URL 写法）
+proxy_add_line() {
+  local line="${1%$'\r'}"
+  proxy_parse "$line" || { log_err "格式错误：$P_ERR（格式说明：ocm proxy format）"; return 1; }
+  _proxy_name_ok "$P_NAME" || return 1
+  _proxies_ensure_file
+  printf '%s\n' "$line" >> "$PROXIES_FILE"; chmod 600 "$PROXIES_FILE"
+  ev "CONFIG proxy add name=${P_NAME// /_} type=$P_TYPE addr=${P_HOST}:${P_PORT}"
+  log "已添加回落代理：${P_NAME}（${P_TYPE} ${P_HOST}:${P_PORT}$( [ "$P_AUTH" = 1 ] && echo '，有认证')）"
+  return 0
+}
+proxy_add_interactive() {
+  local d t h p u="" pw="" path line yn ui=""
+  echo "类型：socks5（s5 / s5h） socks4  socks4a  http  https  ss  socks5+tls  socks5+ws  socks5+wss"
+  read -rp "显示名: " d || return 1; _proxy_name_ok "$d" || return 1
+  read -rp "类型 [socks5]: " t || return 1
+  t=$(_proxy_norm_type "${t:-socks5}") || { log_err "不支持的类型"; return 1; }
+  read -rp "地址（域名或 IPv4；代理在本机就填 127.0.0.1）: " h || return 1
+  read -rp "端口: " p || return 1
+  case "$t" in
+    ss) read -rp "加密方式 [aes-256-gcm]: " u || return 1; u=${u:-aes-256-gcm}
+        read -rsp "密码: " pw || return 1; echo ;;
+    socks4|socks4a) read -rp "用户名（可选，回车跳过）: " u || return 1 ;;
+    *) read -rp "用户名（可选，回车跳过）: " u || return 1
+       if [ -n "$u" ]; then read -rsp "密码: " pw || return 1; echo; fi ;;
+  esac
+  if [[ "$t" == *+ws || "$t" == *+wss ]]; then
+    read -rp "WebSocket 路径 [/ws]: " path || return 1; path=${path:-/ws}; [[ "$path" == /* ]] || path="/$path"
+    if [ -n "$u$pw" ]; then ui=$(_pct_enc "$u"); [ -n "$pw" ] && ui+=":$(_pct_enc "$pw")"; ui+="@"; fi
+    line="${d}|${t}://${ui}${h}:${p}?path=$(_pct_enc "$path")"
+  else
+    line="${d}|${t}|${h}|${p}"
+    [ -n "$u$pw" ] && line+="|${u}"
+    [ -n "$pw" ] && line+="|${pw}"
+  fi
+  proxy_add_line "$line" || return 1
+  read -rp "现在测试这个代理? [Y/n]: " yn || yn=n
+  [[ "$yn" =~ ^[nN]$ ]] || proxy_test_one "$(proxy_find "$d")" || true
+  return 0
+}
+proxy_del() {
+  local i name
+  i=$(proxy_resolve_ref "$1") || { log_err "找不到代理：$1"; return 1; }
+  name=$(proxy_line "$i" | cut -d'|' -f1)
+  ( umask 077; awk -v n="$i" '/^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next} {k++; if (k!=n) print}' "$PROXIES_FILE" > "${PROXIES_FILE}.tmp" ) \
+    || { log_err "删除失败：无法写入临时文件"; rm -f "${PROXIES_FILE}.tmp"; return 1; }
+  mv -f "${PROXIES_FILE}.tmp" "$PROXIES_FILE"; chmod 600 "$PROXIES_FILE"
+  ev "CONFIG proxy del name=${name// /_}"; log "已删除：$name"
+  settings_load
+  if [ "${CFG[FALLBACK_PROXY]}" = "$name" ]; then
+    CFG[FALLBACK_PROXY]=auto; settings_save; ev "CONFIG FALLBACK_PROXY: ${name// /_} -> auto"
+    log_warn "「回落代理选择」原来固定为它，已改回 auto（VPN 正在运行的话重启后生效）。"
+  fi
+  return 0
+}
+proxy_choose() {
+  local a v i old
+  proxies_list
+  read -rp "输入序号或显示名 = 固定只用它；a = 改回自动（回车取消）: " a || return 0
+  [ -z "$a" ] && return 0
+  if [ "$a" = a ] || [ "$a" = auto ]; then v=auto
+  else i=$(proxy_resolve_ref "$a") || { log_err "找不到代理：$a"; return 1; }; v=$(proxy_line "$i" | cut -d'|' -f1); fi
+  settings_load; old=${CFG[FALLBACK_PROXY]}; CFG[FALLBACK_PROXY]=$v; settings_save
+  ev "CONFIG FALLBACK_PROXY: ${old// /_} -> ${v// /_}"; log "回落代理选择：$(cfg_label FALLBACK_PROXY)"
+  _settings_restart_note FALLBACK_PROXY cfg
+  return 0
+}
+manage_proxies() {
+  _proxies_ensure_file
+  local c a fs fa fn
+  while true; do
+    clear 2>/dev/null || true; settings_load
+    title "🛟 管理回落代理 (${PROXIES_FILE})"; sep
+    echo -e "  断线保护：${C_CYAN}$(cfg_label KILL_SWITCH)${C_RESET}   回落代理选择：${C_CYAN}$(cfg_label FALLBACK_PROXY)${C_RESET}"
+    [ "${CFG[KILL_SWITCH]}" = proxy ] || echo -e "  ${C_GREY}（「断线保护」设为「回落代理」后才会用这里的代理：主菜单 5 → 断线保护）${C_RESET}"
+    if [ -r "$FB_STATE_FILE" ]; then read -r fs fa fn < "$FB_STATE_FILE"; echo -e "  ${C_YELLOW}正在使用：${fn}（${fa}）${C_RESET}"; fi
+    sep; proxies_list; sep
+    echo "  1) 添加（逐项填写）     2) 添加（粘贴一行：竖线或 URL 写法）     3) 删除"
+    echo "  4) 测试全部（显示出口 IP）  5) 设置用哪一个（自动 / 固定）     6) 格式说明"
+    echo "  0) 返回                 也可以直接编辑 ${PROXIES_FILE}（改完无需重启）"
+    read -rp "选择: " c || return 0
+    case "$c" in
+      1) proxy_add_interactive || true; _pause ;;
+      2) read -rsp "粘贴一行后回车（输入不回显）: " a || a=""; echo
+         if [ -n "$a" ]; then proxy_add_line "$a" || true; fi; _pause ;;
+      3) read -rp "要删除的序号或显示名: " a || a=""
+         if [ -n "$a" ]; then proxy_del "$a" || true; fi; _pause ;;
+      4) proxy_test_all; _pause ;;
+      5) proxy_choose || true; _pause ;;
+      6) _proxies_template | less -R -F -X || true ;;
+      0|"") return 0 ;;
+      *) log_err "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+cmd_proxy() {
+  check_root; settings_load
+  local sub="${1:-list}" i; shift || true
+  case "$sub" in
+    list|ls) echo "回落代理（${PROXIES_FILE}）  断线保护：$(cfg_label KILL_SWITCH)  选择：$(cfg_label FALLBACK_PROXY)"; proxies_list ;;
+    add)     if [ $# -ge 1 ]; then proxy_add_line "$1" || return 2; else proxy_add_interactive || return 1; fi ;;
+    del|rm)  [ $# -ge 1 ] || { log_err "用法：ocm proxy del <序号|显示名>"; return 2; }; proxy_del "$1" || return 1 ;;
+    test)    if [ $# -ge 1 ]; then i=$(proxy_resolve_ref "$1") || { log_err "找不到代理：$1"; return 2; }; proxy_test_one "$i" || return 1
+             else proxy_test_all; fi ;;
+    format)  _proxies_template ;;
+    path)    echo "$PROXIES_FILE" ;;
+    *) log_err "用法：ocm proxy list | add ['一行'] | del <序号|名称> | test [序号|名称] | format | path"; return 2 ;;
+  esac
+  return 0
+}
 
 # --- 停止与清理 ---
 cleanup_ssh_protect_routes() {
@@ -988,6 +1318,7 @@ _teardown_session() {
         _fwd_teardown "${FORWARDER:-}"
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
+      [ -f "$FB_GOST_PID_FILE" ] && kill "$(cat "$FB_GOST_PID_FILE")" 2>/dev/null || true
       if [ -f "$PID_FILE" ]; then
         local oc_pid; oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
         # 同 default|ocproxy：pid 文件可能是过期记录，先确认身份再发信号
@@ -1026,6 +1357,7 @@ _teardown_session() {
         _wait_pid_gone "$oc_pid"
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
+      [ -f "$FB_GOST_PID_FILE" ] && kill "$(cat "$FB_GOST_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
       cleanup_ssh_protect_routes
@@ -1037,7 +1369,7 @@ _teardown_session() {
   # cleanup_netns 在还原之后删。否则一旦出现"netns 会话被 kill -9 → 用户改用 default
   # 模式 → 这次 stop 走 default 分支（不调 cleanup_netns）"这种跨模式序列，记录会被删掉
   # 而 ip_forward 已经变成 1，就再也没有还原依据了。
-  rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6"; log "所有临时文件已清理，操作完成。"
+  rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6" "$FB_GOST_PID_FILE" "$FB_STATE_FILE" "$FB_YAML"; log "所有临时文件已清理，操作完成。"
 }
 
 # ============================================================================
@@ -1166,7 +1498,7 @@ sup_build_oc() {
   [ "${CFG[MODE]}" = ocproxy ] && OC_ARGS+=(--script-tun --script "ocproxy -k 30 -D ${CFG[SOCKS_PORT]}")
   # 默认全局模式用固定网卡名：宿主上可能已有别的 tun0（组网/其他 VPN），不能靠"任意 tun"判断
   [ "${CFG[MODE]}" = default ] && OC_ARGS+=("--interface=$OC_TUN_DEFAULT")
-  [ "${CFG[MODE]}" = netns ] && [ "${CFG[KILL_SWITCH]}" = on ] && [ -n "$GW_IP" ] && OC_ARGS+=("--resolve=${GW_NAME}:${GW_IP}")
+  [ "${CFG[MODE]}" = netns ] && [[ "${CFG[KILL_SWITCH]}" =~ ^(on|proxy)$ ]] && [ -n "$GW_IP" ] && OC_ARGS+=("--resolve=${GW_NAME}:${GW_IP}")
   if [ -n "${CFG[OC_EXTRA]}" ]; then local -a _x; read -r -a _x <<<"${CFG[OC_EXTRA]}"; OC_ARGS+=("${_x[@]}"); fi
   OC_PREFIX=(); [ "${CFG[MODE]}" = netns ] && OC_PREFIX=("$IP_CMD" netns exec "$NETNS_NAME")
   return 0
@@ -1283,6 +1615,113 @@ ks_apply() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+#  回落代理（KILL_SWITCH=proxy，仅 netns）
+#  netns 里第二个 gost（只监听 veth 地址，链路指向选中的代理）。VPN 不通时在 netns 的 nat PREROUTING
+#  加一条 REDIRECT，把从宿主转发进来的新连接改送到它；VPN 恢复后删掉这条规则。conntrack 让已建立的
+#  连接保持原去向，所以切回时回落期间的连接不断——为此给代理 IP 加了经 veth 的 /32 路由（隧道恢复后
+#  默认路由走 tun，不加的话这些连接会被拐进隧道）。断线保护的防火墙同时生效，只额外放行选中代理的
+#  IP:端口；代理都连不上就直接失败，不走 VPS 出口。
+#  注意：netns 的连接跟踪是按需启用的——如果 REDIRECT 是唯一依赖 conntrack 的规则，删掉它时内核会
+#  撤掉该 netns 的 conntrack 钩子，回落期间建立的连接随即被重置（实测：只删 REDIRECT，下载就停）。
+#  所以 fb_prepare 先放一条常驻的、语义上不改变任何行为的 conntrack 规则把它"钉住"。
+# ---------------------------------------------------------------------------
+FB_MODE=0; FB_ACTIVE=0; FB_KEY=""; FB_NAME=""; FB_ADDR=""; FB_SINCE=0; FB_NEXT=0; FB_FAIL_NOTED=0; FB_GOST_PID=""
+FB_C_NAME=""; FB_C_HOST=""; FB_C_IP=""; FB_C_PORT=""; FB_C_URL=""
+fb_inner_port() { if [ "${CFG[SOCKS_PORT]}" = 10800 ]; then echo 10801; else echo 10800; fi; }
+fb_prepare() {
+  # INPUT 默认就是 ACCEPT，这条只为让 netns 一直启用 conntrack（见上方注释）
+  "$IP_CMD" netns exec "$NETNS_NAME" iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+    || sup_log "回落代理：conntrack 常驻规则写入失败，VPN 恢复时回落期间的连接可能会断"
+  return 0
+}
+_fb_redirect() { # add|del
+  local -a NSX=("$IP_CMD" netns exec "$NETNS_NAME")
+  local -a r=(PREROUTING -i "$VETH_NS" -p tcp --dport "${CFG[SOCKS_PORT]}" -j REDIRECT --to-ports "$(fb_inner_port)")
+  if [ "$1" = add ]; then
+    "${NSX[@]}" iptables -w -t nat -C "${r[@]}" 2>/dev/null || "${NSX[@]}" iptables -w -t nat -A "${r[@]}"
+  else
+    while "${NSX[@]}" iptables -w -t nat -D "${r[@]}" 2>/dev/null; do :; done
+    return 0
+  fi
+}
+_fb_stop_gost() {
+  local p="${FB_GOST_PID:-}"; [ -n "$p" ] || p=$(cat "$FB_GOST_PID_FILE" 2>/dev/null || true)
+  [[ "$p" =~ ^[0-9]+$ ]] && kill "$p" 2>/dev/null
+  FB_GOST_PID=""; FB_KEY=""; rm -f "$FB_GOST_PID_FILE" "$FB_YAML"
+  return 0
+}
+# 按设置选代理：auto＝按文件顺序第一个 TCP 连得上的；固定名称＝只认它。结果放在 FB_C_*
+fb_select() {
+  local want="${CFG[FALLBACK_PROXY]:-auto}" line ip
+  FB_C_NAME=""; FB_C_HOST=""; FB_C_IP=""; FB_C_PORT=""; FB_C_URL=""
+  while IFS= read -r line; do
+    proxy_parse "$line" || continue
+    [ "$want" = auto ] || [ "$P_NAME" = "$want" ] || continue
+    ip=$(_proxy_ip "$P_HOST" ns) || continue
+    _tcp_probe "$ip" "$P_PORT" || continue
+    FB_C_NAME=$P_NAME; FB_C_HOST=$P_HOST; FB_C_IP=$ip; FB_C_PORT=$P_PORT; FB_C_URL=$P_URL
+    return 0
+  done < <(_proxies_lines)
+  return 1
+}
+_fb_disengage() { # 原因
+  _fb_redirect del
+  if [ "$FB_ACTIVE" = 1 ]; then
+    local d=$(( $(now_s) - FB_SINCE ))
+    ev "SUP fallback off reason=$1 proxy=${FB_NAME// /_} dur=$d dur_h=$(fmt_dur $d)"
+    sup_log "回落代理已停用（${1}，用了 $(fmt_dur $d)）"
+  fi
+  FB_ACTIVE=0; FB_NAME=""; FB_ADDR=""; rm -f "$FB_STATE_FILE"
+  return 0
+}
+fb_engage() {
+  local -a NSX=("$IP_CMD" netns exec "$NETNS_NAME")
+  local key
+  if ! fb_select; then
+    if [ "$FB_FAIL_NOTED" = 0 ]; then
+      ev "SUP fallback unavailable want=${CFG[FALLBACK_PROXY]:-auto}"
+      sup_log "回落代理都连不上：VPN 恢复前代理暂时不可用（不会改走 VPS 出口）"; FB_FAIL_NOTED=1
+    fi
+    [ "$FB_ACTIVE" = 1 ] && _fb_disengage proxy-unreachable
+    return 1
+  fi
+  FB_FAIL_NOTED=0
+  key=$(printf '%s|%s|%s' "$FB_C_URL" "$FB_C_IP" "$(fb_inner_port)" | sha256sum | cut -c1-16)
+  if [ "$key" != "$FB_KEY" ] || ! kill -0 "${FB_GOST_PID:-0}" 2>/dev/null; then
+    _fb_stop_gost
+    _proxy_gen_yaml "$FB_C_URL" "$FB_C_HOST" "$FB_C_IP" "$FB_C_PORT" "${VETH_NS_IP}:$(fb_inner_port)" 1 "$FB_YAML" \
+      || { ev "SUP fallback config-failed proxy=${FB_C_NAME// /_}"; sup_log "回落代理「${FB_C_NAME}」：gost 生成配置失败"; return 1; }
+    "${NSX[@]}" gost -C "$FB_YAML" >/dev/null 2>&1 &
+    FB_GOST_PID=$!; echo "$FB_GOST_PID" > "$FB_GOST_PID_FILE"
+    sleep 1; rm -f "$FB_YAML"
+    kill -0 "$FB_GOST_PID" 2>/dev/null || { ev "SUP fallback gost-failed proxy=${FB_C_NAME// /_}"; FB_GOST_PID=""; FB_KEY=""; return 1; }
+    FB_KEY=$key
+  fi
+  [ "$FB_C_IP" = "$VETH_HOST_IP" ] || "$IP_CMD" -n "$NETNS_NAME" route replace "${FB_C_IP}/32" via "$VETH_HOST_IP" dev "$VETH_NS" 2>/dev/null
+  "${NSX[@]}" iptables -w -C OUTPUT -d "$FB_C_IP" -p tcp --dport "$FB_C_PORT" -j ACCEPT 2>/dev/null \
+    || "${NSX[@]}" iptables -w -I OUTPUT 1 -d "$FB_C_IP" -p tcp --dport "$FB_C_PORT" -j ACCEPT
+  _fb_redirect add || { ev "SUP fallback redirect-failed"; return 1; }
+  if [ "$FB_ACTIVE" = 0 ] || [ "$FB_NAME" != "$FB_C_NAME" ]; then
+    [ "$FB_ACTIVE" = 0 ] && FB_SINCE=$(now_s)
+    ev "SUP fallback on proxy=${FB_C_NAME// /_} addr=${FB_C_IP}:${FB_C_PORT}"
+    sup_log "VPN 不可用：新连接改走回落代理「${FB_C_NAME}」（${FB_C_IP}:${FB_C_PORT}）"
+  fi
+  FB_ACTIVE=1; FB_NAME=$FB_C_NAME; FB_ADDR="${FB_C_IP}:${FB_C_PORT}"
+  printf '%s %s %s\n' "$FB_SINCE" "$FB_ADDR" "$FB_NAME" > "$FB_STATE_FILE"
+  return 0
+}
+# VPN 不通期间每 10 秒看一次：没回落就尝试回落；正在用的代理断了就重选
+fb_tick() {
+  [ "$FB_MODE" = 1 ] && [ "$EVER_UP" = 1 ] || return 0
+  local now; now=$(now_s); [ "$now" -ge "$FB_NEXT" ] || return 0
+  FB_NEXT=$((now + 10))
+  if [ "$FB_ACTIVE" = 1 ] && kill -0 "${FB_GOST_PID:-0}" 2>/dev/null && _tcp_probe "${FB_ADDR%:*}" "${FB_ADDR##*:}"; then return 0; fi
+  [ "$FB_ACTIVE" = 1 ] && ev "SUP fallback check-failed proxy=${FB_NAME// /_} → reselect"
+  fb_engage || true
+  return 0
+}
+
 # 重连前恢复网络基线。openconnect 被 kill -9 / 崩溃时来不及运行 vpnc-script 的 disconnect：
 # netns 里默认路由还指向已消失的 tun、resolv.conf 还是 VPN 的 DNS，下一次连接连网关域名都解析不了
 # （实测 kill -9 后重连报 getaddrinfo failed）。正常退出时 vpnc-script 自己会还原，这里幂等补一次。
@@ -1320,7 +1759,7 @@ sup_classify() {
 }
 
 # 可被 SIGTERM 打断的 sleep
-sup_sleep() { local n="$1"; while [ "$n" -gt 0 ] && [ "$SUP_STOP" = 0 ]; do sleep 1 & wait $! 2>/dev/null; n=$((n-1)); done; }
+sup_sleep() { local end=$(( $(now_s) + $1 )); while [ "$(now_s)" -lt "$end" ] && [ "$SUP_STOP" = 0 ]; do fb_tick; sleep 1 & wait $! 2>/dev/null; done; }
 
 sup_on_up() {
   local first=0 took=$(( $(now_s) - OC_START )); [ "$EVER_UP" = 0 ] && first=1
@@ -1331,6 +1770,7 @@ sup_on_up() {
       sup_start_proxy || { ev "SUP proxy-failed"; SUP_STOP=1; PAUSED_REASON="failed:proxy"; return 1; }
     fi
   fi
+  [ "$FB_MODE" = 1 ] && _fb_disengage vpn-up
   set_phase up
   ev "SUP up session=$SESSION_N took=${took}s pid=$OC_PID"
   sup_log "隧道已就绪（第 $SESSION_N 次连接，用时 ${took}s）"
@@ -1354,6 +1794,7 @@ _supervise() {
     sup_log "发现上次会话的残留，先清理"; _teardown_session >/dev/null 2>&1
   fi
   GOST_PID=""; _FWD_DESC=""; _FWD_STATE=""   # 清理时 source 过旧 state，避免沿用旧值
+  FB_MODE=0; FB_ACTIVE=0; FB_KEY=""; FB_GOST_PID=""; rm -f "$FB_STATE_FILE"
   if ! account_load "${CFG[ACCOUNT]}"; then set_phase failed:account; ev "SUP fail reason=account"; exit 3; fi
   GW_NAME=$(gw_host_of "${CFG[ACCOUNT]}")
   sup_log "账户：${VPN_DESC}（协议 $(sup_proto)）  模式：${CFG[MODE]}  数据通道：${CFG[DATA_CHANNEL]}"
@@ -1363,7 +1804,8 @@ _supervise() {
       if [ "${CFG[IPV6_FORWARD]}" = on ]; then OCM_IPV6_FORWARD=1; else OCM_IPV6_FORWARD=0; fi
       setup_netns >/dev/null || { set_phase failed:netns; ev "SUP fail reason=netns"; _teardown_session >/dev/null 2>&1; exit 3; }
       sup_log "Netns ${NETNS_NAME} 已就绪"
-      if [ "${CFG[KILL_SWITCH]}" = on ]; then ks_apply || { set_phase failed:kill-switch; _teardown_session >/dev/null 2>&1; exit 3; }; fi ;;
+      if [ "${CFG[KILL_SWITCH]}" = on ] || [ "${CFG[KILL_SWITCH]}" = proxy ]; then ks_apply || { set_phase failed:kill-switch; _teardown_session >/dev/null 2>&1; exit 3; }; fi
+      [ "${CFG[KILL_SWITCH]}" = proxy ] && { FB_MODE=1; fb_prepare; } ;;
     default)
       ORIG_DEF4=$("$IP_CMD" -4 route show default 2>/dev/null | grep -v ' dev tun\| dev ocmtun' | head -n1)
       setup_ssh_protect_routes >/dev/null || { set_phase failed:routes; ev "SUP fail reason=ssh-protect-routes"; _teardown_session >/dev/null 2>&1; exit 3; }
@@ -1389,6 +1831,7 @@ _supervise() {
       if [ $up = 0 ]; then
         if sup_tunnel_up; then up=1; sup_on_up || break
         elif [ $(( $(now_s) - t0 )) -ge 75 ]; then sup_log "75 秒内隧道未就绪，结束本次尝试"; kill -TERM "$OC_PID" 2>/dev/null; fi
+        [ $up = 0 ] && fb_tick
         interval=1
       else
         sup_check_children; interval=3
@@ -1400,6 +1843,7 @@ _supervise() {
     [ "$SUP_STOP" = 1 ] && break
     set_phase reconnecting   # 立刻反映掉线，不要在判断原因的这几秒里仍显示 up
     rm -f "$PID_FILE"
+    [ "$FB_MODE" = 1 ] && { FB_NEXT=0; fb_tick; }   # 立刻回落，不等判断原因与退避
     sleep 1   # 让日志管道把 openconnect 最后几行写完，再判断退出原因
     age=$(( $(now_s) - OC_START )); kind=$(sup_classify "$rc" "$up")
     ev "SUP exit session=$SESSION_N rc=$rc kind=$kind session_age=$age session_age_h=$(fmt_dur $age) was_up=$up"
@@ -1440,6 +1884,7 @@ _supervise() {
   if [ -n "$OC_PID" ] && kill -0 "$OC_PID" 2>/dev/null; then
     sup_log "正在登出 openconnect..."; kill -TERM "$OC_PID" 2>/dev/null; _wait_pid_gone "$OC_PID"
   fi
+  [ "$FB_MODE" = 1 ] && { _fb_disengage stop; _fb_stop_gost; }
   _teardown_session >/dev/null 2>&1
   rm -f "$RESTART_REQ" "$PID_FILE"
   ev "SUP stop reason=${PAUSED_REASON:-requested} sessions=$SESSION_N"
@@ -1461,7 +1906,8 @@ show_summary() {
   local acc_proto; acc_proto=$(account_field "${CFG[ACCOUNT]}" 6 2>/dev/null || true)
   [ -n "$acc_proto" ] && printf '    %-14s %s\n' "" "（账户自带协议 ${acc_proto}，优先于上一行）"
   case "${CFG[MODE]}" in
-    netns) for k in SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST; do printf '    %-14s %s\n' "${SET_TITLE[$k]}" "$(cfg_label "$k")"; done ;;
+    netns) for k in SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST; do printf '    %-14s %s\n' "${SET_TITLE[$k]}" "$(cfg_label "$k")"; done
+           [ "${CFG[KILL_SWITCH]}" = proxy ] && printf '    %-14s %s（列表 %s 个）\n' "${SET_TITLE[FALLBACK_PROXY]}" "$(cfg_label FALLBACK_PROXY)" "$(proxies_count)" ;;
     ocproxy) printf '    %-14s %s\n' "${SET_TITLE[SOCKS_PORT]}" "127.0.0.1:${CFG[SOCKS_PORT]}" ;;
   esac
   printf '    %-14s %s\n' "${SET_TITLE[AUTO_RECONNECT]}" "$(cfg_label AUTO_RECONNECT)"
@@ -1482,6 +1928,12 @@ start_preflight() {
       if [ "${CFG[FORWARDER]}" = socat ]; then ensure_cmd_socat || return 1; fi
       _check_port_free "${CFG[SOCKS_PORT]}" || { log_err "端口 ${CFG[SOCKS_PORT]} 已被占用，换一个（设置 → SOCKS5 端口）。"; return 1; }
       [ "${CFG[LISTEN]}" = 0.0.0.0 ] && [ -z "${CFG[SOCKS_USER]}" ] && log_warn "SOCKS5 对全部网卡开放且没有认证——任何人都能用你的代理。建议设置认证。"
+      if [ "${CFG[KILL_SWITCH]}" = proxy ]; then
+        [ "$(proxies_count)" -gt 0 ] || { log_err "断线保护设为「回落代理」，但还没有回落代理：先在主菜单 11 或用 ocm proxy add 添加。"; return 1; }
+        local fp="${CFG[FALLBACK_PROXY]:-auto}" _l
+        [ "$fp" = auto ] || proxy_find "$fp" >/dev/null || { log_err "回落代理「$fp」不在列表里（ocm proxy list）。"; return 1; }
+        while IFS= read -r _l; do proxy_parse "$_l" || log_warn "回落代理列表有一行格式错误，会被跳过：${_l%%|*}（$P_ERR）"; done < <(_proxies_lines)
+      fi
       ;;
     ocproxy)
       ensure_pkg_ocproxy
@@ -1669,6 +2121,14 @@ cmd_status() {
     [ -n "$FORWARDER" ] && printf '  转发 %s' "$FORWARDER"
     echo
     is_vpn_running && printf 'openconnect: pid %s，已运行 %s\n' "$(cat "$PID_FILE")" "$(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
+    if [ "${KILL_SWITCH:-}" = proxy ]; then
+      if [ -r "$FB_STATE_FILE" ]; then
+        local fs fa fn; read -r fs fa fn < "$FB_STATE_FILE"
+        printf '回落代理  : 使用中「%s」%s（已 %s，VPN 恢复后自动切回）\n' "$fn" "$fa" "$( [[ "$fs" =~ ^[0-9]+$ ]] && fmt_dur $(( $(now_s) - fs )) || echo '?')"
+      else
+        printf '回落代理  : 待命（VPN 掉线时启用；%s）\n' "$(cfg_label FALLBACK_PROXY)"
+      fi
+    fi
   else
     echo "当前会话  : 无"
   fi
@@ -1895,6 +2355,8 @@ sample() {
     fi
   fi
   [ -z "$proxy" ] && FALLBACK=0
+  S_FB="-"
+  if [ -r "$FB_STATE_FILE" ]; then local _fa _fn; read -r _ _fa _fn < "$FB_STATE_FILE"; S_FB="${_fn// /_}@${_fa}"; fi
 
   # --- 判定候选状态 ---
   REASON=""
@@ -1934,11 +2396,11 @@ sample() {
     fi
   fi
 
-  LINE=$(printf '%s st=%s mode=%s proto=%s oc=%s age=%s sess=%s ocn=%s gost=%s socat=%s tun=%s/%s ip=%s deftun=%s rx=%s tx=%s listen=%s socks=%s/%sms xprobe=%s tping=%s gw=%s gwtcp=%s gwping=%s hping=%s nat=%s fwd=%s veth=%s retr=%s tmo=%s eg=%s nsdns=%s mem=%sMB%s' \
+  LINE=$(printf '%s st=%s mode=%s proto=%s oc=%s age=%s sess=%s ocn=%s gost=%s socat=%s tun=%s/%s ip=%s deftun=%s rx=%s tx=%s listen=%s socks=%s/%sms xprobe=%s tping=%s gw=%s gwtcp=%s gwping=%s hping=%s nat=%s fwd=%s veth=%s retr=%s tmo=%s eg=%s nsdns=%s fb=%s mem=%sMB%s' \
     "$S_TS" "$CAND" "${ST_MODE:--}" "${ST_PROTO:--}" "$S_OCPID" "$S_OCAGE" "$S_SESS" "$S_OCN" "$S_GOST" "$S_SOCAT" \
     "$S_TUN" "$S_TUNST" "$S_TUNIP" "$S_DEFTUN" "$S_RX" "$S_TX" "$S_LISTEN" "$S_SOCKS" "$S_SOCKSMS" "$S_XPROBE" \
     "$S_TPING" "$S_GWIP" "$S_GWTCP" "$S_GWPING" "$S_HPING" "$S_NAT" "$S_FWD" "$S_VETH" "$S_RETR" "$S_TMO" \
-    "$S_EG" "$S_NSDNS" "$S_MEM" "$([ -n "$REASON" ] && printf ' why=%s' "$REASON")")
+    "$S_EG" "$S_NSDNS" "$S_FB" "$S_MEM" "$([ -n "$REASON" ] && printf ' why=%s' "$REASON")")
 }
 
 # ---------------- 现场快照 ----------------
@@ -2185,7 +2647,8 @@ cmd_report() {
       if ($4=="exit") { sx++; sk[kv("kind")]++ }
       if ($4=="up") sup++
       if ($4=="paused" || $4=="rate-limited") ahP++
-      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect)$/) { ah++; ahs[ah]=$0 }
+      if ($4=="fallback") { if ($5=="on") fbn++; else if ($5=="off") fbd+=kv("dur")+0; else if ($5=="unavailable") fbu++ }
+      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect|fallback)$/) { ah++; ahs[ah]=$0 }
       next
     }
     $3=="WATCH" && $4=="restart-request" && e>=cut { wr++; ah++; ahs[ah]=$0; next }
@@ -2224,6 +2687,7 @@ cmd_report() {
       printf "（最近 15 条）：\n"
       if (!ah) print "  （无）"
       for (i=(ah>15?ah-14:1); i<=ah; i++) print "  " ahs[i]
+      if (fbn || fbu) printf "回落代理：启用 / 切换 %d 次，累计使用 %s；回落代理全部不可用 %d 次\n", fbn, dur(fbd), fbu
       printf "\n会话里程碑（最近 12 条，共 %d）：\n", sm
       for (i=(sm>12?sm-11:1); i<=sm; i++) print "  " sms[i]
       printf "\nopenconnect 关键消息统计：\n"; nc=0
@@ -2497,6 +2961,10 @@ show_status() {
     if is_vpn_running; then
       echo -e "    ${C_BOLD}本次会话:${C_RESET} 已连接 $(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
     fi
+    if [ -r "$FB_STATE_FILE" ]; then
+      local fs fa fn; read -r fs fa fn < "$FB_STATE_FILE"
+      echo -e "    ${C_YELLOW}回落代理:${C_RESET} 使用中「${fn}」${fa}（VPN 恢复后自动切回）"
+    fi
     if [ -r "$WATCH_LIB/current" ]; then
       local st ws eg; read -r st ws _ < "$WATCH_LIB/current"
       eg=$(grep -o ' eg=[0-9.]*' "$SAMPLES" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
@@ -2554,9 +3022,10 @@ main_menu() {
   echo -e "  8) 📦 检查/安装依赖"
   echo -e "  9) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
   echo -e " 10) 🗑️  卸载"
+  echo -e " 11) 🛟 管理回落代理（断线保护的备用出口）"
   echo -e "  0) 🚪 退出"
   echo
-  read -rp "请选择 [0-10]: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
+  read -rp "请选择 [0-11]: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
   case "$c" in
     1) OVR=(); cmd_start 1 || true ;;
     2) if svc_active; then OVR=(); cmd_stop || true; sleep 2; fi; cmd_start 1 || true ;;
@@ -2568,6 +3037,7 @@ main_menu() {
     8) manage_deps || true ;;
     9) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then test_netns_ipv6 || true; else log_err "Netns 模式未运行，无法测试"; fi ;;
     10) uninstall; exit 0 ;;
+    11) manage_proxies ;;
     0) exit 0 ;;
     *) log_err "无效选项 '$c'" ;;
   esac
@@ -2591,7 +3061,8 @@ OpenConnect Master Manager v${VERSION}
           --listen ADDR        127.0.0.1 | 0.0.0.0
           --tls-only | --dtls  数据通道：仅 TLS（--no-dtls）/ ESP·DTLS
           --fwd socat|iptables 端口转发方式
-          --kill-switch on|off 断线保护
+          --kill-switch on|off|proxy  断线保护（proxy = 掉线期间改走回落代理）
+          --fallback 名称|auto 回落代理选择（配合 --kill-switch proxy）
           --dns fast|system    DNS 超时策略
           --mtu N|auto         隧道 MTU
           --oc-args "..."      附加给 openconnect 的参数
@@ -2609,17 +3080,23 @@ OpenConnect Master Manager v${VERSION}
   config get KEY           读取一项
   config set KEY VALUE     修改一项（SOCKS5 认证用 SOCKS_USER / SOCKS_PASS）
   accounts                 列出账户（不显示密码）
+  proxy list               列出回落代理（不显示密码）
+  proxy add ['一行']       添加回落代理：不带参数逐项提问；带参数按文件格式（竖线或 URL 写法）
+  proxy del 序号|名称      删除回落代理
+  proxy test [序号|名称]   从本机经代理访问一次，显示出口 IP（不带参数测全部）
+  proxy format             回落代理文件的格式说明
   install-service          安装/刷新 systemd 单元（启动时会自动做）
   uninstall-service        移除 systemd 单元（不删设置与日志）
   -V, --version            版本
   -h, --help               本帮助
 
-文件：设置 ${SETTINGS_FILE}   账户 ${ACCOUNTS_FILE}   日志 ${LOG_DIR}
+文件：设置 ${SETTINGS_FILE}   账户 ${ACCOUNTS_FILE}   回落代理 ${PROXIES_FILE}   日志 ${LOG_DIR}
 退出码：0 成功  1 失败  2 用法错误  3 已在运行 / 状态冲突
 示例：
   ocm start -m netns -p nc -P 8585 --tls-only --save
   ocm log report 7
   ocm config set DEGRADED_WAIT 60
+  ocm proxy add '香港备用|socks5|203.0.113.20|1080|user|pass' && ocm config set KILL_SWITCH proxy
 EOF
 }
 
@@ -2639,6 +3116,7 @@ parse_start_opts() {
       --dtls) OVR[DATA_CHANNEL]=dtls; shift ;;
       --fwd|--forwarder) [ $# -ge 2 ] || exit 2; _ovr FORWARDER "$2"; shift 2 ;;
       --kill-switch) [ $# -ge 2 ] || exit 2; _ovr KILL_SWITCH "$2"; shift 2 ;;
+      --fallback) [ $# -ge 2 ] || exit 2; _ovr FALLBACK_PROXY "$2"; shift 2 ;;
       --dns) [ $# -ge 2 ] || exit 2
              case "$2" in fast|on) OVR[DNS_FAST]=on ;; system|off) OVR[DNS_FAST]=off ;; *) log_err "--dns 只能是 fast|system"; exit 2;; esac; shift 2 ;;
       --mtu) [ $# -ge 2 ] || exit 2; _ovr MTU "$2"; shift 2 ;;
@@ -2703,6 +3181,7 @@ main_entry() {
     heal)          shift; cmd_heal "$@" ;;
     config)        shift; cmd_config "$@" ;;
     accounts)      check_root; accounts_list ;;
+    proxy|proxies) shift; cmd_proxy "$@" ;;
     install-service)   check_root; settings_load; install_units && log "systemd 单元已就绪：$SVC_MAIN / $SVC_WATCH" ;;
     uninstall-service) check_root; uninstall_units; log "已移除 systemd 单元（设置与日志保留）" ;;
     _supervise)    _supervise ;;

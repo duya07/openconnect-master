@@ -1,0 +1,42 @@
+# ocm 回落代理列表（设置「断线保护」= 回落代理 时使用）
+# 本文件含明文密码，权限必须是 600：chmod 600 /etc/oc-master/proxies.conf
+#
+# VPN 掉线 / 重连期间，SOCKS5 代理的新连接改走这里的代理；VPN 恢复后新连接自动切回 VPN，
+# 回落期间已建立的连接不受影响。代理都连不上时直接失败，绝不改走 VPS 自己的出口。
+# 设置「回落代理选择」= auto（默认）时按从上到下的顺序，用第一个能连上的；也可以固定为某个显示名。
+# 改完本文件不用重启：下一次掉线时自动按新内容生效。测试：ocm proxy test
+#
+# 每行一个代理，两种写法任选（# 开头为注释，空行忽略）：
+#
+# 写法一：竖线分列（推荐）
+#   显示名|类型|地址|端口|用户名(可选)|密码(可选)
+#   - 用户名、密码里有 @ : / % # ? 等字符直接照写，不用转义；密码在最后一列，里面有 | 也可以
+#   - 没有认证就省略最后两列
+#
+# 写法二：URL
+#   显示名|类型://用户名:密码@地址:端口[?参数]
+#   - 第 2 列里有 :// 就按 URL 读取
+#   - 用户名、密码里的特殊字符要按 URL 规则编码：@ → %40   : → %3A   / → %2F   % → %25   # → %23
+#
+# 类型（不区分大小写）：
+#   socks5      SOCKS5。别名 s5、s5h、socks5h、socks 都按它处理；目标域名一律交给上游代理解析（即 s5h 的效果）
+#   socks4      SOCKS4（没有密码，用户名可选）        socks4a   SOCKS4a
+#   http        HTTP 代理（CONNECT）。别名 h
+#   https       走 TLS 的 HTTP 代理（等同 http+tls）
+#   ss          Shadowsocks：「用户名」填加密方式（如 aes-256-gcm、chacha20-ietf-poly1305），「密码」填密码
+#   socks5+tls  套 TLS 的 SOCKS5
+#   socks5+ws / socks5+wss   套 WebSocket（wss 带 TLS）的 SOCKS5；路径用 URL 写法加 ?path=/ws
+#   不支持 vmess / vless / trojan / hysteria：先在本机用对应客户端开一个 socks5 端口，再把它填进来
+#
+# 地址：域名或 IPv4（暂不支持 IPv6 地址）。域名在宿主上解析（断线期间 netns 里不能做 DNS）。
+#   代理就跑在这台 VPS 上时写 127.0.0.1 或 localhost：脚本会换成 192.168.200.1（netns 看到的宿主地址），
+#   所以那个代理必须监听 0.0.0.0 或 192.168.200.1，只监听 127.0.0.1 是连不上的。
+#
+# 示例（去掉行首的 # 即可启用）：
+# 香港备用|socks5|203.0.113.20|1080|user|p@ss:word
+# 无认证S5|s5h|203.0.113.21|1080
+# 公司HTTP|http|proxy.example.com|3128|alice|secret
+# 日本SS|ss|203.0.113.30|8388|aes-256-gcm|ss-password
+# TLS代理|https://bob:pa%40ss@proxy.example.com:443
+# WS代理|socks5+wss://carol:pw@proxy.example.com:443?path=/ws
+# 本机代理|socks5|127.0.0.1|7890

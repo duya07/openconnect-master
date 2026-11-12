@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- Global Configuration ---
-VERSION="8.0.0"
+VERSION="8.1.0"
 VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
@@ -34,10 +34,14 @@ DEPS_MARK_FILE="${DEPS_STATE_DIR}/installed-deps"
 # --- v8: settings / runtime / logs ---
 CONF_DIR="/etc/oc-master"
 SETTINGS_FILE="${CONF_DIR}/settings.conf"
+PROXIES_FILE="${CONF_DIR}/proxies.conf"  # fallback proxy list (600, contains plaintext passwords; used when kill switch = proxy)
 RUN_DIR="/run/oc-master"
 RUN_PROFILE="${RUN_DIR}/run.conf"        # effective settings of the current start (600; no VPN password)
 PHASE_FILE="${RUN_DIR}/phase"            # supervisor phase: starting/connecting/up/reconnecting/stopping/stopped/failed:<reason>
 RESTART_REQ="${RUN_DIR}/restart-request" # watch process requests a soft reconnect
+FB_STATE_FILE="${RUN_DIR}/fallback"          # exists while falling back: start-time IP:port display-name
+FB_GOST_PID_FILE="${RUN_DIR}/fallback-gost.pid"
+FB_YAML="${RUN_DIR}/fallback-gost.yaml"      # config of the fallback gost (600, contains proxy passwords; deleted as soon as gost has started)
 SESSION_LOG="${RUN_DIR}/oc-session.log"  # output of the current openconnect run (used to classify the exit reason)
 LOG_DIR="/var/log/oc-master"
 EVENTS="${LOG_DIR}/events.log"
@@ -621,7 +625,8 @@ SET_REGISTRY=(
   "LISTEN|choice|127.0.0.1|127.0.0.1:Local only (access via SSH tunnel),0.0.0.0:All interfaces (publicly exposed)|Listen scope|Proxy"
   "SOCKS_AUTH|auth|||SOCKS5 authentication|Proxy"
   "FORWARDER|choice|socat|socat:socat process relay (IPv4+IPv6 entry),iptables:iptables double NAT (IPv4 entry only)|Port forwarding method|Proxy"
-  "KILL_SWITCH|choice|off|off:Off (proxy uses the VPS egress while the VPN is down),on:On (proxy fails outright while the VPN is down)|Kill switch|Security"
+  "KILL_SWITCH|choice|off|off:Off (proxy uses the VPS egress while the VPN is down),on:On (proxy fails outright while the VPN is down),proxy:Fallback proxy (use the given proxies while the VPN is down; fail if none is reachable)|Kill switch|Security"
+  "FALLBACK_PROXY|text|auto|auto:Auto (first reachable one in list order)|Fallback proxy choice|Security"
   "DNS_FAST|choice|off|off:System default (waits 5 s each time),on:Fast retry (1 s × 3 attempts; rotating servers)|DNS timeout policy|Network"
   "IPV6_FORWARD|choice|off|off:Off,on:On|Host IPv6 forwarding|Network"
   "AUTO_RECONNECT|choice|on|on:On,off:Off|Auto reconnect|Supervisor"
@@ -644,7 +649,7 @@ for _e in "${SET_REGISTRY[@]}"; do
 done
 unset _e _k _t _d _c _ti _g
 # Keys that need a VPN restart to take effect after a change (supervisor/logging keys are read live while running)
-SET_NEEDS_RESTART=" ACCOUNT MODE PROTOCOL DATA_CHANNEL RECONNECT_TIMEOUT MTU OC_EXTRA SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST IPV6_FORWARD "
+SET_NEEDS_RESTART=" ACCOUNT MODE PROTOCOL DATA_CHANNEL RECONNECT_TIMEOUT MTU OC_EXTRA SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH FALLBACK_PROXY DNS_FAST IPV6_FORWARD "
 
 _set_help() {
   case "$1" in
@@ -677,9 +682,17 @@ Username must not contain @ : / quotes backslash whitespace; password must not c
     FORWARDER) echo "Forwards the host port to the SOCKS5 server inside netns:
 socat   : process-level relay, reachable over both IPv4+IPv6 on the host side, the safest choice (default).
 iptables: kernel double NAT, no extra process, but IPv4 entry only.";;
-    KILL_SWITCH) echo "Off: during the few seconds the VPN is down/reconnecting the proxy still responds, but traffic leaves via the VPS's own IP.
-On: when the VPN is down the proxy fails outright (the firewall inside netns only allows the tunnel), so traffic never leaves via the VPS egress;
-    the cost is that requests error out while reconnecting. Netns mode only.";;
+    KILL_SWITCH) echo "Off           : during the few seconds the VPN is down/reconnecting the proxy still responds, but traffic leaves via the VPS's own IP.
+On            : when the VPN is down the proxy fails outright (the firewall inside netns only allows the tunnel), so traffic never leaves via the VPS egress;
+                the cost is that requests error out while reconnecting.
+Fallback proxy: when the VPN is down, new connections automatically go through a proxy from the [fallback proxy] list (${PROXIES_FILE}) and switch back once the VPN recovers;
+                connections made during fallback are not cut by the switch back. If no proxy is reachable it behaves like On: fails outright, never via the VPS egress.
+                Add proxies via main menu 11 [Manage fallback proxies] or ocm proxy add; test them with ocm proxy test.
+All of the above apply to netns mode only.";;
+    FALLBACK_PROXY) echo "Which proxy to use when kill switch = fallback proxy:
+auto        : on every disconnect, check the list top to bottom (TCP connect test) and use the first reachable one; if the proxy in use goes down, the next one is picked automatically.
+display name: use only this one; if it is unreachable, fail outright.
+List: ${PROXIES_FILE} (main menu 11 or ocm proxy list). Changes to the list need no restart; the next disconnect uses the new content.";;
     DNS_FAST) echo "If the DNS pushed by the VPN often drops packets, programs wait 5 seconds for every lost query, so pages hang now and then.
 on: adds options timeout:1 attempts:3 rotate to the netns resolv.conf, retrying after 1 second and rotating servers on loss.
 Netns mode only; re-applied automatically after every (re)connect (vpnc-script rewrites that file on every connect).";;
@@ -745,6 +758,7 @@ settings_validate() {
     SOCKS_PASS) [ -z "$v" ] && return 0
       case "$v" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "Password must not contain / quotes backslash whitespace"; return 1;; esac; return 0;;
     OC_EXTRA|EXTRA_PROBE_URL) case "$v" in *$'\n'*) log_err "Must not contain newlines"; return 1;; esac; return 0;;
+    FALLBACK_PROXY) [ -z "$v" ] || [ "$v" = auto ] || proxy_find "$v" >/dev/null || { log_err "Fallback proxy choice must be auto or the display name of a proxy in the list (ocm proxy list)"; return 1; }; return 0;;
   esac
   case "${SET_TYPE[$k]:-}" in
     choice) IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]}"
@@ -763,6 +777,7 @@ cfg_label() {
     SOCKS_AUTH) if [ -n "${CFG[SOCKS_USER]:-}" ]; then echo "${CFG[SOCKS_USER]}:****"; else echo "none"; fi; return;;
     ACCOUNT) echo "${v}) $(account_field "$v" 1 2>/dev/null || echo '?')"; return;;
     OC_EXTRA|EXTRA_PROBE_URL) echo "${v:-(empty)}"; return;;
+    FALLBACK_PROXY) if [ -z "$v" ] || [ "$v" = auto ]; then echo "Auto (first reachable one in list order)"; else echo "Fixed: $v"; fi; return;;
   esac
   IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]:-}"
   for c in "${_cs[@]}"; do [ "${c%%:*}" = "$v" ] && { echo "${c#*:}"; return; }; done
@@ -803,6 +818,321 @@ accounts_list() {
   [ $n -gt 0 ] || echo "  (no accounts)"
 }
 gw_host_of() { local h; h=$(account_field "$1" 4 2>/dev/null || true); h=${h#https://}; h=${h#http://}; h=${h%%/*}; h=${h%%:*}; printf '%s' "$h"; }
+
+# ============================================================================
+#  Fallback proxies (kill switch = proxy: while the VPN is down, new SOCKS5 connections go through the proxies here)
+#  File: /etc/oc-master/proxies.conf (600, contains plaintext passwords); format: see _proxies_template (written as the file header when the file is created).
+#  Each line is first normalised into a gost proxy URL, then handed to gost itself to parse (gost -F URL -O yaml), so behaviour matches gost exactly.
+# ============================================================================
+_proxies_template() { cat <<'EOT'
+# ocm fallback proxy list (used when the setting [Kill switch] = fallback proxy)
+# This file contains plaintext passwords; its permissions must be 600: chmod 600 /etc/oc-master/proxies.conf
+#
+# While the VPN is down / reconnecting, new connections to the SOCKS5 proxy go through the proxies here; once the VPN recovers, new connections switch back to the VPN automatically,
+# and connections established during fallback are not affected. If no proxy is reachable, connections fail outright and never use the VPS's own egress.
+# With [Fallback proxy choice] = auto (default) the first reachable proxy from top to bottom is used; it can also be fixed to one display name.
+# No restart needed after editing this file: the new content takes effect at the next disconnect. Test: ocm proxy test
+#
+# One proxy per line, in either of two notations (lines starting with # are comments, empty lines are ignored):
+#
+# Notation 1: pipe-separated columns (recommended)
+#   DisplayName|Type|Address|Port|Username(optional)|Password(optional)
+#   - characters such as @ : / % # ? in the username or password are written as-is, no escaping; the password is the last column, so it may even contain |
+#   - without authentication, omit the last two columns
+#
+# Notation 2: URL
+#   DisplayName|type://username:password@address:port[?params]
+#   - if column 2 contains :// it is read as a URL
+#   - special characters in the username/password must be URL-encoded: @ → %40   : → %3A   / → %2F   % → %25   # → %23
+#
+# Types (case-insensitive):
+#   socks5      SOCKS5. Aliases s5, s5h, socks5h, socks are treated the same; target domains are always resolved by the upstream proxy (i.e. s5h behaviour)
+#   socks4      SOCKS4 (no password, username optional)        socks4a   SOCKS4a
+#   http        HTTP proxy (CONNECT). Alias h
+#   https       HTTP proxy over TLS (same as http+tls)
+#   ss          Shadowsocks: put the cipher in [Username] (e.g. aes-256-gcm, chacha20-ietf-poly1305) and the password in [Password]
+#   socks5+tls  SOCKS5 wrapped in TLS
+#   socks5+ws / socks5+wss   SOCKS5 over WebSocket (wss with TLS); set the path with the URL notation plus ?path=/ws
+#   vmess / vless / trojan / hysteria are not supported: first run the matching client on this host with a socks5 port, then add that port here
+#
+# Address: domain or IPv4 (IPv6 addresses are not supported yet). Domains are resolved on the host (no DNS inside netns while the VPN is down).
+#   If the proxy runs on this VPS, write 127.0.0.1 or localhost: the script replaces it with 192.168.200.1 (the host address as seen from netns),
+#   so that proxy must listen on 0.0.0.0 or 192.168.200.1; one listening only on 127.0.0.1 cannot be reached.
+#
+# Examples (remove the leading # to enable):
+# HK-backup|socks5|203.0.113.20|1080|user|p@ss:word
+# NoAuth-S5|s5h|203.0.113.21|1080
+# Office-HTTP|http|proxy.example.com|3128|alice|secret
+# JP-SS|ss|203.0.113.30|8388|aes-256-gcm|ss-password
+# TLS-proxy|https://bob:pa%40ss@proxy.example.com:443
+# WS-proxy|socks5+wss://carol:pw@proxy.example.com:443?path=/ws
+# Local-proxy|socks5|127.0.0.1|7890
+EOT
+}
+_proxies_ensure_file() {
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  [ -f "$PROXIES_FILE" ] || ( umask 077; _proxies_template > "$PROXIES_FILE" )
+  chmod 600 "$PROXIES_FILE" 2>/dev/null || true
+}
+_proxies_lines() { { tr -d '\r' < "$PROXIES_FILE" | grep -vE '^[[:space:]]*#|^[[:space:]]*$'; } 2>/dev/null || true; }
+proxies_count() { _proxies_lines | wc -l; }
+proxy_line() { _proxies_lines | sed -n "${1}p"; }
+proxy_find() { _proxies_lines | awk -F'|' -v a="$1" '$1==a{print NR; f=1; exit} END{exit !f}'; }
+# Index or display name → index
+proxy_resolve_ref() {
+  local a="$1" n; n=$(proxies_count)
+  if [[ "$a" =~ ^[0-9]+$ ]]; then [ "$a" -ge 1 ] && [ "$a" -le "$n" ] && { echo "$a"; return 0; }; return 1; fi
+  proxy_find "$a"
+}
+# Type alias → gost protocol name. Anything outside the whitelist is rejected: gost silently treats unknown protocol names as http (verified with socks5h://)
+_proxy_norm_type() {
+  case "${1,,}" in
+    s5|s5h|socks|socks5|socks5h) echo socks5 ;;
+    s4|socks4) echo socks4 ;;
+    socks4a)   echo socks4a ;;
+    h|http)    echo http ;;
+    https|http+tls) echo http+tls ;;
+    ss|shadowsocks) echo ss ;;
+    socks5+tls|socks5+ws|socks5+wss) echo "${1,,}" ;;
+    *) return 1 ;;
+  esac
+}
+# URL percent-encoding (byte-wise, keeping only RFC 3986 unreserved characters)
+_pct_enc() {
+  local LC_ALL=C s="$1" i c o=""
+  for ((i=0; i<${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in [A-Za-z0-9._~-]) o+=$c ;; *) printf -v c '%%%02X' "'$c"; o+=$c ;; esac
+  done
+  printf '%s' "$o"
+}
+# Parse one line → P_NAME P_TYPE P_HOST P_PORT P_AUTH, P_URL (for gost, includes auth, kept in memory only); on failure sets P_ERR and returns 1
+proxy_parse() {
+  local line="${1%$'\r'}" rest
+  P_NAME=""; P_TYPE=""; P_HOST=""; P_PORT=""; P_URL=""; P_AUTH=0; P_ERR=""
+  case "$line" in *"|"*) ;; *) P_ERR="missing | separator (expected DisplayName|Type|Address|Port... or DisplayName|URL)"; return 1 ;; esac
+  P_NAME=${line%%|*}; rest=${line#*|}
+  [ -n "$P_NAME" ] || { P_ERR="display name is empty"; return 1; }
+  if [[ "$rest" == *"://"* ]]; then
+    local re='^([A-Za-z0-9+]+)://(([^@/?#]*)@)?([A-Za-z0-9.-]+):([0-9]{1,5})/?(\?[^#[:space:]]*)?$'
+    [[ "$rest" =~ $re ]] || { P_ERR="bad URL format (type://[username:password@]address:port[?params]; write @ : / in the password as %40 %3A %2F)"; return 1; }
+    local sch=${BASH_REMATCH[1]} ui=${BASH_REMATCH[3]} q=${BASH_REMATCH[6]}
+    P_HOST=${BASH_REMATCH[4]}; P_PORT=${BASH_REMATCH[5]}
+    P_TYPE=$(_proxy_norm_type "$sch") || { P_ERR="unsupported type: $sch"; return 1; }
+    [ -n "$ui" ] && P_AUTH=1
+    P_URL="${P_TYPE}://${ui:+${ui}@}${P_HOST}:${P_PORT}${q}"
+  else
+    local t h p u pw ui="" r="$rest"
+    # Cut out the first 4 columns one by one; everything left is the password (it may contain |, a trailing | is kept too; read would swallow a trailing |)
+    t=${r%%|*}; r=${r#"$t"}; r=${r#|}
+    h=${r%%|*}; r=${r#"$h"}; r=${r#|}
+    p=${r%%|*}; r=${r#"$p"}; r=${r#|}
+    u=${r%%|*}; r=${r#"$u"}; r=${r#|}
+    pw=$r
+    P_TYPE=$(_proxy_norm_type "$t") || { P_ERR="unsupported type: ${t:-(empty)}"; return 1; }
+    P_HOST=$h; P_PORT=$p
+    [[ "$P_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { P_ERR="address must be a domain or IPv4: ${P_HOST:-(empty)}"; return 1; }
+    [[ "$P_PORT" =~ ^[0-9]{1,5}$ ]] || { P_ERR="port must be a number: ${P_PORT:-(empty)}"; return 1; }
+    if [ -n "$u" ] || [ -n "$pw" ]; then
+      ui=$(_pct_enc "$u"); [ -n "$pw" ] && ui+=":$(_pct_enc "$pw")"; P_AUTH=1
+    fi
+    P_URL="${P_TYPE}://${ui:+${ui}@}${P_HOST}:${P_PORT}"
+  fi
+  [ "$P_PORT" -ge 1 ] && [ "$P_PORT" -le 65535 ] || { P_ERR="port must be 1-65535"; return 1; }
+  [ "$P_TYPE" = ss ] && [ "$P_AUTH" = 0 ] && { P_ERR="ss needs a cipher (username column) and a password"; return 1; }
+  return 0
+}
+# Proxy address → IPv4. $2=ns: as seen from netns (a local proxy becomes the veth host address); host: as seen from the host
+_proxy_ip() {
+  local h="$1" ip=""
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ip=$h
+  elif [ "${h,,}" = localhost ]; then ip=127.0.0.1
+  else ip=$(timeout 5 getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}' || true); fi
+  [ -n "$ip" ] || return 1
+  [ "${2:-ns}" = ns ] && [[ "$ip" == 127.* ]] && ip=$VETH_HOST_IP
+  printf '%s' "$ip"
+}
+_tcp_probe() { timeout 3 bash -c ">/dev/tcp/$1/$2" 2>/dev/null; }
+# Generate the gost config: $1=URL $2=original address $3=actual IP $4=proxy port $5=listen (addr:port) $6=whether the listener uses SOCKS5 auth $7=output file
+_proxy_gen_yaml() {
+  local url="$1" host="$2" ip="$3" port="$4" listen="$5" auth="$6" out="$7" gl tmp
+  gl="socks5://${listen}"
+  [ "$auth" = 1 ] && [ -n "${CFG[SOCKS_USER]:-}" ] && gl="socks5://${CFG[SOCKS_USER]}:${CFG[SOCKS_PASS]}@${listen}"
+  tmp=$(umask 077; mktemp "${out}.XXXXXX") || return 1
+  # gost -O only prints the parsed config and exits without listening; the URL (with password) appears in a root process's arguments only for this instant
+  if ! timeout 10 gost -L "$gl" -F "$url" -O yaml > "$tmp" 2>/dev/null || ! grep -q '^chains:' "$tmp"; then rm -f "$tmp"; return 1; fi
+  if [ "$host" != "$ip" ]; then
+    # Replace the node address with the resolved IP (no DNS inside netns while the VPN is down); TLS serverName keeps the original domain
+    ( umask 077; awk -v from="addr: ${host}:${port}" -v to="addr: ${ip}:${port}" '
+        /^chains:/ {c=1}
+        c && !n && (i=index($0, from)) { $0=substr($0,1,i-1) to substr($0,i+length(from)); n=1 }
+        {print} END{exit !n}' "$tmp" > "$tmp.2" ) || { rm -f "$tmp" "$tmp.2"; return 1; }
+    mv -f "$tmp.2" "$tmp"
+  fi
+  chmod 600 "$tmp"; mv -f "$tmp" "$out"
+}
+proxies_list() {
+  local n=0 line
+  [ -f "$PROXIES_FILE" ] || { echo "  (proxy file does not exist: $PROXIES_FILE)"; return 0; }
+  while IFS= read -r line; do
+    n=$((n+1))
+    if proxy_parse "$line"; then
+      printf '  %d) %s  %s  %s:%s%s\n' "$n" "$P_NAME" "$P_TYPE" "$P_HOST" "$P_PORT" "$( [ "$P_AUTH" = 1 ] && echo '  (with auth)')"
+    else
+      echo -e "  ${n}) ${C_RED}${line%%|*}  format error: ${P_ERR} (this line will be skipped)${C_RESET}"
+    fi
+  done < <(_proxies_lines)
+  [ $n -gt 0 ] || echo "  (no fallback proxies yet)"
+  return 0
+}
+# Access https://api.ipify.org once from this host through the proxy and print the egress IP (the IP websites see during fallback)
+proxy_test_one() {
+  local line ip t0 t1 dir port pid eg i
+  line=$(proxy_line "$1")
+  proxy_parse "$line" || { printf '  %s) %s: format error: %s\n' "$1" "${line%%|*}" "$P_ERR"; return 1; }
+  printf '  %s) %s (%s %s:%s)' "$1" "$P_NAME" "$P_TYPE" "$P_HOST" "$P_PORT"
+  ip=$(_proxy_ip "$P_HOST" host) || { echo " → domain resolution failed ❌"; return 1; }
+  t0=$(ms_now)
+  _tcp_probe "$ip" "$P_PORT" || { echo " → ${ip}:${P_PORT} TCP unreachable ❌"; return 1; }
+  t1=$(ms_now); printf ' → %s TCP %sms' "$ip" "$((t1 - t0))"
+  command -v gost >/dev/null 2>&1 || { echo ", gost not installed, skipping the egress test"; return 0; }
+  dir=$(mktemp -d)
+  for i in 1 2 3 4 5 6 7 8 9 10; do port=$(( RANDOM % 20000 + 30000 )); ss -Hlnt "sport = :$port" 2>/dev/null | grep -q . || break; done
+  _proxy_gen_yaml "$P_URL" "$P_HOST" "$ip" "$P_PORT" "127.0.0.1:${port}" 0 "$dir/t.yaml" \
+    || { echo ", gost cannot parse this proxy ❌"; rm -rf "$dir"; return 1; }
+  gost -C "$dir/t.yaml" >/dev/null 2>&1 & pid=$!
+  for i in 1 2 3 4 5 6; do ss -Hlnt "sport = :$port" 2>/dev/null | grep -q . && break; sleep 0.5; done
+  rm -f "$dir/t.yaml"
+  eg=$("$CURL_CMD" -4 -s --connect-timeout 8 --max-time 15 -x "socks5h://127.0.0.1:${port}" https://api.ipify.org 2>/dev/null || true)
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$dir"
+  if [[ "$eg" =~ ^[0-9.]+$ ]]; then echo ", egress via proxy ${eg} ✅"; return 0; fi
+  echo ", access via the proxy failed (auth / protocol / the proxy's own network?) ❌"; return 1
+}
+proxy_test_all() {
+  local n i; n=$(proxies_count)
+  [ "$n" -gt 0 ] || { echo "  (no fallback proxies yet)"; return 0; }
+  echo "Accessing https://api.ipify.org from this host through each proxy (the egress IP shown is what websites see during fallback):"
+  for ((i=1; i<=n; i++)); do proxy_test_one "$i" || true; done
+  return 0
+}
+_proxy_name_ok() {
+  local d="$1"
+  [ -n "$d" ] || { log_err "Display name cannot be empty"; return 1; }
+  case "$d" in *"|"*) log_err "Display name must not contain |"; return 1 ;; esac
+  [ "$d" = auto ] && { log_err "auto is reserved; choose another display name"; return 1; }
+  proxy_find "$d" >/dev/null && { log_err "A proxy with this name already exists: $d"; return 1; }
+  return 0
+}
+# Validate, then append one line (pipe or URL notation)
+proxy_add_line() {
+  local line="${1%$'\r'}"
+  proxy_parse "$line" || { log_err "Format error: $P_ERR (format help: ocm proxy format)"; return 1; }
+  _proxy_name_ok "$P_NAME" || return 1
+  _proxies_ensure_file
+  printf '%s\n' "$line" >> "$PROXIES_FILE"; chmod 600 "$PROXIES_FILE"
+  ev "CONFIG proxy add name=${P_NAME// /_} type=$P_TYPE addr=${P_HOST}:${P_PORT}"
+  log "Added fallback proxy: ${P_NAME} (${P_TYPE} ${P_HOST}:${P_PORT}$( [ "$P_AUTH" = 1 ] && echo ', with auth'))"
+  return 0
+}
+proxy_add_interactive() {
+  local d t h p u="" pw="" path line yn ui=""
+  echo "Types: socks5 (s5 / s5h)  socks4  socks4a  http  https  ss  socks5+tls  socks5+ws  socks5+wss"
+  read -rp "Display name: " d || return 1; _proxy_name_ok "$d" || return 1
+  read -rp "Type [socks5]: " t || return 1
+  t=$(_proxy_norm_type "${t:-socks5}") || { log_err "Unsupported type"; return 1; }
+  read -rp "Address (domain or IPv4; for a proxy on this host enter 127.0.0.1): " h || return 1
+  read -rp "Port: " p || return 1
+  case "$t" in
+    ss) read -rp "Cipher [aes-256-gcm]: " u || return 1; u=${u:-aes-256-gcm}
+        read -rsp "Password: " pw || return 1; echo ;;
+    socks4|socks4a) read -rp "Username (optional, Enter to skip): " u || return 1 ;;
+    *) read -rp "Username (optional, Enter to skip): " u || return 1
+       if [ -n "$u" ]; then read -rsp "Password: " pw || return 1; echo; fi ;;
+  esac
+  if [[ "$t" == *+ws || "$t" == *+wss ]]; then
+    read -rp "WebSocket path [/ws]: " path || return 1; path=${path:-/ws}; [[ "$path" == /* ]] || path="/$path"
+    if [ -n "$u$pw" ]; then ui=$(_pct_enc "$u"); [ -n "$pw" ] && ui+=":$(_pct_enc "$pw")"; ui+="@"; fi
+    line="${d}|${t}://${ui}${h}:${p}?path=$(_pct_enc "$path")"
+  else
+    line="${d}|${t}|${h}|${p}"
+    [ -n "$u$pw" ] && line+="|${u}"
+    [ -n "$pw" ] && line+="|${pw}"
+  fi
+  proxy_add_line "$line" || return 1
+  read -rp "Test this proxy now? [Y/n]: " yn || yn=n
+  [[ "$yn" =~ ^[nN]$ ]] || proxy_test_one "$(proxy_find "$d")" || true
+  return 0
+}
+proxy_del() {
+  local i name
+  i=$(proxy_resolve_ref "$1") || { log_err "Proxy not found: $1"; return 1; }
+  name=$(proxy_line "$i" | cut -d'|' -f1)
+  ( umask 077; awk -v n="$i" '/^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next} {k++; if (k!=n) print}' "$PROXIES_FILE" > "${PROXIES_FILE}.tmp" ) \
+    || { log_err "Delete failed: cannot write the temporary file"; rm -f "${PROXIES_FILE}.tmp"; return 1; }
+  mv -f "${PROXIES_FILE}.tmp" "$PROXIES_FILE"; chmod 600 "$PROXIES_FILE"
+  ev "CONFIG proxy del name=${name// /_}"; log "Deleted: $name"
+  settings_load
+  if [ "${CFG[FALLBACK_PROXY]}" = "$name" ]; then
+    CFG[FALLBACK_PROXY]=auto; settings_save; ev "CONFIG FALLBACK_PROXY: ${name// /_} -> auto"
+    log_warn "[Fallback proxy choice] was fixed to this proxy; reset to auto (if the VPN is running, this takes effect after a restart)."
+  fi
+  return 0
+}
+proxy_choose() {
+  local a v i old
+  proxies_list
+  read -rp "Index or display name = use only that one; a = back to auto (Enter cancels): " a || return 0
+  [ -z "$a" ] && return 0
+  if [ "$a" = a ] || [ "$a" = auto ]; then v=auto
+  else i=$(proxy_resolve_ref "$a") || { log_err "Proxy not found: $a"; return 1; }; v=$(proxy_line "$i" | cut -d'|' -f1); fi
+  settings_load; old=${CFG[FALLBACK_PROXY]}; CFG[FALLBACK_PROXY]=$v; settings_save
+  ev "CONFIG FALLBACK_PROXY: ${old// /_} -> ${v// /_}"; log "Fallback proxy choice: $(cfg_label FALLBACK_PROXY)"
+  _settings_restart_note FALLBACK_PROXY cfg
+  return 0
+}
+manage_proxies() {
+  _proxies_ensure_file
+  local c a fs fa fn
+  while true; do
+    clear 2>/dev/null || true; settings_load
+    title "🛟 Manage Fallback Proxies (${PROXIES_FILE})"; sep
+    echo -e "  Kill switch: ${C_CYAN}$(cfg_label KILL_SWITCH)${C_RESET}   Fallback proxy choice: ${C_CYAN}$(cfg_label FALLBACK_PROXY)${C_RESET}"
+    [ "${CFG[KILL_SWITCH]}" = proxy ] || echo -e "  ${C_GREY}(the proxies here are only used once [Kill switch] is set to [Fallback proxy]: main menu 5 → Kill switch)${C_RESET}"
+    if [ -r "$FB_STATE_FILE" ]; then read -r fs fa fn < "$FB_STATE_FILE"; echo -e "  ${C_YELLOW}In use: ${fn} (${fa})${C_RESET}"; fi
+    sep; proxies_list; sep
+    echo "  1) Add (field by field)       2) Add (paste one line: pipe or URL notation)   3) Delete"
+    echo "  4) Test all (shows egress IP)  5) Choose which one to use (auto / fixed)      6) Format help"
+    echo "  0) Back                       you can also edit ${PROXIES_FILE} directly (no restart needed)"
+    read -rp "Select: " c || return 0
+    case "$c" in
+      1) proxy_add_interactive || true; _pause ;;
+      2) read -rsp "Paste one line and press Enter (input is not echoed): " a || a=""; echo
+         if [ -n "$a" ]; then proxy_add_line "$a" || true; fi; _pause ;;
+      3) read -rp "Index or display name to delete: " a || a=""
+         if [ -n "$a" ]; then proxy_del "$a" || true; fi; _pause ;;
+      4) proxy_test_all; _pause ;;
+      5) proxy_choose || true; _pause ;;
+      6) _proxies_template | less -R -F -X || true ;;
+      0|"") return 0 ;;
+      *) log_err "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+cmd_proxy() {
+  check_root; settings_load
+  local sub="${1:-list}" i; shift || true
+  case "$sub" in
+    list|ls) echo "Fallback proxies (${PROXIES_FILE})  Kill switch: $(cfg_label KILL_SWITCH)  Choice: $(cfg_label FALLBACK_PROXY)"; proxies_list ;;
+    add)     if [ $# -ge 1 ]; then proxy_add_line "$1" || return 2; else proxy_add_interactive || return 1; fi ;;
+    del|rm)  [ $# -ge 1 ] || { log_err "Usage: ocm proxy del <index|display name>"; return 2; }; proxy_del "$1" || return 1 ;;
+    test)    if [ $# -ge 1 ]; then i=$(proxy_resolve_ref "$1") || { log_err "Proxy not found: $1"; return 2; }; proxy_test_one "$i" || return 1
+             else proxy_test_all; fi ;;
+    format)  _proxies_template ;;
+    path)    echo "$PROXIES_FILE" ;;
+    *) log_err "Usage: ocm proxy list | add ['line'] | del <index|name> | test [index|name] | format | path"; return 2 ;;
+  esac
+  return 0
+}
 
 # --- Stop & cleanup ---
 cleanup_ssh_protect_routes() {
@@ -988,6 +1318,7 @@ _teardown_session() {
         _fwd_teardown "${FORWARDER:-}"
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
+      [ -f "$FB_GOST_PID_FILE" ] && kill "$(cat "$FB_GOST_PID_FILE")" 2>/dev/null || true
       if [ -f "$PID_FILE" ]; then
         local oc_pid; oc_pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
         # Same as default|ocproxy: the pid file may be a stale record, verify identity before signalling
@@ -1026,6 +1357,7 @@ _teardown_session() {
         _wait_pid_gone "$oc_pid"
       fi
       [ -f "$GOST_PID_FILE" ] && kill "$(cat "$GOST_PID_FILE")" 2>/dev/null || true
+      [ -f "$FB_GOST_PID_FILE" ] && kill "$(cat "$FB_GOST_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE" ] && kill "$(cat "$SOCAT_PID_FILE")" 2>/dev/null || true
       [ -f "$SOCAT_PID_FILE_V6" ] && kill "$(cat "$SOCAT_PID_FILE_V6")" 2>/dev/null || true
       cleanup_ssh_protect_routes
@@ -1037,7 +1369,7 @@ _teardown_session() {
   # removed by cleanup_netns after restoring. Otherwise, with a cross-mode sequence like "netns session kill -9'd -> user switches to default
   # mode -> this stop takes the default branch (no cleanup_netns call)", the record would be deleted
   # while ip_forward is already 1, leaving no basis for restoring it.
-  rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6"; log "All temporary files cleaned up, operation complete."
+  rm -f "$PID_FILE" "$STATE_FILE" "$GOST_PID_FILE" "$SOCAT_PID_FILE" "$SOCAT_PID_FILE_V6" "$FB_GOST_PID_FILE" "$FB_STATE_FILE" "$FB_YAML"; log "All temporary files cleaned up, operation complete."
 }
 
 # ============================================================================
@@ -1166,7 +1498,7 @@ sup_build_oc() {
   [ "${CFG[MODE]}" = ocproxy ] && OC_ARGS+=(--script-tun --script "ocproxy -k 30 -D ${CFG[SOCKS_PORT]}")
   # Default global mode uses a fixed interface name: the host may already have another tun0 (overlay network/other VPN), so "any tun" cannot be relied on
   [ "${CFG[MODE]}" = default ] && OC_ARGS+=("--interface=$OC_TUN_DEFAULT")
-  [ "${CFG[MODE]}" = netns ] && [ "${CFG[KILL_SWITCH]}" = on ] && [ -n "$GW_IP" ] && OC_ARGS+=("--resolve=${GW_NAME}:${GW_IP}")
+  [ "${CFG[MODE]}" = netns ] && [[ "${CFG[KILL_SWITCH]}" =~ ^(on|proxy)$ ]] && [ -n "$GW_IP" ] && OC_ARGS+=("--resolve=${GW_NAME}:${GW_IP}")
   if [ -n "${CFG[OC_EXTRA]}" ]; then local -a _x; read -r -a _x <<<"${CFG[OC_EXTRA]}"; OC_ARGS+=("${_x[@]}"); fi
   OC_PREFIX=(); [ "${CFG[MODE]}" = netns ] && OC_PREFIX=("$IP_CMD" netns exec "$NETNS_NAME")
   return 0
@@ -1283,6 +1615,113 @@ ks_apply() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+#  Fallback proxy (KILL_SWITCH=proxy, netns only)
+#  A second gost inside netns (listens only on the veth address; its chain points to the selected proxy). While the VPN is down, a REDIRECT is added to
+#  the netns nat PREROUTING that sends new connections forwarded in from the host to it; once the VPN recovers the rule is removed. conntrack keeps established
+#  connections on their original path, so connections made during fallback survive the switch back - for that the proxy IP gets a /32 route via veth (once the tunnel
+#  recovers the default route goes via tun; without it those connections would be diverted into the tunnel). The kill-switch firewall stays in effect and only additionally allows the selected proxy's
+#  IP:port; if no proxy is reachable, connections fail outright and never use the VPS egress.
+#  Note: connection tracking in a netns is enabled on demand - if the REDIRECT is the only rule that depends on conntrack, deleting it makes the kernel
+#  remove that netns's conntrack hooks, and connections established during fallback are reset right away (verified: deleting only the REDIRECT stopped a download).
+#  So fb_prepare first adds a permanent conntrack rule that semantically changes nothing, to "pin" it.
+# ---------------------------------------------------------------------------
+FB_MODE=0; FB_ACTIVE=0; FB_KEY=""; FB_NAME=""; FB_ADDR=""; FB_SINCE=0; FB_NEXT=0; FB_FAIL_NOTED=0; FB_GOST_PID=""
+FB_C_NAME=""; FB_C_HOST=""; FB_C_IP=""; FB_C_PORT=""; FB_C_URL=""
+fb_inner_port() { if [ "${CFG[SOCKS_PORT]}" = 10800 ]; then echo 10801; else echo 10800; fi; }
+fb_prepare() {
+  # INPUT already defaults to ACCEPT; this rule only exists to keep conntrack enabled in the netns at all times (see the comment above)
+  "$IP_CMD" netns exec "$NETNS_NAME" iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+    || sup_log "Fallback proxy: failed to write the permanent conntrack rule; connections made during fallback may drop when the VPN recovers"
+  return 0
+}
+_fb_redirect() { # add|del
+  local -a NSX=("$IP_CMD" netns exec "$NETNS_NAME")
+  local -a r=(PREROUTING -i "$VETH_NS" -p tcp --dport "${CFG[SOCKS_PORT]}" -j REDIRECT --to-ports "$(fb_inner_port)")
+  if [ "$1" = add ]; then
+    "${NSX[@]}" iptables -w -t nat -C "${r[@]}" 2>/dev/null || "${NSX[@]}" iptables -w -t nat -A "${r[@]}"
+  else
+    while "${NSX[@]}" iptables -w -t nat -D "${r[@]}" 2>/dev/null; do :; done
+    return 0
+  fi
+}
+_fb_stop_gost() {
+  local p="${FB_GOST_PID:-}"; [ -n "$p" ] || p=$(cat "$FB_GOST_PID_FILE" 2>/dev/null || true)
+  [[ "$p" =~ ^[0-9]+$ ]] && kill "$p" 2>/dev/null
+  FB_GOST_PID=""; FB_KEY=""; rm -f "$FB_GOST_PID_FILE" "$FB_YAML"
+  return 0
+}
+# Pick a proxy per the settings: auto = the first one in file order that accepts a TCP connection; fixed name = only that one. Result goes into FB_C_*
+fb_select() {
+  local want="${CFG[FALLBACK_PROXY]:-auto}" line ip
+  FB_C_NAME=""; FB_C_HOST=""; FB_C_IP=""; FB_C_PORT=""; FB_C_URL=""
+  while IFS= read -r line; do
+    proxy_parse "$line" || continue
+    [ "$want" = auto ] || [ "$P_NAME" = "$want" ] || continue
+    ip=$(_proxy_ip "$P_HOST" ns) || continue
+    _tcp_probe "$ip" "$P_PORT" || continue
+    FB_C_NAME=$P_NAME; FB_C_HOST=$P_HOST; FB_C_IP=$ip; FB_C_PORT=$P_PORT; FB_C_URL=$P_URL
+    return 0
+  done < <(_proxies_lines)
+  return 1
+}
+_fb_disengage() { # reason
+  _fb_redirect del
+  if [ "$FB_ACTIVE" = 1 ]; then
+    local d=$(( $(now_s) - FB_SINCE ))
+    ev "SUP fallback off reason=$1 proxy=${FB_NAME// /_} dur=$d dur_h=$(fmt_dur $d)"
+    sup_log "Fallback proxy disengaged (${1}, used for $(fmt_dur $d))"
+  fi
+  FB_ACTIVE=0; FB_NAME=""; FB_ADDR=""; rm -f "$FB_STATE_FILE"
+  return 0
+}
+fb_engage() {
+  local -a NSX=("$IP_CMD" netns exec "$NETNS_NAME")
+  local key
+  if ! fb_select; then
+    if [ "$FB_FAIL_NOTED" = 0 ]; then
+      ev "SUP fallback unavailable want=${CFG[FALLBACK_PROXY]:-auto}"
+      sup_log "No fallback proxy is reachable: the proxy is unavailable until the VPN recovers (it will not switch to the VPS egress)"; FB_FAIL_NOTED=1
+    fi
+    [ "$FB_ACTIVE" = 1 ] && _fb_disengage proxy-unreachable
+    return 1
+  fi
+  FB_FAIL_NOTED=0
+  key=$(printf '%s|%s|%s' "$FB_C_URL" "$FB_C_IP" "$(fb_inner_port)" | sha256sum | cut -c1-16)
+  if [ "$key" != "$FB_KEY" ] || ! kill -0 "${FB_GOST_PID:-0}" 2>/dev/null; then
+    _fb_stop_gost
+    _proxy_gen_yaml "$FB_C_URL" "$FB_C_HOST" "$FB_C_IP" "$FB_C_PORT" "${VETH_NS_IP}:$(fb_inner_port)" 1 "$FB_YAML" \
+      || { ev "SUP fallback config-failed proxy=${FB_C_NAME// /_}"; sup_log "Fallback proxy [${FB_C_NAME}]: gost failed to generate the config"; return 1; }
+    "${NSX[@]}" gost -C "$FB_YAML" >/dev/null 2>&1 &
+    FB_GOST_PID=$!; echo "$FB_GOST_PID" > "$FB_GOST_PID_FILE"
+    sleep 1; rm -f "$FB_YAML"
+    kill -0 "$FB_GOST_PID" 2>/dev/null || { ev "SUP fallback gost-failed proxy=${FB_C_NAME// /_}"; FB_GOST_PID=""; FB_KEY=""; return 1; }
+    FB_KEY=$key
+  fi
+  [ "$FB_C_IP" = "$VETH_HOST_IP" ] || "$IP_CMD" -n "$NETNS_NAME" route replace "${FB_C_IP}/32" via "$VETH_HOST_IP" dev "$VETH_NS" 2>/dev/null
+  "${NSX[@]}" iptables -w -C OUTPUT -d "$FB_C_IP" -p tcp --dport "$FB_C_PORT" -j ACCEPT 2>/dev/null \
+    || "${NSX[@]}" iptables -w -I OUTPUT 1 -d "$FB_C_IP" -p tcp --dport "$FB_C_PORT" -j ACCEPT
+  _fb_redirect add || { ev "SUP fallback redirect-failed"; return 1; }
+  if [ "$FB_ACTIVE" = 0 ] || [ "$FB_NAME" != "$FB_C_NAME" ]; then
+    [ "$FB_ACTIVE" = 0 ] && FB_SINCE=$(now_s)
+    ev "SUP fallback on proxy=${FB_C_NAME// /_} addr=${FB_C_IP}:${FB_C_PORT}"
+    sup_log "VPN unavailable: new connections now go through fallback proxy [${FB_C_NAME}] (${FB_C_IP}:${FB_C_PORT})"
+  fi
+  FB_ACTIVE=1; FB_NAME=$FB_C_NAME; FB_ADDR="${FB_C_IP}:${FB_C_PORT}"
+  printf '%s %s %s\n' "$FB_SINCE" "$FB_ADDR" "$FB_NAME" > "$FB_STATE_FILE"
+  return 0
+}
+# While the VPN is down, check every 10 seconds: if not falling back yet, try to; if the proxy in use went down, reselect
+fb_tick() {
+  [ "$FB_MODE" = 1 ] && [ "$EVER_UP" = 1 ] || return 0
+  local now; now=$(now_s); [ "$now" -ge "$FB_NEXT" ] || return 0
+  FB_NEXT=$((now + 10))
+  if [ "$FB_ACTIVE" = 1 ] && kill -0 "${FB_GOST_PID:-0}" 2>/dev/null && _tcp_probe "${FB_ADDR%:*}" "${FB_ADDR##*:}"; then return 0; fi
+  [ "$FB_ACTIVE" = 1 ] && ev "SUP fallback check-failed proxy=${FB_NAME// /_} → reselect"
+  fb_engage || true
+  return 0
+}
+
 # Restore the network baseline before reconnecting. When openconnect is kill -9'd / crashes, the vpnc-script disconnect never runs:
 # the netns default route still points at the vanished tun and resolv.conf still holds the VPN's DNS, so the next connection cannot even resolve the gateway name
 # (measured: reconnect after kill -9 reports getaddrinfo failed). On a normal exit vpnc-script restores them itself; this is an idempotent backup.
@@ -1320,7 +1759,7 @@ sup_classify() {
 }
 
 # sleep that can be interrupted by SIGTERM
-sup_sleep() { local n="$1"; while [ "$n" -gt 0 ] && [ "$SUP_STOP" = 0 ]; do sleep 1 & wait $! 2>/dev/null; n=$((n-1)); done; }
+sup_sleep() { local end=$(( $(now_s) + $1 )); while [ "$(now_s)" -lt "$end" ] && [ "$SUP_STOP" = 0 ]; do fb_tick; sleep 1 & wait $! 2>/dev/null; done; }
 
 sup_on_up() {
   local first=0 took=$(( $(now_s) - OC_START )); [ "$EVER_UP" = 0 ] && first=1
@@ -1331,6 +1770,7 @@ sup_on_up() {
       sup_start_proxy || { ev "SUP proxy-failed"; SUP_STOP=1; PAUSED_REASON="failed:proxy"; return 1; }
     fi
   fi
+  [ "$FB_MODE" = 1 ] && _fb_disengage vpn-up
   set_phase up
   ev "SUP up session=$SESSION_N took=${took}s pid=$OC_PID"
   sup_log "Tunnel is up (connection #$SESSION_N, took ${took}s)"
@@ -1354,6 +1794,7 @@ _supervise() {
     sup_log "Found leftovers from the previous session, cleaning up first"; _teardown_session >/dev/null 2>&1
   fi
   GOST_PID=""; _FWD_DESC=""; _FWD_STATE=""   # cleanup sourced the old state; avoid reusing old values
+  FB_MODE=0; FB_ACTIVE=0; FB_KEY=""; FB_GOST_PID=""; rm -f "$FB_STATE_FILE"
   if ! account_load "${CFG[ACCOUNT]}"; then set_phase failed:account; ev "SUP fail reason=account"; exit 3; fi
   GW_NAME=$(gw_host_of "${CFG[ACCOUNT]}")
   sup_log "Account: ${VPN_DESC} (protocol $(sup_proto))  Mode: ${CFG[MODE]}  Data channel: ${CFG[DATA_CHANNEL]}"
@@ -1363,7 +1804,8 @@ _supervise() {
       if [ "${CFG[IPV6_FORWARD]}" = on ]; then OCM_IPV6_FORWARD=1; else OCM_IPV6_FORWARD=0; fi
       setup_netns >/dev/null || { set_phase failed:netns; ev "SUP fail reason=netns"; _teardown_session >/dev/null 2>&1; exit 3; }
       sup_log "Netns ${NETNS_NAME} is ready"
-      if [ "${CFG[KILL_SWITCH]}" = on ]; then ks_apply || { set_phase failed:kill-switch; _teardown_session >/dev/null 2>&1; exit 3; }; fi ;;
+      if [ "${CFG[KILL_SWITCH]}" = on ] || [ "${CFG[KILL_SWITCH]}" = proxy ]; then ks_apply || { set_phase failed:kill-switch; _teardown_session >/dev/null 2>&1; exit 3; }; fi
+      [ "${CFG[KILL_SWITCH]}" = proxy ] && { FB_MODE=1; fb_prepare; } ;;
     default)
       ORIG_DEF4=$("$IP_CMD" -4 route show default 2>/dev/null | grep -v ' dev tun\| dev ocmtun' | head -n1)
       setup_ssh_protect_routes >/dev/null || { set_phase failed:routes; ev "SUP fail reason=ssh-protect-routes"; _teardown_session >/dev/null 2>&1; exit 3; }
@@ -1389,6 +1831,7 @@ _supervise() {
       if [ $up = 0 ]; then
         if sup_tunnel_up; then up=1; sup_on_up || break
         elif [ $(( $(now_s) - t0 )) -ge 75 ]; then sup_log "Tunnel not up within 75 seconds, ending this attempt"; kill -TERM "$OC_PID" 2>/dev/null; fi
+        [ $up = 0 ] && fb_tick
         interval=1
       else
         sup_check_children; interval=3
@@ -1400,6 +1843,7 @@ _supervise() {
     [ "$SUP_STOP" = 1 ] && break
     set_phase reconnecting   # reflect the disconnect immediately; do not keep showing up during the seconds spent classifying the cause
     rm -f "$PID_FILE"
+    [ "$FB_MODE" = 1 ] && { FB_NEXT=0; fb_tick; }   # fall back immediately, without waiting for exit classification and backoff
     sleep 1   # let the log pipe finish writing openconnect's last lines before classifying the exit reason
     age=$(( $(now_s) - OC_START )); kind=$(sup_classify "$rc" "$up")
     ev "SUP exit session=$SESSION_N rc=$rc kind=$kind session_age=$age session_age_h=$(fmt_dur $age) was_up=$up"
@@ -1440,6 +1884,7 @@ _supervise() {
   if [ -n "$OC_PID" ] && kill -0 "$OC_PID" 2>/dev/null; then
     sup_log "Logging out openconnect..."; kill -TERM "$OC_PID" 2>/dev/null; _wait_pid_gone "$OC_PID"
   fi
+  [ "$FB_MODE" = 1 ] && { _fb_disengage stop; _fb_stop_gost; }
   _teardown_session >/dev/null 2>&1
   rm -f "$RESTART_REQ" "$PID_FILE"
   ev "SUP stop reason=${PAUSED_REASON:-requested} sessions=$SESSION_N"
@@ -1461,7 +1906,8 @@ show_summary() {
   local acc_proto; acc_proto=$(account_field "${CFG[ACCOUNT]}" 6 2>/dev/null || true)
   [ -n "$acc_proto" ] && printf '    %-14s %s\n' "" "(the account has its own protocol ${acc_proto}, which overrides the line above)"
   case "${CFG[MODE]}" in
-    netns) for k in SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST; do printf '    %-14s %s\n' "${SET_TITLE[$k]}" "$(cfg_label "$k")"; done ;;
+    netns) for k in SOCKS_PORT LISTEN SOCKS_AUTH FORWARDER KILL_SWITCH DNS_FAST; do printf '    %-14s %s\n' "${SET_TITLE[$k]}" "$(cfg_label "$k")"; done
+           [ "${CFG[KILL_SWITCH]}" = proxy ] && printf '    %-14s %s (%s in list)\n' "${SET_TITLE[FALLBACK_PROXY]}" "$(cfg_label FALLBACK_PROXY)" "$(proxies_count)" ;;
     ocproxy) printf '    %-14s %s\n' "${SET_TITLE[SOCKS_PORT]}" "127.0.0.1:${CFG[SOCKS_PORT]}" ;;
   esac
   printf '    %-14s %s\n' "${SET_TITLE[AUTO_RECONNECT]}" "$(cfg_label AUTO_RECONNECT)"
@@ -1482,6 +1928,12 @@ start_preflight() {
       if [ "${CFG[FORWARDER]}" = socat ]; then ensure_cmd_socat || return 1; fi
       _check_port_free "${CFG[SOCKS_PORT]}" || { log_err "Port ${CFG[SOCKS_PORT]} is already in use; pick another (Settings -> SOCKS5 port)."; return 1; }
       [ "${CFG[LISTEN]}" = 0.0.0.0 ] && [ -z "${CFG[SOCKS_USER]}" ] && log_warn "SOCKS5 is open on all interfaces without authentication - anyone can use your proxy. Setting up authentication is recommended."
+      if [ "${CFG[KILL_SWITCH]}" = proxy ]; then
+        [ "$(proxies_count)" -gt 0 ] || { log_err "Kill switch is set to [Fallback proxy], but there are no fallback proxies yet: add one via main menu 11 or ocm proxy add first."; return 1; }
+        local fp="${CFG[FALLBACK_PROXY]:-auto}" _l
+        [ "$fp" = auto ] || proxy_find "$fp" >/dev/null || { log_err "Fallback proxy [$fp] is not in the list (ocm proxy list)."; return 1; }
+        while IFS= read -r _l; do proxy_parse "$_l" || log_warn "A line in the fallback proxy list has a format error and will be skipped: ${_l%%|*} ($P_ERR)"; done < <(_proxies_lines)
+      fi
       ;;
     ocproxy)
       ensure_pkg_ocproxy
@@ -1669,6 +2121,14 @@ cmd_status() {
     [ -n "$FORWARDER" ] && printf '  forwarder %s' "$FORWARDER"
     echo
     is_vpn_running && printf 'openconnect: pid %s, running for %s\n' "$(cat "$PID_FILE")" "$(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
+    if [ "${KILL_SWITCH:-}" = proxy ]; then
+      if [ -r "$FB_STATE_FILE" ]; then
+        local fs fa fn; read -r fs fa fn < "$FB_STATE_FILE"
+        printf 'Fallback    : using [%s] %s (for %s; switches back automatically when the VPN recovers)\n' "$fn" "$fa" "$( [[ "$fs" =~ ^[0-9]+$ ]] && fmt_dur $(( $(now_s) - fs )) || echo '?')"
+      else
+        printf 'Fallback    : standby (engages when the VPN drops; %s)\n' "$(cfg_label FALLBACK_PROXY)"
+      fi
+    fi
   else
     echo "Session     : none"
   fi
@@ -1895,6 +2355,8 @@ sample() {
     fi
   fi
   [ -z "$proxy" ] && FALLBACK=0
+  S_FB="-"
+  if [ -r "$FB_STATE_FILE" ]; then local _fa _fn; read -r _ _fa _fn < "$FB_STATE_FILE"; S_FB="${_fn// /_}@${_fa}"; fi
 
   # --- Decide the candidate state ---
   REASON=""
@@ -1934,11 +2396,11 @@ sample() {
     fi
   fi
 
-  LINE=$(printf '%s st=%s mode=%s proto=%s oc=%s age=%s sess=%s ocn=%s gost=%s socat=%s tun=%s/%s ip=%s deftun=%s rx=%s tx=%s listen=%s socks=%s/%sms xprobe=%s tping=%s gw=%s gwtcp=%s gwping=%s hping=%s nat=%s fwd=%s veth=%s retr=%s tmo=%s eg=%s nsdns=%s mem=%sMB%s' \
+  LINE=$(printf '%s st=%s mode=%s proto=%s oc=%s age=%s sess=%s ocn=%s gost=%s socat=%s tun=%s/%s ip=%s deftun=%s rx=%s tx=%s listen=%s socks=%s/%sms xprobe=%s tping=%s gw=%s gwtcp=%s gwping=%s hping=%s nat=%s fwd=%s veth=%s retr=%s tmo=%s eg=%s nsdns=%s fb=%s mem=%sMB%s' \
     "$S_TS" "$CAND" "${ST_MODE:--}" "${ST_PROTO:--}" "$S_OCPID" "$S_OCAGE" "$S_SESS" "$S_OCN" "$S_GOST" "$S_SOCAT" \
     "$S_TUN" "$S_TUNST" "$S_TUNIP" "$S_DEFTUN" "$S_RX" "$S_TX" "$S_LISTEN" "$S_SOCKS" "$S_SOCKSMS" "$S_XPROBE" \
     "$S_TPING" "$S_GWIP" "$S_GWTCP" "$S_GWPING" "$S_HPING" "$S_NAT" "$S_FWD" "$S_VETH" "$S_RETR" "$S_TMO" \
-    "$S_EG" "$S_NSDNS" "$S_MEM" "$([ -n "$REASON" ] && printf ' why=%s' "$REASON")")
+    "$S_EG" "$S_NSDNS" "$S_FB" "$S_MEM" "$([ -n "$REASON" ] && printf ' why=%s' "$REASON")")
 }
 
 # ---------------- Incident snapshot ----------------
@@ -2185,7 +2647,8 @@ cmd_report() {
       if ($4=="exit") { sx++; sk[kv("kind")]++ }
       if ($4=="up") sup++
       if ($4=="paused" || $4=="rate-limited") ahP++
-      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect)$/) { ah++; ahs[ah]=$0 }
+      if ($4=="fallback") { if ($5=="on") fbn++; else if ($5=="off") fbd+=kv("dur")+0; else if ($5=="unavailable") fbu++ }
+      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect|fallback)$/) { ah++; ahs[ah]=$0 }
       next
     }
     $3=="WATCH" && $4=="restart-request" && e>=cut { wr++; ah++; ahs[ah]=$0; next }
@@ -2224,6 +2687,7 @@ cmd_report() {
       printf " (last 15):\n"
       if (!ah) print "  (none)"
       for (i=(ah>15?ah-14:1); i<=ah; i++) print "  " ahs[i]
+      if (fbn || fbu) printf "Fallback proxy: engaged / switched %d times, total %s; all fallback proxies unreachable %d times\n", fbn, dur(fbd), fbu
       printf "\nSession milestones (last 12 of %d):\n", sm
       for (i=(sm>12?sm-11:1); i<=sm; i++) print "  " sms[i]
       printf "\nopenconnect key message counts:\n"; nc=0
@@ -2497,6 +2961,10 @@ show_status() {
     if is_vpn_running; then
       echo -e "    ${C_BOLD}Session:${C_RESET} connected for $(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
     fi
+    if [ -r "$FB_STATE_FILE" ]; then
+      local fs fa fn; read -r fs fa fn < "$FB_STATE_FILE"
+      echo -e "    ${C_YELLOW}Fallback proxy:${C_RESET} using [${fn}] ${fa} (switches back automatically when the VPN recovers)"
+    fi
     if [ -r "$WATCH_LIB/current" ]; then
       local st ws eg; read -r st ws _ < "$WATCH_LIB/current"
       eg=$(grep -o ' eg=[0-9.]*' "$SAMPLES" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
@@ -2554,9 +3022,10 @@ main_menu() {
   echo -e "  8) 📦 Check/install dependencies"
   echo -e "  9) 🧪 ${C_CYAN}Test Netns IPv6 connectivity${C_RESET}"
   echo -e " 10) 🗑️  Uninstall"
+  echo -e " 11) 🛟 Manage fallback proxies (backup egress for the kill switch)"
   echo -e "  0) 🚪 Exit"
   echo
-  read -rp "Please select [0-10]: " c || { echo; log_info "Standard input ended, exiting."; exit 0; }
+  read -rp "Please select [0-11]: " c || { echo; log_info "Standard input ended, exiting."; exit 0; }
   case "$c" in
     1) OVR=(); cmd_start 1 || true ;;
     2) if svc_active; then OVR=(); cmd_stop || true; sleep 2; fi; cmd_start 1 || true ;;
@@ -2568,6 +3037,7 @@ main_menu() {
     8) manage_deps || true ;;
     9) if [ -f "$STATE_FILE" ] && grep -q "MODE=netns" "$STATE_FILE"; then test_netns_ipv6 || true; else log_err "Netns mode is not running, cannot test"; fi ;;
     10) uninstall; exit 0 ;;
+    11) manage_proxies ;;
     0) exit 0 ;;
     *) log_err "Invalid option '$c'" ;;
   esac
@@ -2591,7 +3061,8 @@ Usage: ocm [command] [options]
           --listen ADDR        127.0.0.1 | 0.0.0.0
           --tls-only | --dtls  data channel: TLS only (--no-dtls) / ESP·DTLS
           --fwd socat|iptables port forwarding method
-          --kill-switch on|off kill switch
+          --kill-switch on|off|proxy  kill switch (proxy = use the fallback proxies while the VPN is down)
+          --fallback NAME|auto fallback proxy choice (with --kill-switch proxy)
           --dns fast|system    DNS timeout policy
           --mtu N|auto         tunnel MTU
           --oc-args "..."      extra arguments for openconnect
@@ -2609,17 +3080,23 @@ Usage: ocm [command] [options]
   config get KEY           read one setting
   config set KEY VALUE     change one setting (for SOCKS5 auth use SOCKS_USER / SOCKS_PASS)
   accounts                 list accounts (passwords not shown)
+  proxy list               list fallback proxies (passwords not shown)
+  proxy add ['line']       add a fallback proxy: asks field by field without an argument; with an argument uses the file format (pipe or URL notation)
+  proxy del index|name     delete a fallback proxy
+  proxy test [index|name]  access once through the proxy from this host and show the egress IP (tests all without an argument)
+  proxy format             format help for the fallback proxy file
   install-service          install/refresh the systemd units (done automatically on start)
   uninstall-service        remove the systemd units (settings and logs are kept)
   -V, --version            version
   -h, --help               this help
 
-Files: settings ${SETTINGS_FILE}   accounts ${ACCOUNTS_FILE}   logs ${LOG_DIR}
+Files: settings ${SETTINGS_FILE}   accounts ${ACCOUNTS_FILE}   fallback proxies ${PROXIES_FILE}   logs ${LOG_DIR}
 Exit codes: 0 success  1 failure  2 usage error  3 already running / state conflict
 Examples:
   ocm start -m netns -p nc -P 8585 --tls-only --save
   ocm log report 7
   ocm config set DEGRADED_WAIT 60
+  ocm proxy add 'HK-backup|socks5|203.0.113.20|1080|user|pass' && ocm config set KILL_SWITCH proxy
 EOF
 }
 
@@ -2639,6 +3116,7 @@ parse_start_opts() {
       --dtls) OVR[DATA_CHANNEL]=dtls; shift ;;
       --fwd|--forwarder) [ $# -ge 2 ] || exit 2; _ovr FORWARDER "$2"; shift 2 ;;
       --kill-switch) [ $# -ge 2 ] || exit 2; _ovr KILL_SWITCH "$2"; shift 2 ;;
+      --fallback) [ $# -ge 2 ] || exit 2; _ovr FALLBACK_PROXY "$2"; shift 2 ;;
       --dns) [ $# -ge 2 ] || exit 2
              case "$2" in fast|on) OVR[DNS_FAST]=on ;; system|off) OVR[DNS_FAST]=off ;; *) log_err "--dns must be fast|system"; exit 2;; esac; shift 2 ;;
       --mtu) [ $# -ge 2 ] || exit 2; _ovr MTU "$2"; shift 2 ;;
@@ -2703,6 +3181,7 @@ main_entry() {
     heal)          shift; cmd_heal "$@" ;;
     config)        shift; cmd_config "$@" ;;
     accounts)      check_root; accounts_list ;;
+    proxy|proxies) shift; cmd_proxy "$@" ;;
     install-service)   check_root; settings_load; install_units && log "systemd units are ready: $SVC_MAIN / $SVC_WATCH" ;;
     uninstall-service) check_root; uninstall_units; log "systemd units removed (settings and logs kept)" ;;
     _supervise)    _supervise ;;
