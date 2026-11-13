@@ -4,7 +4,7 @@
 
 **[English](README_EN.md) | 简体中文**
 
-![Version](https://img.shields.io/badge/version-8.1.1-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.2.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
@@ -36,6 +36,7 @@
   - 退出后按原因处理：服务器到期终止 → 约 2 秒后重连；网络错误 → 按退避间隔重试；认证失败 → 计数，达到阈值即暂停，**防止账号被锁**
   - 重连期间 netns 与代理保持不动，客户端只感到几秒中断
   - 「进程还在但不通」也能发现：持续不通超过阈值会主动软重连
+  - 可选**定时重连**（v8.2 新增）：会话满设定时长（如 `110m`）就主动登出重连，赶在服务器固定的会话上限之前
 
 - ✅ **内置长期诊断日志**（v8 新增，`ocm-watch.service`）
   - 定时采样隧道 / 代理 / 网关 / 出口 IP，记录每次状态变化与断线现场快照
@@ -156,6 +157,7 @@ ssh -N -L 8585:127.0.0.1:8585 root@你的VPS
 | 守护 | 每小时最多重连 `MAX_PER_HOUR` | 数字 | 防止异常时疯狂重试 |
 | 守护 | 认证失败暂停阈值 `AUTH_FAIL_PAUSE` | 数字 | 连续认证失败达到此数即暂停（首次启动就失败会立即停止） |
 | 守护 | 软重连等待 `DEGRADED_WAIT` | 30 / 60 / 90 / 180 秒 | 进程在但代理持续不通多久后主动重连 |
+| 守护 | 定时重连 `SESSION_RESTART` | `off` / `110m` / `1h50m` / 纯数字＝分钟 | 会话满这个时长就主动登出并立即重连（最短 10 分钟）；改了即时生效，不用重启 |
 | 守护 | 开机自动连接 `AUTOSTART` | `off` / `on` | 启用 `ocm.service` 开机自启 |
 | 日志 | 诊断日志 `WATCH` | `on` / `off` | `ocm-watch.service` |
 | 日志 | 采样间隔 `SAMPLE_INTERVAL` | 15 / 30 / 60 秒 | 状态变化后自动加密到 5 秒，持续 3 分钟 |
@@ -246,7 +248,7 @@ ocm log report 7
 
 <a id="fallback-proxy"></a>
 
-### 🛟 回落代理（断线保护的备用出口）
+### 🔀 回落代理（断线保护的备用出口）
 
 把「断线保护」设为 `proxy` 后，VPN 掉线 / 重连期间，SOCKS5 代理的**新连接**自动改走你指定的代理；VPN 一恢复，新连接马上切回 VPN。回落期间已经建立的连接不会因为切回而中断。
 代理都连不上时与 `on` 相同：直接失败，**绝不**改走 VPS 自己的出口。仅 netns 模式。
@@ -306,7 +308,7 @@ ocm stop            # 或菜单 3
 
 ### 卸载
 
-菜单 `10) 🗑️ 卸载`：停止 VPN 并清理 → 移除 systemd 单元 → 询问是否删除设置与诊断日志 → 清理本脚本的 crontab 条目（先备份到 `/root/.oc_master-crontab.bak`）→ 逐个询问是否删除依赖 → 删除账户文件、快捷命令与脚本自身。
+菜单 `10) 🧹 卸载`：停止 VPN 并清理 → 移除 systemd 单元 → 询问是否删除设置与诊断日志 → 清理本脚本的 crontab 条目（先备份到 `/root/.oc_master-crontab.bak`）→ 逐个询问是否删除依赖 → 删除账户文件、快捷命令与脚本自身。
 
 > ⚠️ 账户文件（含明文密码）与脚本本体会被删除，需要保留请先自行备份。
 
@@ -386,6 +388,11 @@ ip netns exec ocm_vpn_space ss -lntp            # gost 在 netns 内监听
    - 脚本会自动保护 SSH 连接；首次启动 3 分钟内若未确认成功会自动回滚
 
 ## 📊 版本历史
+
+### v8.2.0 (2026-11-13)
+
+- ✨ **新增**：定时重连 `SESSION_RESTART`：会话满设定时长（`110m` / `1h50m` / 纯数字＝分钟，最短 10 分钟）就让 openconnect 正常登出并在约 1 秒后重连，赶在服务器固定的会话上限（例如 2 小时）之前，在自己定的时间点重连。运行中修改即时生效；报告里标 `[计划]`、单独计数，不算作意外断线；状态页显示本次会话还剩多久
+- 🔧 **修复**：主菜单图标不对齐——⚙️ 🗓️ 🗑️ 依赖变体选择符（U+FE0F），不同终端宽度不一致；🛟 在较旧的字体里显示为方框。统一换成固定占 2 格的 🔧 📅 🧹 🔀（中英两版）
 
 ### v8.1.1 (2026-11-12)
 

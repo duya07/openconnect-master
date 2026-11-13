@@ -4,7 +4,7 @@
 
 **English | [简体中文](README.md)**
 
-![Version](https://img.shields.io/badge/version-8.1.1-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.2.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey?style=flat-square)
 ![Shell](https://img.shields.io/badge/shell-bash-89e051?style=flat-square)
@@ -36,6 +36,7 @@ Three Running Modes | systemd-managed + Auto-Reconnect | Built-in Diagnostic Log
   - Exits are handled by cause: server terminated the session (expired) → reconnect after ~2 seconds; network error → retry with backoff intervals; authentication failure → counted, and paused once the threshold is reached, **to keep the account from being locked**
   - The netns and the proxy stay in place during a reconnect; clients only notice a few seconds of interruption
   - "Process still running but no connectivity" is detected too: if connectivity stays down beyond a threshold, a soft reconnect is triggered
+  - Optional **planned restart** (new in v8.2): once the session reaches a set length (e.g. `110m`) it logs out and reconnects on purpose, ahead of the server's fixed session limit
 
 - ✅ **Built-in long-term diagnostic logs** (new in v8, `ocm-watch.service`)
   - Periodically samples the tunnel / proxy / gateway / egress IP, records every state change and an incident snapshot at each drop
@@ -157,6 +158,7 @@ Settings are stored in `/etc/oc-master/settings.conf` (`600`). Every item has a 
 | Daemon | Max reconnects per hour `MAX_PER_HOUR` | Number | Prevents frantic retrying when something goes wrong |
 | Daemon | Auth-failure pause threshold `AUTH_FAIL_PAUSE` | Number | Pause after this many consecutive authentication failures (a failure on the very first start stops immediately) |
 | Daemon | Soft-reconnect wait `DEGRADED_WAIT` | 30 / 60 / 90 / 180 seconds | How long the process may be running while the proxy stays unreachable before a reconnect is triggered |
+| Daemon | Planned restart `SESSION_RESTART` | `off` / `110m` / `1h50m` / bare number = minutes | Once the session reaches this length, log out and reconnect right away (minimum 10 minutes); changes apply immediately, no restart needed |
 | Daemon | Connect at boot `AUTOSTART` | `off` / `on` | Enables `ocm.service` to start at boot |
 | Logs | Diagnostic logs `WATCH` | `on` / `off` | `ocm-watch.service` |
 | Logs | Sampling interval `SAMPLE_INTERVAL` | 15 / 30 / 60 seconds | Automatically tightens to 5 seconds for 3 minutes after a state change |
@@ -247,7 +249,7 @@ No field may contain `|`. See also [examples/vpn_accounts.example](examples/vpn_
 
 <a id="fallback-proxy"></a>
 
-### 🛟 Fallback Proxy (Backup Egress for the Kill Switch)
+### 🔀 Fallback Proxy (Backup Egress for the Kill Switch)
 
 With the kill switch set to `proxy`, **new connections** to the SOCKS5 proxy go through a proxy you specify while the VPN is down or reconnecting; as soon as the VPN recovers, new connections switch back to the VPN. Connections established during fallback are not cut by the switch back.
 If no proxy is reachable it behaves like `on`: connections fail outright and **never** use the VPS's own egress. Netns mode only.
@@ -307,7 +309,7 @@ ocm stop            # or menu 3
 
 ### Uninstall
 
-Menu `10) 🗑️ Uninstall`: stop the VPN and clean up → remove the systemd units → ask whether to delete the settings and diagnostic logs → remove this script's crontab entries (backed up first to `/root/.oc_master-crontab.bak`) → ask about each dependency individually → delete the account file, the shortcut command and the script itself.
+Menu `10) 🧹 Uninstall`: stop the VPN and clean up → remove the systemd units → ask whether to delete the settings and diagnostic logs → remove this script's crontab entries (backed up first to `/root/.oc_master-crontab.bak`) → ask about each dependency individually → delete the account file, the shortcut command and the script itself.
 
 > ⚠️ The account file (with plain-text passwords) and the script itself will be deleted; back them up yourself first if you want to keep them.
 
@@ -387,6 +389,11 @@ ip netns exec ocm_vpn_space ss -lntp            # gost listens inside the netns
    - The script automatically protects SSH connections; if success is not confirmed within 3 minutes of the first start, it rolls back automatically
 
 ## 📊 Version History
+
+### v8.2.0 (2026-11-13)
+
+- ✨ **New**: planned restart `SESSION_RESTART`: once the session reaches a set length (`110m` / `1h50m` / a bare number = minutes, minimum 10 minutes) openconnect logs out normally and reconnects about 1 second later, so you reconnect at a time you choose before the server's fixed session limit (e.g. 2 hours). Changes apply while running; the report marks these `[planned]` and counts them separately instead of as unexpected drops; the status page shows how long is left in the current session
+- 🔧 **Fix**: misaligned main-menu icons — ⚙️ 🗓️ 🗑️ rely on the variation selector (U+FE0F), whose width differs between terminals, and 🛟 shows as a box in older fonts. They are now 🔧 📅 🧹 🔀, which always take 2 columns (both language builds)
 
 ### v8.1.1 (2026-11-12)
 

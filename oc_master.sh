@@ -1,11 +1,11 @@
 #!/bin/bash
 # =================================================================
-#   OpenConnect Master Manager - v8.0.0
+#   OpenConnect Master Manager - v8.2.0
 #   - 新增: systemd 托管（ocm.service）。openconnect 改为前台运行，退出后按原因自动重连
 #     （服务器到期终止 / 网络错误 / 认证失败分别处理），netns 与代理在重连期间保持不动；
 #     关闭 SSH 不再影响 VPN。
 #   - 新增: 内置长期诊断日志（ocm-watch.service）：定时采样、事件、断线现场快照、报告。
-#   - 新增: ⚙️ 设置菜单 + /etc/oc-master/settings.conf —— 每个可调参数都有说明与可选项，
+#   - 新增: 🔧 设置菜单 + /etc/oc-master/settings.conf —— 每个可调参数都有说明与可选项，
 #     启动前显示摘要，可直接启动 / 先改设置 / 只改本次。
 #   - 新增: 命令行接口（ocm -h）：start / stop / restart / status / log / heal / config / accounts。
 #   - 变更: netns 模式默认不再打开宿主 IPv6 全局转发（设置里可开）；VPN 密码不再 export
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- 全局配置 ---
-VERSION="8.1.1"
+VERSION="8.2.0"
 VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
@@ -39,6 +39,7 @@ RUN_DIR="/run/oc-master"
 RUN_PROFILE="${RUN_DIR}/run.conf"        # 本次启动的生效设置（600；不含 VPN 密码）
 PHASE_FILE="${RUN_DIR}/phase"            # supervisor 阶段：starting/connecting/up/reconnecting/stopping/stopped/failed:<原因>
 RESTART_REQ="${RUN_DIR}/restart-request" # 观察进程请求软重连
+PLANNED_REQ="${RUN_DIR}/planned-restart" # supervisor 自己发起的定时重连（区分于服务器终止/软重连）
 FB_STATE_FILE="${RUN_DIR}/fallback"          # 正在回落时存在：起始时间 IP:端口 显示名
 FB_GOST_PID_FILE="${RUN_DIR}/fallback-gost.pid"
 FB_YAML="${RUN_DIR}/fallback-gost.yaml"      # 回落 gost 的配置（600，含代理密码；gost 启动后即删除）
@@ -54,6 +55,7 @@ SVC_MAIN="ocm.service"
 SVC_WATCH="ocm-watch.service"
 UNIT_DIR="/etc/systemd/system"
 START_TIMEOUT=90                         # ocm start 等待隧道就绪的最长时间（秒）
+SESSION_RESTART_MIN=600                  # 定时重连的最短会话时长（秒），防止误填过小反复登录
 OC_TUN_DEFAULT="ocmtun0"                 # 默认全局模式的隧道网卡名（netns 模式在命名空间里，仍是 tun0）
 
 # --- 路由与网络配置 ---
@@ -634,6 +636,7 @@ SET_REGISTRY=(
   "MAX_PER_HOUR|int|12|6:6 次,12:12 次,30:30 次|每小时最多重连|守护"
   "AUTH_FAIL_PAUSE|int|3|1:1 次,3:3 次,5:5 次|认证失败暂停阈值|守护"
   "DEGRADED_WAIT|int|90|30:30 秒,60:60 秒,90:90 秒,180:180 秒|隧道不通多久后软重连|守护"
+  "SESSION_RESTART|text|off|off:关,110m:110 分钟（2 小时会话上限的学校推荐）,100m:100 分钟,90m:90 分钟|定时重连（会话满多久主动重连）|守护"
   "AUTOSTART|choice|off|off:关,on:开|开机自动连接|守护"
   "WATCH|choice|on|on:开,off:关|诊断日志|日志"
   "SAMPLE_INTERVAL|int|30|15:15 秒,30:30 秒,60:60 秒|采样间隔（秒）|日志"
@@ -706,6 +709,11 @@ IPv6 且你要经代理走 IPv6 时才需要；全局开启可能让宿主不再
 首次启动就认证失败会立即停止。恢复：确认账号后 ocm heal on 或重新启动。";;
     DEGRADED_WAIT) echo "openconnect 进程还在、但经代理访问持续失败多少秒后，主动断开重连（软重连）。
 太短会被 UDP 通道切换、短暂抖动误触发；太长则卡死的连接要更久才恢复。";;
+    SESSION_RESTART) echo "会话满这个时长就主动重连一次：openconnect 先正常登出，约 1–2 秒后重新登录，代理中断几秒。
+用途：服务器有固定会话时长（例如 2 小时就踢）时，赶在被踢之前、在自己定的时间点重连。
+格式：110m / 110min / 1h50m / 2h / 纯数字＝分钟（不区分大小写）；最短 $((SESSION_RESTART_MIN / 60)) 分钟；off＝关闭。
+时长从本次 openconnect 启动算起。改了立即生效（约 30 秒内），不用重启。
+参考 ocm log report 里「会话结束时间轴」的会话时长来定，留几分钟余量。";;
     AUTOSTART) echo "开机后自动按当前设置连接（启用 systemd 单元 ocm.service）。";;
     WATCH) echo "后台诊断服务（ocm-watch.service）：定时采样隧道/代理/网关状态，记录状态变化与断线现场，
 并负责「进程在但不通」时的软重连。日志在 ${LOG_DIR}，ocm log report 查看汇总。";;
@@ -745,6 +753,16 @@ settings_save() {
   chmod 600 "$tmp"; mv -f "$tmp" "$SETTINGS_FILE"
 }
 
+# 时长 → 秒：110m / 110min / 1h50m / 2h / 纯数字（分钟）；off、0、空 → 0；格式不对返回 1
+_dur_to_s() {
+  local v="${1,,}"; v=${v//[[:space:]]/}
+  case "$v" in ""|off|0) echo 0; return 0 ;; esac
+  if [[ "$v" =~ ^[0-9]{1,5}$ ]]; then echo $(( 10#$v * 60 )); return 0; fi
+  [[ "$v" =~ ^(([0-9]{1,3})h)?(([0-9]{1,5})(m|min))?$ ]] || return 1
+  [ -n "${BASH_REMATCH[2]}${BASH_REMATCH[4]}" ] || return 1
+  echo $(( 10#${BASH_REMATCH[2]:-0} * 3600 + 10#${BASH_REMATCH[4]:-0} * 60 ))
+}
+
 # 校验：成功返回 0；失败打印原因返回 1
 settings_validate() {
   local k="$1" v="$2" c ok=0 n
@@ -759,6 +777,8 @@ settings_validate() {
       case "$v" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "密码不能含 / 引号 反斜杠 空白"; return 1;; esac; return 0;;
     OC_EXTRA|EXTRA_PROBE_URL) case "$v" in *$'\n'*) log_err "不能含换行"; return 1;; esac; return 0;;
     FALLBACK_PROXY) [ -z "$v" ] || [ "$v" = auto ] || proxy_find "$v" >/dev/null || { log_err "回落代理选择应为 auto 或列表里某个代理的显示名（ocm proxy list）"; return 1; }; return 0;;
+    SESSION_RESTART) local _s; _s=$(_dur_to_s "$v") || { log_err "定时重连格式：110m / 110min / 1h50m / 2h / 纯数字（分钟）/ off"; return 1; }
+      [ "$_s" = 0 ] || [ "$_s" -ge "$SESSION_RESTART_MIN" ] || { log_err "定时重连最短 $((SESSION_RESTART_MIN / 60)) 分钟（或 off 关闭）"; return 1; }; return 0;;
   esac
   case "${SET_TYPE[$k]:-}" in
     choice) IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]}"
@@ -778,6 +798,8 @@ cfg_label() {
     ACCOUNT) echo "${v}) $(account_field "$v" 1 2>/dev/null || echo '?')"; return;;
     OC_EXTRA|EXTRA_PROBE_URL) echo "${v:-（空）}"; return;;
     FALLBACK_PROXY) if [ -z "$v" ] || [ "$v" = auto ]; then echo "自动（按顺序选第一个能连上的）"; else echo "固定：$v"; fi; return;;
+    SESSION_RESTART) local _s; _s=$(_dur_to_s "$v" 2>/dev/null) || _s=""
+      if [ -z "$_s" ]; then echo "${v}（格式无效，视为关）"; elif [ "$_s" = 0 ]; then echo "关"; else echo "会话满 $(fmt_dur "$_s") 主动重连（${v}）"; fi; return;;
   esac
   IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]:-}"
   for c in "${_cs[@]}"; do [ "${c%%:*}" = "$v" ] && { echo "${c#*:}"; return; }; done
@@ -1095,7 +1117,7 @@ manage_proxies() {
   local c a fs fa fn
   while true; do
     clear 2>/dev/null || true; settings_load
-    title "🛟 管理回落代理 (${PROXIES_FILE})"; sep
+    title "🔀 管理回落代理 (${PROXIES_FILE})"; sep
     echo -e "  断线保护：${C_CYAN}$(cfg_label KILL_SWITCH)${C_RESET}   回落代理选择：${C_CYAN}$(cfg_label FALLBACK_PROXY)${C_RESET}"
     [ "${CFG[KILL_SWITCH]}" = proxy ] || echo -e "  ${C_GREY}（「断线保护」设为「回落代理」后才会用这里的代理：主菜单 5 → 断线保护）${C_RESET}"
     if [ -r "$FB_STATE_FILE" ]; then read -r fs fa fn < "$FB_STATE_FILE"; echo -e "  ${C_YELLOW}正在使用：${fn}（${fa}）${C_RESET}"; fi
@@ -1484,7 +1506,7 @@ live_reload() {
   local k; local -A bak=()
   for k in "${!CFG[@]}"; do bak[$k]=${CFG[$k]}; done
   settings_load
-  for k in AUTO_RECONNECT BACKOFF MAX_PER_HOUR AUTH_FAIL_PAUSE; do LIVE[$k]=${CFG[$k]}; done
+  for k in AUTO_RECONNECT BACKOFF MAX_PER_HOUR AUTH_FAIL_PAUSE SESSION_RESTART; do LIVE[$k]=${CFG[$k]}; done
   for k in "${!bak[@]}"; do CFG[$k]=${bak[$k]}; done
 }
 sup_proto() { echo "${VPN_ACC_PROTO:-${CFG[PROTOCOL]}}"; }
@@ -1754,6 +1776,7 @@ sup_classify() {
   [ -f "$RESTART_REQ" ] && { req=1; rm -f "$RESTART_REQ"; }
   # 先看 openconnect 自己说了什么（服务器终止优先于软重连标志，避免过期标志误判）
   if grep -qiE 'Server terminated connection|Session terminated by server|session expired|session timed out' "$SESSION_LOG" 2>/dev/null; then echo server-terminated; return; fi
+  if [ -f "$PLANNED_REQ" ]; then rm -f "$PLANNED_REQ"; case "$rc" in 0|137|143) echo planned; return ;; esac; fi
   if [ $req = 1 ]; then echo watch-request; return; fi
   if [ "$rc" = 2 ] || grep -qiE 'login failed|authentication failed|invalid (user|pass|cred)|incorrect (user|pass)|password (has )?expired|account (is )?(locked|disabled)|cookie was rejected|failed to authenticate' "$SESSION_LOG" 2>/dev/null; then echo auth; return; fi
   if grep -qiE 'frmConfirmation|already (logged|signed) in|maximum number of (open )?(sessions|users)|session limit' "$SESSION_LOG" 2>/dev/null; then echo session-confirm; return; fi
@@ -1763,6 +1786,29 @@ sup_classify() {
 
 # 可被 SIGTERM 打断的 sleep
 sup_sleep() { local end=$(( $(now_s) + $1 )); while [ "$(now_s)" -lt "$end" ] && [ "$SUP_STOP" = 0 ]; do fb_tick; sleep 1 & wait $! 2>/dev/null; done; }
+
+# 定时重连：会话（自 openconnect 启动）满 SESSION_RESTART 就让它正常登出，随后由主循环立即重连。
+# 设置每 30 秒重读一次，所以改了即时生效；TERM 后 20 秒还没退出就 KILL。
+PLANNED_SENT=0; LR_AT=0
+sup_planned_check() {
+  local now lim; now=$(now_s)
+  if [ $((now - LR_AT)) -ge 30 ]; then live_reload; LR_AT=$now; fi
+  if [ "$PLANNED_SENT" -gt 0 ]; then
+    if [ $((now - PLANNED_SENT)) -ge 20 ] && kill -0 "$OC_PID" 2>/dev/null; then
+      ev "SUP planned-restart kill pid=$OC_PID (still running 20s after TERM)"; kill -KILL "$OC_PID" 2>/dev/null; PLANNED_SENT=$now
+    fi
+    return 0
+  fi
+  [ "${LIVE[AUTO_RECONNECT]:-on}" = on ] || return 0
+  lim=$(_dur_to_s "${LIVE[SESSION_RESTART]:-off}" 2>/dev/null) || return 0
+  [ "$lim" -ge "$SESSION_RESTART_MIN" ] && [ $((now - OC_START)) -ge "$lim" ] || return 0
+  kill -0 "$OC_PID" 2>/dev/null || return 0
+  PLANNED_SENT=$now; touch "$PLANNED_REQ"
+  ev "SUP planned-restart session=$SESSION_N age=$((now - OC_START)) limit=$lim limit_h=$(fmt_dur "$lim") pid=$OC_PID"
+  sup_log "会话已满 $(fmt_dur "$lim")（定时重连），正常登出后立即重连"
+  kill -TERM "$OC_PID" 2>/dev/null
+  return 0
+}
 
 sup_on_up() {
   local first=0 took=$(( $(now_s) - OC_START )); [ "$EVER_UP" = 0 ] && first=1
@@ -1825,11 +1871,11 @@ _supervise() {
     live_reload
     read -r -a B <<<"${LIVE[BACKOFF]}"; [ ${#B[@]} -gt 0 ] || B=(30)
     if [ "$EVER_UP" = 1 ]; then set_phase reconnecting; else set_phase connecting; fi
-    attempts+=("$(now_s)")
+    [ "${kind:-}" = planned ] || attempts+=("$(now_s)")
     [ "$SESSION_N" -gt 0 ] && sup_reset_net
     sup_launch_oc
     sup_log "启动 openconnect（第 $SESSION_N 次，pid $OC_PID）"
-    up=0; t0=$(now_s)
+    up=0; t0=$(now_s); PLANNED_SENT=0; rm -f "$PLANNED_REQ"
     while kill -0 "$OC_PID" 2>/dev/null && [ "$SUP_STOP" = 0 ]; do
       if [ $up = 0 ]; then
         if sup_tunnel_up; then up=1; sup_on_up || break
@@ -1837,7 +1883,7 @@ _supervise() {
         [ $up = 0 ] && fb_tick
         interval=1
       else
-        sup_check_children; interval=3
+        sup_check_children; sup_planned_check; interval=3; [ "$PLANNED_SENT" -gt 0 ] && interval=1
       fi
       sleep "$interval" & wait $! 2>/dev/null
     done
@@ -1855,15 +1901,17 @@ _supervise() {
 
     case "$kind" in
       server-terminated|watch-request) delay=2; fails=0 ;;
+      planned) delay=1; fails=0 ;;
       auth) authfails=$((authfails+1)); fails=$((fails+1)) ;;
       *) fails=$((fails+1)) ;;
     esac
     [ "$up" = 1 ] && [ "$kind" != auth ] && authfails=0
-    if [ "$kind" != server-terminated ] && [ "$kind" != watch-request ]; then
-      idx=$((fails-1)); [ $idx -ge ${#B[@]} ] && idx=$(( ${#B[@]} - 1 )); [ $idx -lt 0 ] && idx=0; delay=${B[$idx]}
-    fi
+    case "$kind" in
+      server-terminated|watch-request|planned) : ;;
+      *) idx=$((fails-1)); [ $idx -ge ${#B[@]} ] && idx=$(( ${#B[@]} - 1 )); [ $idx -lt 0 ] && idx=0; delay=${B[$idx]} ;;
+    esac
 
-    if [ "${LIVE[AUTO_RECONNECT]}" != on ]; then sup_log "自动重连已关闭，停止"; ev "SUP no-reconnect (AUTO_RECONNECT=off)"; PAUSED_REASON="stopped:no-reconnect"; break; fi
+    if [ "${LIVE[AUTO_RECONNECT]}" != on ] && [ "$kind" != planned ]; then sup_log "自动重连已关闭，停止"; ev "SUP no-reconnect (AUTO_RECONNECT=off)"; PAUSED_REASON="stopped:no-reconnect"; break; fi
     if [ "$kind" = auth ] && { [ "$EVER_UP" = 0 ] || [ "$authfails" -ge "${LIVE[AUTH_FAIL_PAUSE]}" ]; }; then
       sup_log "认证失败（连续 $authfails 次），为防止账号被锁已停止。确认账号密码后重新启动。"
       ev "SUP paused reason=auth authfails=$authfails"; PAUSED_REASON="failed:auth"; break
@@ -1872,7 +1920,7 @@ _supervise() {
     local -a recent=(); local t
     for t in "${attempts[@]}"; do [ $(( $(now_s) - t )) -lt 3600 ] && recent+=("$t"); done
     attempts=("${recent[@]}")
-    if [ "${#attempts[@]}" -ge "${LIVE[MAX_PER_HOUR]}" ]; then
+    if [ "$kind" != planned ] && [ "${#attempts[@]}" -ge "${LIVE[MAX_PER_HOUR]}" ]; then
       local w=$(( attempts[0] + 3600 - $(now_s) )); [ $w -lt $delay ] || delay=$w
       ev "SUP rate-limited attempts_last_hour=${#attempts[@]} wait=${delay}s"; sup_log "1 小时内已重连 ${#attempts[@]} 次，等待 ${delay}s"
     fi
@@ -1889,7 +1937,7 @@ _supervise() {
   fi
   [ "$FB_MODE" = 1 ] && { _fb_disengage stop; _fb_stop_gost; }
   _teardown_session >/dev/null 2>&1
-  rm -f "$RESTART_REQ" "$PID_FILE"
+  rm -f "$RESTART_REQ" "$PLANNED_REQ" "$PID_FILE"
   ev "SUP stop reason=${PAUSED_REASON:-requested} sessions=$SESSION_N"
   set_phase "${PAUSED_REASON:-stopped}"
   sup_log "已停止（${PAUSED_REASON:-requested}）"
@@ -1914,6 +1962,7 @@ show_summary() {
     ocproxy) printf '    %-14s %s\n' "${SET_TITLE[SOCKS_PORT]}" "127.0.0.1:${CFG[SOCKS_PORT]}" ;;
   esac
   printf '    %-14s %s\n' "${SET_TITLE[AUTO_RECONNECT]}" "$(cfg_label AUTO_RECONNECT)"
+  printf '    %-14s %s\n' "${SET_TITLE[SESSION_RESTART]}" "$(cfg_label SESSION_RESTART)"
   [ "${CFG[MTU]}" != auto ] && printf '    %-14s %s\n' "MTU" "${CFG[MTU]}"
   [ -n "${CFG[OC_EXTRA]}" ] && printf '    %-14s %s\n' "附加参数" "${CFG[OC_EXTRA]}"
   return 0
@@ -2115,6 +2164,11 @@ cmd_status() {
   local en; en=$(systemctl is-enabled "$SVC_MAIN" 2>/dev/null || true)
   printf '   开机自启 %s\n' "${en:-未安装}"
   printf '诊断日志  : %s   自动重连 %s\n' "$(systemctl is-active "$SVC_WATCH" 2>/dev/null || true)" "$(cfg_label AUTO_RECONNECT)"
+  local _sr _ag=""; _sr=$(_dur_to_s "${CFG[SESSION_RESTART]:-off}" 2>/dev/null || echo 0)
+  if [ "${_sr:-0}" -gt 0 ]; then
+    if is_vpn_running; then _ag=$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ') || true; fi
+    printf '定时重连  : 会话满 %s 主动重连%s\n' "$(fmt_dur "$_sr")" "$( [[ "$_ag" =~ ^[0-9]+$ ]] && [ "$_ag" -lt "$_sr" ] && echo "（本次还剩 $(fmt_dur $((_sr - _ag)))）")"
+  fi
   if [ -f "$STATE_FILE" ]; then
     local MODE="" ACCOUNT_INDEX="" VPN_PROTOCOL="" SOCKS_PORT="" LISTEN_ADDR="" FORWARDER="" SOCKS_USER="" SOCKS_PASS="" KILL_SWITCH=""
     # shellcheck disable=SC1090
@@ -2614,7 +2668,7 @@ cmd_report() {
         # 连续的异常状态（DOWN→STARTING→DEGRADED…）合并成一次断线，原因依次拼接
         if (to ~ /^(DOWN|DEGRADED|FALLBACK|UNMANAGED)$/) {
           if (open>0) { why[open]=why[open] " ; " to ":" kv("reason") }
-          else { n++; ts[n]=$1; fr[n]=from; tt[n]=to; why[n]=kv("reason"); hf[n]=held; be[n]=e; sa[n]=kv("session_age"); open=n }
+          else { n++; ts[n]=$1; fr[n]=from; tt[n]=to; why[n]=kv("reason") ((plpid!="" && kv("session_pid")==plpid) ? " [定时重连]" : ""); hf[n]=held; be[n]=e; sa[n]=kv("session_age"); open=n }
         }
         if (to=="UP" && open>0) { rec[open]=e-be[open]; open=0 }
         if (to=="STOPPED" && open>0 && kv("heal")!="1") { rec[open]=-1; open=0 }
@@ -2626,8 +2680,9 @@ cmd_report() {
           if (a ~ /^[0-9]+$/) {
             se++; se_ts[se]=$1; se_to[se]=to; se_age[se]=a+0; se_why[se]=kv("reason")
             se_man[se]=(md>0 && e-md<=60) ? 1 : 0
-            if (!se_man[se] && a+0>=slo && a+0<=shi) near2h++
-            if (!se_man[se]) unplanned++
+            se_pl[se]=(!se_man[se] && plpid!="" && kv("session_pid")==plpid) ? 1 : 0
+            if (!se_man[se] && !se_pl[se] && a+0>=slo && a+0<=shi) near2h++
+            if (!se_man[se] && !se_pl[se]) unplanned++
           }
         }
       }
@@ -2651,7 +2706,8 @@ cmd_report() {
       if ($4=="up") sup++
       if ($4=="paused" || $4=="rate-limited") ahP++
       if ($4=="fallback") { if ($5=="on") fbn++; else if ($5=="off") fbd+=kv("dur")+0; else if ($5=="unavailable") fbu++ }
-      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect|fallback)$/) { ah++; ahs[ah]=$0 }
+      if ($4=="planned-restart" && $5 ~ /^session=/) { plc++; plpid=kv("pid") }
+      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect|fallback|planned-restart)$/) { ah++; ahs[ah]=$0 }
       next
     }
     $3=="WATCH" && $4=="restart-request" && e>=cut { wr++; ah++; ahs[ah]=$0; next }
@@ -2680,8 +2736,9 @@ cmd_report() {
       for (i=1;i<=n;i++) printf "  %s  %s→%s  会话已持续 %-10s 恢复用时 %-12s 原因 %s\n", ts[i], fr[i], tt[i], (sa[i] ~ /^[0-9]+$/ ? dur(sa[i]+0) : "?"), (i in rec ? (rec[i]<0?"被停止":dur(rec[i])) : "尚未恢复"), why[i]
       printf "\n会话结束时间轴（离开 UP 时距认证多久；≈2h = %s–%s）：\n", dur(slo), dur(shi)
       if (!se) print "  （暂无会话结束记录）"
-      for (i=1;i<=se;i++) printf "  %s  →%-9s 会话时长 %-10s %s%s  %s\n", se_ts[i], se_to[i], dur(se_age[i]), (se_man[i]?"[人工] ":""), (!se_man[i] && se_age[i]>=slo && se_age[i]<=shi ? "[≈2h!] " : ""), se_why[i]
+      for (i=1;i<=se;i++) printf "  %s  →%-9s 会话时长 %-10s %s%s%s  %s\n", se_ts[i], se_to[i], dur(se_age[i]), (se_man[i]?"[人工] ":""), (se_pl[i]?"[计划] ":""), (!se_man[i] && !se_pl[i] && se_age[i]>=slo && se_age[i]<=shi ? "[≈2h!] " : ""), se_why[i]
       if (unplanned>0) printf "  非人工结束 %d 次，其中落在 ≈2h 区间 %d 次\n", unplanned, near2h
+      if (plc>0) printf "  定时重连（主动登出后重连）%d 次\n", plc
       printf "  会话内短暂故障（DEGRADED，未断开）%d 次\n", blips
       printf "\n自动重连：openconnect 退出 %d 次", sx
       if (sx) { printf "（"; sep=""; for (k in sk) { printf "%s%s=%d", sep, k, sk[k]; sep=" " } printf "）" }
@@ -2825,7 +2882,7 @@ settings_edit_item() {
   local k="$1" target="${2:-cfg}" t="${SET_TYPE[$1]}" v="" a old j c
   local -a cs=()
   clear 2>/dev/null || true
-  title "⚙️  ${SET_TITLE[$k]}   ${C_GREY}($k)${C_RESET}"; sep
+  title "🔧 ${SET_TITLE[$k]}   ${C_GREY}($k)${C_RESET}"; sep
   _set_help "$k"; sep
   echo -e "当前：${C_CYAN}$(cfg_label "$k")${C_RESET}"
   [ -n "${SET_CHOICES[$k]}" ] && IFS=',' read -r -a cs <<<"${SET_CHOICES[$k]}"
@@ -2887,7 +2944,7 @@ settings_menu() {
   local target="${1:-cfg}" n i k g lastg mark
   while true; do
     clear 2>/dev/null || true
-    if [ "$target" = ovr ]; then title "⏱  只改本次（不保存，仅对这次启动生效）"; else title "⚙️  设置   ${C_GREY}${SETTINGS_FILE}${C_RESET}"; fi
+    if [ "$target" = ovr ]; then title "⏳ 只改本次（不保存，仅对这次启动生效）"; else title "🔧 设置   ${C_GREY}${SETTINGS_FILE}${C_RESET}"; fi
     sep
     i=0; lastg=""
     for k in "${SET_KEYS[@]}"; do
@@ -2913,11 +2970,11 @@ settings_menu() {
 manage_cron() {
   local c exp act cron_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   if ! command -v crontab &>/dev/null; then
-    clear 2>/dev/null || true; title "🗓️ 定时任务"; sep
+    clear 2>/dev/null || true; title "📅 定时任务"; sep
     log_err "系统未安装 cron/crontab，定时任务不可用。可先执行： apt-get install -y cron"; sep; _pause "按任意键返回主菜单..."; return 0
   fi
   while true; do
-    clear 2>/dev/null || true; title "🗓️ 定时任务"; sep
+    clear 2>/dev/null || true; title "📅 定时任务"; sep
     crontab -l 2>/dev/null | grep -F "$SCRIPT_PATH" || log_info "  当前无此脚本的定时任务。"
     crontab -l 2>/dev/null | grep -q "_internal_check_health" && log_warn "  有旧版守护任务（_internal_check_health）：v8 已由 systemd 自动重连取代，建议选 3 清除。"
     sep
@@ -2962,7 +3019,8 @@ show_status() {
       [ -n "$SOCKS_PORT" ] && echo -e "    ${C_BOLD}SOCKS5:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}${SOCKS_USER:+ （认证 ${SOCKS_USER}:****）}${FORWARDER:+ ${C_GREY}by ${FORWARDER}${C_RESET}}"
     fi
     if is_vpn_running; then
-      echo -e "    ${C_BOLD}本次会话:${C_RESET} 已连接 $(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
+      local _ag _sr; _ag=$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ') || true; _sr=$(_dur_to_s "${CFG[SESSION_RESTART]:-off}" 2>/dev/null || echo 0)
+      echo -e "    ${C_BOLD}本次会话:${C_RESET} 已连接 $(fmt_dur "$_ag")$( [[ "$_ag" =~ ^[0-9]+$ ]] && [ "${_sr:-0}" -gt 0 ] && [ "$_ag" -lt "$_sr" ] && echo "   ${C_GREY}定时重连还剩 $(fmt_dur $((_sr - _ag)))${C_RESET}")"
     fi
     if [ -r "$FB_STATE_FILE" ]; then
       local fs fa fn; read -r fs fa fn < "$FB_STATE_FILE"
@@ -3016,16 +3074,16 @@ main_menu() {
   title "主菜单:"
   echo -e "  ${C_GREEN}1) 🚀 启动 VPN（按当前设置，启动前确认）${C_RESET}"
   echo -e "  ${C_GREEN}2) 🔁 重启 VPN（应用新设置）${C_RESET}"
-  echo -e "  ${C_RED}3) ⏹  停止 VPN${C_RESET}"
+  echo -e "  ${C_RED}3) 🛑 停止 VPN${C_RESET}"
   echo -e "  4) 📊 状态详情与诊断报告"
   sep
-  echo -e "  5) ⚙️  设置（模式 / 协议 / 数据通道 / 代理 / 重连 / 日志…）"
+  echo -e "  5) 🔧 设置（模式 / 协议 / 数据通道 / 代理 / 重连 / 日志…）"
   echo -e "  6) 🔐 管理 VPN 账户"
-  echo -e "  7) 🗓️  定时启动 / 关闭"
+  echo -e "  7) 📅 定时启动 / 关闭"
   echo -e "  8) 📦 检查/安装依赖"
   echo -e "  9) 🧪 ${C_CYAN}测试 Netns IPv6 连通性${C_RESET}"
-  echo -e " 10) 🗑️  卸载"
-  echo -e " 11) 🛟 管理回落代理（断线保护的备用出口）"
+  echo -e " 10) 🧹 卸载"
+  echo -e " 11) 🔀 管理回落代理（断线保护的备用出口）"
   echo -e "  0) 🚪 退出"
   echo
   read -rp "请选择 [0-11]: " c || { echo; log_info "标准输入已结束，退出。"; exit 0; }
@@ -3099,6 +3157,7 @@ OpenConnect Master Manager v${VERSION}
   ocm start -m netns -p nc -P 8585 --tls-only --save
   ocm log report 7
   ocm config set DEGRADED_WAIT 60
+  ocm config set SESSION_RESTART 110m     # 会话满 110 分钟主动重连（赶在 2 小时上限之前）
   ocm proxy add '香港备用|socks5|203.0.113.20|1080|user|pass' && ocm config set KILL_SWITCH proxy
 EOF
 }

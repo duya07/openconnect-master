@@ -1,11 +1,11 @@
 #!/bin/bash
 # =================================================================
-#   OpenConnect Master Manager - v8.0.0
+#   OpenConnect Master Manager - v8.2.0
 #   - New: systemd management (ocm.service). openconnect now runs in the foreground and is reconnected
 #     automatically according to why it exited (server session expiry / network error / auth failure are handled separately); netns and proxies stay up while reconnecting;
 #     closing SSH no longer affects the VPN.
 #   - New: built-in long-term diagnostic log (ocm-watch.service): periodic samples, events, incident snapshots, reports.
-#   - New: ⚙️ Settings menu + /etc/oc-master/settings.conf - every tunable has a description and choices;
+#   - New: 🔧 Settings menu + /etc/oc-master/settings.conf - every tunable has a description and choices;
 #     a summary is shown before starting: start directly / change settings first / override for this run only.
 #   - New: command-line interface (ocm -h): start / stop / restart / status / log / heal / config / accounts.
 #   - Changed: netns mode no longer enables host-wide IPv6 forwarding by default (can be enabled in settings); the VPN password is no longer exported
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- Global Configuration ---
-VERSION="8.1.1"
+VERSION="8.2.0"
 VR_TAG="OC-Master-v${VERSION}"
 SCRIPT_PATH="$(readlink -f "$0")"
 PID_FILE="/var/run/oc_manager.pid"
@@ -39,6 +39,7 @@ RUN_DIR="/run/oc-master"
 RUN_PROFILE="${RUN_DIR}/run.conf"        # effective settings of the current start (600; no VPN password)
 PHASE_FILE="${RUN_DIR}/phase"            # supervisor phase: starting/connecting/up/reconnecting/stopping/stopped/failed:<reason>
 RESTART_REQ="${RUN_DIR}/restart-request" # watch process requests a soft reconnect
+PLANNED_REQ="${RUN_DIR}/planned-restart" # planned restart started by the supervisor itself (vs. server termination / soft reconnect)
 FB_STATE_FILE="${RUN_DIR}/fallback"          # exists while falling back: start-time IP:port display-name
 FB_GOST_PID_FILE="${RUN_DIR}/fallback-gost.pid"
 FB_YAML="${RUN_DIR}/fallback-gost.yaml"      # config of the fallback gost (600, contains proxy passwords; deleted as soon as gost has started)
@@ -54,6 +55,7 @@ SVC_MAIN="ocm.service"
 SVC_WATCH="ocm-watch.service"
 UNIT_DIR="/etc/systemd/system"
 START_TIMEOUT=90                         # max time (seconds) ocm start waits for the tunnel to come up
+SESSION_RESTART_MIN=600                  # shortest session length (seconds) for planned restarts, so a tiny value cannot cause repeated logins
 OC_TUN_DEFAULT="ocmtun0"                 # tunnel interface name in Default global mode (in netns mode it lives in the namespace and is still tun0)
 
 # --- Routing & Network Config ---
@@ -634,6 +636,7 @@ SET_REGISTRY=(
   "MAX_PER_HOUR|int|12|6:6 times,12:12 times,30:30 times|Max reconnects per hour|Supervisor"
   "AUTH_FAIL_PAUSE|int|3|1:1 time,3:3 times,5:5 times|Auth failure pause threshold|Supervisor"
   "DEGRADED_WAIT|int|90|30:30 s,60:60 s,90:90 s,180:180 s|Soft reconnect after tunnel is unusable for|Supervisor"
+  "SESSION_RESTART|text|off|off:Off,110m:110 minutes (recommended for 2-hour session limits),100m:100 minutes,90m:90 minutes|Planned restart (reconnect after this session length)|Supervisor"
   "AUTOSTART|choice|off|off:Off,on:On|Connect automatically at boot|Supervisor"
   "WATCH|choice|on|on:On,off:Off|Diagnostic log|Logging"
   "SAMPLE_INTERVAL|int|30|15:15 s,30:30 s,60:60 s|Sample interval (s)|Logging"
@@ -706,6 +709,11 @@ auth failure -> counted, pause once the threshold is reached so the account is n
 An auth failure on the very first start stops immediately. To resume: check the account, then ocm heal on or start again.";;
     DEGRADED_WAIT) echo "If the openconnect process is still alive but access through the proxy keeps failing for this many seconds, disconnect and reconnect (soft reconnect).
 Too short and UDP channel switches or brief jitter trigger it falsely; too long and a stuck connection takes longer to recover.";;
+    SESSION_RESTART) echo "Once the session reaches this length, reconnect on purpose: openconnect logs out normally and logs in again about 1-2 seconds later; the proxy pauses for a few seconds.
+Use it when the server has a fixed session length (e.g. it kicks you after 2 hours), to reconnect at a time you choose before being kicked.
+Format: 110m / 110min / 1h50m / 2h / a bare number = minutes (case-insensitive); minimum $((SESSION_RESTART_MIN / 60)) minutes; off = disabled.
+Measured from the start of the current openconnect run. Changes take effect right away (within about 30 seconds), no restart needed.
+Pick it from the session lengths in the [session end timeline] of ocm log report, leaving a few minutes of margin.";;
     AUTOSTART) echo "Connect automatically at boot with the current settings (enables the systemd unit ocm.service).";;
     WATCH) echo "Background diagnostic service (ocm-watch.service): periodically samples tunnel/proxy/gateway state, records state changes and disconnect snapshots,
 and performs the soft reconnect when [process alive but not working]. Logs are in ${LOG_DIR}; ocm log report shows a summary.";;
@@ -745,6 +753,16 @@ settings_save() {
   chmod 600 "$tmp"; mv -f "$tmp" "$SETTINGS_FILE"
 }
 
+# Duration -> seconds: 110m / 110min / 1h50m / 2h / bare number (minutes); off, 0, empty -> 0; returns 1 on a bad format
+_dur_to_s() {
+  local v="${1,,}"; v=${v//[[:space:]]/}
+  case "$v" in ""|off|0) echo 0; return 0 ;; esac
+  if [[ "$v" =~ ^[0-9]{1,5}$ ]]; then echo $(( 10#$v * 60 )); return 0; fi
+  [[ "$v" =~ ^(([0-9]{1,3})h)?(([0-9]{1,5})(m|min))?$ ]] || return 1
+  [ -n "${BASH_REMATCH[2]}${BASH_REMATCH[4]}" ] || return 1
+  echo $(( 10#${BASH_REMATCH[2]:-0} * 3600 + 10#${BASH_REMATCH[4]:-0} * 60 ))
+}
+
 # Validation: returns 0 on success; on failure prints the reason and returns 1
 settings_validate() {
   local k="$1" v="$2" c ok=0 n
@@ -759,6 +777,8 @@ settings_validate() {
       case "$v" in */*|*\"*|*\'*|*\\*|*[[:space:]]*) log_err "Password must not contain / quotes backslash whitespace"; return 1;; esac; return 0;;
     OC_EXTRA|EXTRA_PROBE_URL) case "$v" in *$'\n'*) log_err "Must not contain newlines"; return 1;; esac; return 0;;
     FALLBACK_PROXY) [ -z "$v" ] || [ "$v" = auto ] || proxy_find "$v" >/dev/null || { log_err "Fallback proxy choice must be auto or the display name of a proxy in the list (ocm proxy list)"; return 1; }; return 0;;
+    SESSION_RESTART) local _s; _s=$(_dur_to_s "$v") || { log_err "Planned restart format: 110m / 110min / 1h50m / 2h / bare number (minutes) / off"; return 1; }
+      [ "$_s" = 0 ] || [ "$_s" -ge "$SESSION_RESTART_MIN" ] || { log_err "Planned restart must be at least $((SESSION_RESTART_MIN / 60)) minutes (or off)"; return 1; }; return 0;;
   esac
   case "${SET_TYPE[$k]:-}" in
     choice) IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]}"
@@ -778,6 +798,8 @@ cfg_label() {
     ACCOUNT) echo "${v}) $(account_field "$v" 1 2>/dev/null || echo '?')"; return;;
     OC_EXTRA|EXTRA_PROBE_URL) echo "${v:-(empty)}"; return;;
     FALLBACK_PROXY) if [ -z "$v" ] || [ "$v" = auto ]; then echo "Auto (first reachable one in list order)"; else echo "Fixed: $v"; fi; return;;
+    SESSION_RESTART) local _s; _s=$(_dur_to_s "$v" 2>/dev/null) || _s=""
+      if [ -z "$_s" ]; then echo "${v} (invalid format, treated as off)"; elif [ "$_s" = 0 ]; then echo "Off"; else echo "Reconnect when the session reaches $(fmt_dur "$_s") (${v})"; fi; return;;
   esac
   IFS=',' read -r -a _cs <<<"${SET_CHOICES[$k]:-}"
   for c in "${_cs[@]}"; do [ "${c%%:*}" = "$v" ] && { echo "${c#*:}"; return; }; done
@@ -1095,7 +1117,7 @@ manage_proxies() {
   local c a fs fa fn
   while true; do
     clear 2>/dev/null || true; settings_load
-    title "🛟 Manage Fallback Proxies (${PROXIES_FILE})"; sep
+    title "🔀 Manage Fallback Proxies (${PROXIES_FILE})"; sep
     echo -e "  Kill switch: ${C_CYAN}$(cfg_label KILL_SWITCH)${C_RESET}   Fallback proxy choice: ${C_CYAN}$(cfg_label FALLBACK_PROXY)${C_RESET}"
     [ "${CFG[KILL_SWITCH]}" = proxy ] || echo -e "  ${C_GREY}(the proxies here are only used once [Kill switch] is set to [Fallback proxy]: main menu 5 → Kill switch)${C_RESET}"
     if [ -r "$FB_STATE_FILE" ]; then read -r fs fa fn < "$FB_STATE_FILE"; echo -e "  ${C_YELLOW}In use: ${fn} (${fa})${C_RESET}"; fi
@@ -1484,7 +1506,7 @@ live_reload() {
   local k; local -A bak=()
   for k in "${!CFG[@]}"; do bak[$k]=${CFG[$k]}; done
   settings_load
-  for k in AUTO_RECONNECT BACKOFF MAX_PER_HOUR AUTH_FAIL_PAUSE; do LIVE[$k]=${CFG[$k]}; done
+  for k in AUTO_RECONNECT BACKOFF MAX_PER_HOUR AUTH_FAIL_PAUSE SESSION_RESTART; do LIVE[$k]=${CFG[$k]}; done
   for k in "${!bak[@]}"; do CFG[$k]=${bak[$k]}; done
 }
 sup_proto() { echo "${VPN_ACC_PROTO:-${CFG[PROTOCOL]}}"; }
@@ -1754,6 +1776,7 @@ sup_classify() {
   [ -f "$RESTART_REQ" ] && { req=1; rm -f "$RESTART_REQ"; }
   # First check what openconnect itself said (server termination takes precedence over the soft reconnect flag, so a stale flag is not misread)
   if grep -qiE 'Server terminated connection|Session terminated by server|session expired|session timed out' "$SESSION_LOG" 2>/dev/null; then echo server-terminated; return; fi
+  if [ -f "$PLANNED_REQ" ]; then rm -f "$PLANNED_REQ"; case "$rc" in 0|137|143) echo planned; return ;; esac; fi
   if [ $req = 1 ]; then echo watch-request; return; fi
   if [ "$rc" = 2 ] || grep -qiE 'login failed|authentication failed|invalid (user|pass|cred)|incorrect (user|pass)|password (has )?expired|account (is )?(locked|disabled)|cookie was rejected|failed to authenticate' "$SESSION_LOG" 2>/dev/null; then echo auth; return; fi
   if grep -qiE 'frmConfirmation|already (logged|signed) in|maximum number of (open )?(sessions|users)|session limit' "$SESSION_LOG" 2>/dev/null; then echo session-confirm; return; fi
@@ -1763,6 +1786,29 @@ sup_classify() {
 
 # sleep that can be interrupted by SIGTERM
 sup_sleep() { local end=$(( $(now_s) + $1 )); while [ "$(now_s)" -lt "$end" ] && [ "$SUP_STOP" = 0 ]; do fb_tick; sleep 1 & wait $! 2>/dev/null; done; }
+
+# Planned restart: once the session (since openconnect started) reaches SESSION_RESTART, let it log out normally; the main loop reconnects right away.
+# Settings are re-read every 30 seconds, so changes apply immediately; KILL if it is still running 20 seconds after TERM.
+PLANNED_SENT=0; LR_AT=0
+sup_planned_check() {
+  local now lim; now=$(now_s)
+  if [ $((now - LR_AT)) -ge 30 ]; then live_reload; LR_AT=$now; fi
+  if [ "$PLANNED_SENT" -gt 0 ]; then
+    if [ $((now - PLANNED_SENT)) -ge 20 ] && kill -0 "$OC_PID" 2>/dev/null; then
+      ev "SUP planned-restart kill pid=$OC_PID (still running 20s after TERM)"; kill -KILL "$OC_PID" 2>/dev/null; PLANNED_SENT=$now
+    fi
+    return 0
+  fi
+  [ "${LIVE[AUTO_RECONNECT]:-on}" = on ] || return 0
+  lim=$(_dur_to_s "${LIVE[SESSION_RESTART]:-off}" 2>/dev/null) || return 0
+  [ "$lim" -ge "$SESSION_RESTART_MIN" ] && [ $((now - OC_START)) -ge "$lim" ] || return 0
+  kill -0 "$OC_PID" 2>/dev/null || return 0
+  PLANNED_SENT=$now; touch "$PLANNED_REQ"
+  ev "SUP planned-restart session=$SESSION_N age=$((now - OC_START)) limit=$lim limit_h=$(fmt_dur "$lim") pid=$OC_PID"
+  sup_log "Session reached $(fmt_dur "$lim") (planned restart); logging out and reconnecting right away"
+  kill -TERM "$OC_PID" 2>/dev/null
+  return 0
+}
 
 sup_on_up() {
   local first=0 took=$(( $(now_s) - OC_START )); [ "$EVER_UP" = 0 ] && first=1
@@ -1825,11 +1871,11 @@ _supervise() {
     live_reload
     read -r -a B <<<"${LIVE[BACKOFF]}"; [ ${#B[@]} -gt 0 ] || B=(30)
     if [ "$EVER_UP" = 1 ]; then set_phase reconnecting; else set_phase connecting; fi
-    attempts+=("$(now_s)")
+    [ "${kind:-}" = planned ] || attempts+=("$(now_s)")
     [ "$SESSION_N" -gt 0 ] && sup_reset_net
     sup_launch_oc
     sup_log "Starting openconnect (attempt #$SESSION_N, pid $OC_PID)"
-    up=0; t0=$(now_s)
+    up=0; t0=$(now_s); PLANNED_SENT=0; rm -f "$PLANNED_REQ"
     while kill -0 "$OC_PID" 2>/dev/null && [ "$SUP_STOP" = 0 ]; do
       if [ $up = 0 ]; then
         if sup_tunnel_up; then up=1; sup_on_up || break
@@ -1837,7 +1883,7 @@ _supervise() {
         [ $up = 0 ] && fb_tick
         interval=1
       else
-        sup_check_children; interval=3
+        sup_check_children; sup_planned_check; interval=3; [ "$PLANNED_SENT" -gt 0 ] && interval=1
       fi
       sleep "$interval" & wait $! 2>/dev/null
     done
@@ -1855,15 +1901,17 @@ _supervise() {
 
     case "$kind" in
       server-terminated|watch-request) delay=2; fails=0 ;;
+      planned) delay=1; fails=0 ;;
       auth) authfails=$((authfails+1)); fails=$((fails+1)) ;;
       *) fails=$((fails+1)) ;;
     esac
     [ "$up" = 1 ] && [ "$kind" != auth ] && authfails=0
-    if [ "$kind" != server-terminated ] && [ "$kind" != watch-request ]; then
-      idx=$((fails-1)); [ $idx -ge ${#B[@]} ] && idx=$(( ${#B[@]} - 1 )); [ $idx -lt 0 ] && idx=0; delay=${B[$idx]}
-    fi
+    case "$kind" in
+      server-terminated|watch-request|planned) : ;;
+      *) idx=$((fails-1)); [ $idx -ge ${#B[@]} ] && idx=$(( ${#B[@]} - 1 )); [ $idx -lt 0 ] && idx=0; delay=${B[$idx]} ;;
+    esac
 
-    if [ "${LIVE[AUTO_RECONNECT]}" != on ]; then sup_log "Auto reconnect is off, stopping"; ev "SUP no-reconnect (AUTO_RECONNECT=off)"; PAUSED_REASON="stopped:no-reconnect"; break; fi
+    if [ "${LIVE[AUTO_RECONNECT]}" != on ] && [ "$kind" != planned ]; then sup_log "Auto reconnect is off, stopping"; ev "SUP no-reconnect (AUTO_RECONNECT=off)"; PAUSED_REASON="stopped:no-reconnect"; break; fi
     if [ "$kind" = auth ] && { [ "$EVER_UP" = 0 ] || [ "$authfails" -ge "${LIVE[AUTH_FAIL_PAUSE]}" ]; }; then
       sup_log "Auth failed ($authfails times in a row); stopped to avoid locking the account. Check the username/password, then start again."
       ev "SUP paused reason=auth authfails=$authfails"; PAUSED_REASON="failed:auth"; break
@@ -1872,7 +1920,7 @@ _supervise() {
     local -a recent=(); local t
     for t in "${attempts[@]}"; do [ $(( $(now_s) - t )) -lt 3600 ] && recent+=("$t"); done
     attempts=("${recent[@]}")
-    if [ "${#attempts[@]}" -ge "${LIVE[MAX_PER_HOUR]}" ]; then
+    if [ "$kind" != planned ] && [ "${#attempts[@]}" -ge "${LIVE[MAX_PER_HOUR]}" ]; then
       local w=$(( attempts[0] + 3600 - $(now_s) )); [ $w -lt $delay ] || delay=$w
       ev "SUP rate-limited attempts_last_hour=${#attempts[@]} wait=${delay}s"; sup_log "Reconnected ${#attempts[@]} times within 1 hour, waiting ${delay}s"
     fi
@@ -1889,7 +1937,7 @@ _supervise() {
   fi
   [ "$FB_MODE" = 1 ] && { _fb_disengage stop; _fb_stop_gost; }
   _teardown_session >/dev/null 2>&1
-  rm -f "$RESTART_REQ" "$PID_FILE"
+  rm -f "$RESTART_REQ" "$PLANNED_REQ" "$PID_FILE"
   ev "SUP stop reason=${PAUSED_REASON:-requested} sessions=$SESSION_N"
   set_phase "${PAUSED_REASON:-stopped}"
   sup_log "Stopped (${PAUSED_REASON:-requested})"
@@ -1914,6 +1962,7 @@ show_summary() {
     ocproxy) printf '    %-14s %s\n' "${SET_TITLE[SOCKS_PORT]}" "127.0.0.1:${CFG[SOCKS_PORT]}" ;;
   esac
   printf '    %-14s %s\n' "${SET_TITLE[AUTO_RECONNECT]}" "$(cfg_label AUTO_RECONNECT)"
+  printf '    %-14s %s\n' "${SET_TITLE[SESSION_RESTART]}" "$(cfg_label SESSION_RESTART)"
   [ "${CFG[MTU]}" != auto ] && printf '    %-14s %s\n' "MTU" "${CFG[MTU]}"
   [ -n "${CFG[OC_EXTRA]}" ] && printf '    %-14s %s\n' "Extra args" "${CFG[OC_EXTRA]}"
   return 0
@@ -2115,6 +2164,11 @@ cmd_status() {
   local en; en=$(systemctl is-enabled "$SVC_MAIN" 2>/dev/null || true)
   printf '   autostart %s\n' "${en:-not installed}"
   printf 'Diag log    : %s   auto reconnect %s\n' "$(systemctl is-active "$SVC_WATCH" 2>/dev/null || true)" "$(cfg_label AUTO_RECONNECT)"
+  local _sr _ag=""; _sr=$(_dur_to_s "${CFG[SESSION_RESTART]:-off}" 2>/dev/null || echo 0)
+  if [ "${_sr:-0}" -gt 0 ]; then
+    if is_vpn_running; then _ag=$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ') || true; fi
+    printf 'Auto restart: reconnect when the session reaches %s%s\n' "$(fmt_dur "$_sr")" "$( [[ "$_ag" =~ ^[0-9]+$ ]] && [ "$_ag" -lt "$_sr" ] && echo " (in $(fmt_dur $((_sr - _ag))) for this session)")"
+  fi
   if [ -f "$STATE_FILE" ]; then
     local MODE="" ACCOUNT_INDEX="" VPN_PROTOCOL="" SOCKS_PORT="" LISTEN_ADDR="" FORWARDER="" SOCKS_USER="" SOCKS_PASS="" KILL_SWITCH=""
     # shellcheck disable=SC1090
@@ -2614,7 +2668,7 @@ cmd_report() {
         # Consecutive abnormal states (DOWN->STARTING->DEGRADED...) are merged into one outage, with the reasons concatenated in order
         if (to ~ /^(DOWN|DEGRADED|FALLBACK|UNMANAGED)$/) {
           if (open>0) { why[open]=why[open] " ; " to ":" kv("reason") }
-          else { n++; ts[n]=$1; fr[n]=from; tt[n]=to; why[n]=kv("reason"); hf[n]=held; be[n]=e; sa[n]=kv("session_age"); open=n }
+          else { n++; ts[n]=$1; fr[n]=from; tt[n]=to; why[n]=kv("reason") ((plpid!="" && kv("session_pid")==plpid) ? " [planned restart]" : ""); hf[n]=held; be[n]=e; sa[n]=kv("session_age"); open=n }
         }
         if (to=="UP" && open>0) { rec[open]=e-be[open]; open=0 }
         if (to=="STOPPED" && open>0 && kv("heal")!="1") { rec[open]=-1; open=0 }
@@ -2626,8 +2680,9 @@ cmd_report() {
           if (a ~ /^[0-9]+$/) {
             se++; se_ts[se]=$1; se_to[se]=to; se_age[se]=a+0; se_why[se]=kv("reason")
             se_man[se]=(md>0 && e-md<=60) ? 1 : 0
-            if (!se_man[se] && a+0>=slo && a+0<=shi) near2h++
-            if (!se_man[se]) unplanned++
+            se_pl[se]=(!se_man[se] && plpid!="" && kv("session_pid")==plpid) ? 1 : 0
+            if (!se_man[se] && !se_pl[se] && a+0>=slo && a+0<=shi) near2h++
+            if (!se_man[se] && !se_pl[se]) unplanned++
           }
         }
       }
@@ -2651,7 +2706,8 @@ cmd_report() {
       if ($4=="up") sup++
       if ($4=="paused" || $4=="rate-limited") ahP++
       if ($4=="fallback") { if ($5=="on") fbn++; else if ($5=="off") fbd+=kv("dur")+0; else if ($5=="unavailable") fbu++ }
-      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect|fallback)$/) { ah++; ahs[ah]=$0 }
+      if ($4=="planned-restart" && $5 ~ /^session=/) { plc++; plpid=kv("pid") }
+      if ($4 ~ /^(exit|up|paused|rate-limited|start|stop|child-died|fail|no-reconnect|fallback|planned-restart)$/) { ah++; ahs[ah]=$0 }
       next
     }
     $3=="WATCH" && $4=="restart-request" && e>=cut { wr++; ah++; ahs[ah]=$0; next }
@@ -2680,8 +2736,9 @@ cmd_report() {
       for (i=1;i<=n;i++) printf "  %s  %s→%s  session age %-10s recovered in %-12s reason %s\n", ts[i], fr[i], tt[i], (sa[i] ~ /^[0-9]+$/ ? dur(sa[i]+0) : "?"), (i in rec ? (rec[i]<0?"stopped":dur(rec[i])) : "not recovered yet"), why[i]
       printf "\nSession end timeline (time since auth when leaving UP; ≈2h = %s–%s):\n", dur(slo), dur(shi)
       if (!se) print "  (no session end records yet)"
-      for (i=1;i<=se;i++) printf "  %s  →%-9s session %-10s %s%s  %s\n", se_ts[i], se_to[i], dur(se_age[i]), (se_man[i]?"[manual] ":""), (!se_man[i] && se_age[i]>=slo && se_age[i]<=shi ? "[≈2h!] " : ""), se_why[i]
+      for (i=1;i<=se;i++) printf "  %s  →%-9s session %-10s %s%s%s  %s\n", se_ts[i], se_to[i], dur(se_age[i]), (se_man[i]?"[manual] ":""), (se_pl[i]?"[planned] ":""), (!se_man[i] && !se_pl[i] && se_age[i]>=slo && se_age[i]<=shi ? "[≈2h!] " : ""), se_why[i]
       if (unplanned>0) printf "  %d non-manual ends, %d of them in the ≈2h window\n", unplanned, near2h
+      if (plc>0) printf "  %d planned restarts (logged out and reconnected on purpose)\n", plc
       printf "  Brief in-session faults (DEGRADED, not disconnected): %d\n", blips
       printf "\nAuto reconnect: openconnect exited %d times", sx
       if (sx) { printf " ("; sep=""; for (k in sk) { printf "%s%s=%d", sep, k, sk[k]; sep=" " } printf ")" }
@@ -2825,7 +2882,7 @@ settings_edit_item() {
   local k="$1" target="${2:-cfg}" t="${SET_TYPE[$1]}" v="" a old j c
   local -a cs=()
   clear 2>/dev/null || true
-  title "⚙️  ${SET_TITLE[$k]}   ${C_GREY}($k)${C_RESET}"; sep
+  title "🔧 ${SET_TITLE[$k]}   ${C_GREY}($k)${C_RESET}"; sep
   _set_help "$k"; sep
   echo -e "Current: ${C_CYAN}$(cfg_label "$k")${C_RESET}"
   [ -n "${SET_CHOICES[$k]}" ] && IFS=',' read -r -a cs <<<"${SET_CHOICES[$k]}"
@@ -2887,7 +2944,7 @@ settings_menu() {
   local target="${1:-cfg}" n i k g lastg mark
   while true; do
     clear 2>/dev/null || true
-    if [ "$target" = ovr ]; then title "⏱  This run only (not saved, applies to this start only)"; else title "⚙️  Settings   ${C_GREY}${SETTINGS_FILE}${C_RESET}"; fi
+    if [ "$target" = ovr ]; then title "⏳ This run only (not saved, applies to this start only)"; else title "🔧 Settings   ${C_GREY}${SETTINGS_FILE}${C_RESET}"; fi
     sep
     i=0; lastg=""
     for k in "${SET_KEYS[@]}"; do
@@ -2913,11 +2970,11 @@ settings_menu() {
 manage_cron() {
   local c exp act cron_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   if ! command -v crontab &>/dev/null; then
-    clear 2>/dev/null || true; title "🗓️ Scheduled tasks"; sep
+    clear 2>/dev/null || true; title "📅 Scheduled tasks"; sep
     log_err "cron/crontab is not installed; scheduled tasks are unavailable. You can first run: apt-get install -y cron"; sep; _pause "Press any key to return to the main menu..."; return 0
   fi
   while true; do
-    clear 2>/dev/null || true; title "🗓️ Scheduled tasks"; sep
+    clear 2>/dev/null || true; title "📅 Scheduled tasks"; sep
     crontab -l 2>/dev/null | grep -F "$SCRIPT_PATH" || log_info "  No scheduled tasks for this script."
     crontab -l 2>/dev/null | grep -q "_internal_check_health" && log_warn "  Found a legacy guard job (_internal_check_health): v8 replaces it with systemd auto reconnect; choosing 3 to remove it is recommended."
     sep
@@ -2962,7 +3019,8 @@ show_status() {
       [ -n "$SOCKS_PORT" ] && echo -e "    ${C_BOLD}SOCKS5:${C_RESET} ${LISTEN_ADDR:-127.0.0.1}:${SOCKS_PORT}${SOCKS_USER:+ (auth ${SOCKS_USER}:****)}${FORWARDER:+ ${C_GREY}by ${FORWARDER}${C_RESET}}"
     fi
     if is_vpn_running; then
-      echo -e "    ${C_BOLD}Session:${C_RESET} connected for $(fmt_dur "$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ')")"
+      local _ag _sr; _ag=$(ps -o etimes= -p "$(cat "$PID_FILE")" 2>/dev/null | tr -d ' ') || true; _sr=$(_dur_to_s "${CFG[SESSION_RESTART]:-off}" 2>/dev/null || echo 0)
+      echo -e "    ${C_BOLD}Session:${C_RESET} connected for $(fmt_dur "$_ag")$( [[ "$_ag" =~ ^[0-9]+$ ]] && [ "${_sr:-0}" -gt 0 ] && [ "$_ag" -lt "$_sr" ] && echo "   ${C_GREY}planned restart in $(fmt_dur $((_sr - _ag)))${C_RESET}")"
     fi
     if [ -r "$FB_STATE_FILE" ]; then
       local fs fa fn; read -r fs fa fn < "$FB_STATE_FILE"
@@ -3016,16 +3074,16 @@ main_menu() {
   title "Main Menu:"
   echo -e "  ${C_GREEN}1) 🚀 Start VPN (current settings, confirm before starting)${C_RESET}"
   echo -e "  ${C_GREEN}2) 🔁 Restart VPN (apply new settings)${C_RESET}"
-  echo -e "  ${C_RED}3) ⏹  Stop VPN${C_RESET}"
+  echo -e "  ${C_RED}3) 🛑 Stop VPN${C_RESET}"
   echo -e "  4) 📊 Status details & diagnostic report"
   sep
-  echo -e "  5) ⚙️  Settings (mode / protocol / data channel / proxy / reconnect / logging...)"
+  echo -e "  5) 🔧 Settings (mode / protocol / data channel / proxy / reconnect / logging...)"
   echo -e "  6) 🔐 Manage VPN accounts"
-  echo -e "  7) 🗓️  Scheduled start / stop"
+  echo -e "  7) 📅 Scheduled start / stop"
   echo -e "  8) 📦 Check/install dependencies"
   echo -e "  9) 🧪 ${C_CYAN}Test Netns IPv6 connectivity${C_RESET}"
-  echo -e " 10) 🗑️  Uninstall"
-  echo -e " 11) 🛟 Manage fallback proxies (backup egress for the kill switch)"
+  echo -e " 10) 🧹 Uninstall"
+  echo -e " 11) 🔀 Manage fallback proxies (backup egress for the kill switch)"
   echo -e "  0) 🚪 Exit"
   echo
   read -rp "Please select [0-11]: " c || { echo; log_info "Standard input ended, exiting."; exit 0; }
@@ -3099,6 +3157,7 @@ Examples:
   ocm start -m netns -p nc -P 8585 --tls-only --save
   ocm log report 7
   ocm config set DEGRADED_WAIT 60
+  ocm config set SESSION_RESTART 110m     # reconnect on purpose after 110 minutes (before a 2-hour limit)
   ocm proxy add 'HK-backup|socks5|203.0.113.20|1080|user|pass' && ocm config set KILL_SWITCH proxy
 EOF
 }
